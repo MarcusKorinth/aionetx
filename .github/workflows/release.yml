@@ -1,0 +1,623 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_target:
+        description: "Where to publish after verification"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - none
+          - testpypi
+          - dry-run
+      release_version:
+        description: "Required for TestPyPI publish: expected pyproject version (example: 0.1.0)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Calibration note:
+  # - Release workflow contains required trust gates only.
+  # - Docs/process hygiene and observability-only lanes are intentionally kept in the CI workflow.
+  # Tier: release provenance
+  verify_tag_version:
+    name: Verify tag matches pyproject version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Verify release provenance
+        if: >-
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_target == 'testpypi')
+        env:
+          TAG_NAME: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_TARGET: ${{ github.event.inputs.publish_target }}
+          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
+        run: python scripts/ci/validate_release_provenance.py
+
+  # Tier: packaging/release verification
+  cross_platform_portability_smoke:
+    name: Release trust gate — cross-platform portability smoke (${{ matrix.os }})
+    needs: [verify_tag_version]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        os: ["ubuntu-latest", "windows-latest", "macos-latest"]
+        python-version: ["3.11"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Capture deterministic build timestamp
+        id: build_epoch
+        shell: bash
+        run: echo "epoch=$(git log -1 --format=%ct "${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tool
+        run: |
+          python -m pip install --upgrade pip build twine
+
+      - name: Build artifacts
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
+        run: python -m build
+
+      - name: Validate artifact metadata
+        run: python -m twine check dist/*
+
+      - name: Install wheel and run portability smoke + semantic mini-suite
+        run: |
+          python scripts/ci/install_single_artifact.py "dist/*.whl" --force-reinstall --no-deps
+          python -c "import aionetx; print(aionetx.__name__)"
+          python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
+          python scripts/ci/installed_artifact_smoke.py
+          python scripts/ci/installed_artifact_semantic_minisuite.py
+          python -m pip check
+
+      - name: Install sdist and run portability smoke + semantic mini-suite
+        run: |
+          python -m pip uninstall -y aionetx
+          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps
+          python -c "import aionetx; print(aionetx.__name__)"
+          python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
+          python scripts/ci/installed_artifact_smoke.py
+          python scripts/ci/installed_artifact_semantic_minisuite.py
+          python -m pip check
+
+  # Tier: static correctness checks
+  api_symbol_stability:
+    name: Release trust gate - API symbol stability
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run API symbol stability test
+        run: pytest tests/unit/test_api_symbol_sources.py -k "api_symbol" --tb=short -q
+
+  ruff_checks:
+    name: Release trust gate — Ruff
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+
+  mypy_supported_bounds:
+    name: Release trust gate — Mypy (${{ matrix.python-version }})
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Mypy
+        run: mypy src
+
+  # Tier: runtime-semantic trust gates
+  required_behavior_tests:
+    name: Release trust gate — required behavior tests (${{ matrix.python-version }})
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run required behavior test slice
+        run: pytest -q -m "not multicast and not slow and not integration" --timeout=60
+
+  behavior_critical_tests:
+    name: Release trust gate - adversarial lifecycle behavior_critical gate (${{ matrix.python-version }})
+    needs: [required_behavior_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run behavior_critical adversarial lifecycle tests
+        run: pytest -m behavior_critical --tb=short -q --timeout=60
+
+  # Tier: integration confidence
+  integration_tests_supported_bounds:
+    name: Release trust gate — integration tests (${{ matrix.python-version }})
+    needs: [required_behavior_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run integration tests on supported bounds (exclude environment-sensitive multicast)
+        run: pytest -q -m "integration and not multicast and not slow" --timeout=60
+
+  integration_smoke_tests_intermediate_versions:
+    name: Release trust gate — integration smoke tests (${{ matrix.python-version }})
+    needs: [required_behavior_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run required integration smoke slice on intermediate supported versions
+        run: pytest -q -m "integration_smoke and not multicast and not slow" --timeout=60
+
+  integration_semantic_tests_intermediate_versions:
+    name: Release trust gate — integration semantic shard (${{ matrix.python-version }})
+    needs: [required_behavior_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Validate required integration semantic shard contract
+        run: python scripts/ci/assert_integration_semantic_shard.py
+      - name: Run required integration semantic shard on intermediate supported versions
+        run: pytest -q -m "integration_semantic and not multicast and not slow" --timeout=60
+
+  # Tier: focused runtime reliability contracts
+  reliability_smoke_tests:
+    name: Release trust gate — reliability smoke tests
+    needs: [required_behavior_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run required reliability smoke tests
+        run: pytest -q -m "reliability_smoke" --timeout=60
+
+  multicast_contract_required:
+    name: Release trust gate — deterministic multicast contract
+    needs: [required_behavior_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run required deterministic multicast contract
+        run: pytest -q tests/unit/test_asyncio_multicast_receiver_startup_cleanup.py::test_multicast_start_failure_cleans_dispatcher_and_state --timeout=60
+
+  # Tier: runtime trust aggregate gate
+  required_suite_with_coverage:
+    name: Release trust gate — required suite with coverage
+    needs: [api_symbol_stability, ruff_checks, mypy_supported_bounds, integration_tests_supported_bounds, integration_smoke_tests_intermediate_versions, integration_semantic_tests_intermediate_versions, required_behavior_tests, behavior_critical_tests, reliability_smoke_tests, multicast_contract_required]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Run required test suite with coverage
+        run: pytest -q -m "not multicast and not slow" --cov=aionetx --cov-report=term-missing --cov-fail-under=85 --timeout=60
+
+  # Tier: reproducible build verification (release runs only)
+  verify_reproducible_build:
+    name: Release trust gate — wheel reproducibility
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+      - name: Install build tool
+        run: python -m pip install --upgrade pip build
+      - name: Capture deterministic build timestamp
+        id: build_epoch
+        shell: bash
+        run: echo "epoch=$(git log -1 --format=%ct "${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+      - name: First wheel build
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
+        run: python -m build --wheel --outdir dist1/
+      - name: Second wheel build (independent repeat)
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
+        run: python -m build --wheel --outdir dist2/
+      - name: Compare wheel SHA-256 hashes (byte-identical check)
+        run: |
+          python - <<'EOF'
+          import hashlib, pathlib, sys
+          def sha256(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+          w1 = sorted(pathlib.Path("dist1").glob("*.whl"))
+          w2 = sorted(pathlib.Path("dist2").glob("*.whl"))
+          if not w1 or not w2:
+              print("ERROR: no wheel files found in dist1/ or dist2/", file=sys.stderr)
+              sys.exit(1)
+          if len(w1) != len(w2):
+              print(f"ERROR: wheel count mismatch: {len(w1)} vs {len(w2)}", file=sys.stderr)
+              sys.exit(1)
+          ok = True
+          for a, b in zip(w1, w2):
+              ha, hb = sha256(a), sha256(b)
+              if ha == hb:
+                  print(f"OK  {a.name}  {ha}")
+              else:
+                  print(f"FAIL {a.name}: {ha} != {hb}", file=sys.stderr)
+                  ok = False
+          sys.exit(0 if ok else 1)
+          EOF
+
+  release_profile_gate:
+    name: Release trust gate profile passed
+    needs: [required_suite_with_coverage, cross_platform_portability_smoke, verify_reproducible_build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm release profile gate completion
+        run: |
+          echo "Release profile trust gate completed."
+          echo "- release workflow contains required trust gates only"
+          echo "- CI-only non-blocking secondary lanes remain outside release trust gates by design"
+
+  release_codeql_gate:
+    name: Release trust gate — CodeQL alerts
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Capture deterministic build timestamp
+        id: build_epoch
+        shell: bash
+        run: echo "epoch=$(git log -1 --format=%ct "${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+      - name: Skip CodeQL release gate for non-tag runs
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: echo "Skipping CodeQL release gate because this run is not publishing a tagged release ref."
+      - name: Fail on open high/critical CodeQL alerts for release ref
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+        run: python scripts/ci/check_release_codeql_gate.py
+
+  verify_and_build:
+    name: Verify and build release artifacts
+    needs: [release_profile_gate, release_codeql_gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Capture deterministic build timestamp
+        id: build_epoch
+        shell: bash
+        run: echo "epoch=$(git log -1 --format=%ct "${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install build twine
+
+      - name: Build artifacts from source
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
+        run: python -m build
+
+      - name: Validate artifact metadata
+        run: python -m twine check dist/*
+
+      - name: Install wheel and run installed-artifact smoke + semantic mini-suite
+        run: |
+          python scripts/ci/install_single_artifact.py "dist/*.whl" --force-reinstall --no-deps
+          # Keep release installed-artifact verification at CI parity.
+          python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
+          python scripts/ci/installed_artifact_smoke.py
+          python scripts/ci/installed_artifact_semantic_minisuite.py
+          python -m pip check
+
+      - name: Install sdist and run installed-artifact smoke + semantic mini-suite
+        run: |
+          python -m pip uninstall -y aionetx
+          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps
+          python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
+          python scripts/ci/installed_artifact_smoke.py
+          python scripts/ci/installed_artifact_semantic_minisuite.py
+          python -m pip check
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+
+  # Tier: supply-chain trust (SBOM + SLSA provenance — tag-triggered only)
+  generate_sbom:
+    name: Generate SBOM (SPDX JSON)
+    needs: verify_and_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: dist
+          format: spdx-json
+          output-file: aionetx-sbom.spdx.json
+          artifact-name: aionetx-sbom.spdx.json
+
+  attest_provenance:
+    name: Attest SLSA provenance
+    needs: verify_and_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write      # required for OIDC token to sign provenance
+      attestations: write  # required to write attestation records
+      contents: read
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Attest build provenance (wheel)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/*.whl
+
+      - name: Attest build provenance (sdist)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/*.tar.gz
+
+  publish:
+    name: Publish package (OIDC trusted publishing)
+    needs: [verify_and_build, attest_provenance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aionetx/
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Publish to PyPI via OIDC
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+
+  publish_testpypi:
+    name: Publish package to TestPyPI (OIDC trusted publishing)
+    needs: verify_and_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_target == 'testpypi'
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/aionetx/
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Publish to TestPyPI via OIDC
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  github_release:
+    name: Attach dist to GitHub Release
+    needs: [publish, generate_sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: aionetx-sbom.spdx.json
+          path: release-sbom
+
+      - name: Create GitHub release and upload artifacts
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          files: |
+            dist/*
+            release-sbom/aionetx-sbom.spdx.json
+          generate_release_notes: true
+
+  github_release_dry_run:
+    name: Create dry-run GitHub Release draft with dist assets
+    needs: verify_and_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_target == 'dry-run'
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Create draft GitHub release with assets (dry run)
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          tag_name: dry-run-${{ github.run_id }}
+          target_commitish: ${{ github.sha }}
+          name: Dry Run Release ${{ github.run_id }}
+          body: |
+            Dry-run release created via workflow_dispatch with `publish_target=dry-run`.
+            This release is a draft and should be deleted after verification.
+          files: dist/*
+          draft: true
+          prerelease: true
+          generate_release_notes: false

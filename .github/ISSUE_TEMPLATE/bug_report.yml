@@ -1,0 +1,120 @@
+name: Bug report
+description: Report a defect in aionetx's runtime, lifecycle, or API behavior.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        Before filing, please check:
+        - **Questions or usage help** belong in [Discussions -> Q&A](https://github.com/MarcusKorinth/aionetx/discussions/categories/q-a), not here.
+        - **Security vulnerabilities** must be reported privately via [GitHub Private Vulnerability Reporting](https://github.com/MarcusKorinth/aionetx/security/advisories/new) or the email fallback in `SECURITY.md`. Do not file them as public issues.
+        - Search [existing issues](https://github.com/MarcusKorinth/aionetx/issues?q=is%3Aissue) to see if the bug is already tracked.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear, concise description of what is broken.
+      placeholder: e.g. "Calling `client.stop()` from inside an event handler leaves the dispatcher task alive."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: |
+        A self-contained snippet or steps to reproduce the bug. Please keep it as small as possible
+        - ideally fewer than 30 lines, using only `aionetx` and the standard library.
+      render: python
+      placeholder: |
+        import asyncio
+        from aionetx import AsyncioNetworkFactory
+        # ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen if the bug were fixed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happens instead? Include tracebacks or stderr output verbatim if any.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: aionetx-version
+    attributes:
+      label: aionetx version
+      description: Output of `python -c "import aionetx, importlib.metadata; print(importlib.metadata.version('aionetx'))"`
+      placeholder: e.g. 0.1.0
+    validations:
+      required: false
+
+  - type: dropdown
+    id: python-version
+    attributes:
+      label: Python version
+      description: If the bug is specific to a version, note it here; otherwise pick the one you reproduced with.
+      options:
+        - "3.10"
+        - "3.11"
+        - "3.12"
+        - "3.13"
+        - "3.14"
+        - Other / multiple (please specify in Additional context)
+    validations:
+      required: false
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other (please specify in Additional context)
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or stack trace
+      description: Relevant logs, stack traces, or event-handler output. Remove anything sensitive before pasting.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that would help diagnose the bug (network environment, container runtime, proxies, unusual firewall/NAT setup, etc.).
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have searched existing issues and confirmed this bug is not already reported.
+          required: true
+        - label: This is a defect in aionetx itself, not a usage question (usage questions belong in Discussions Q&A).
+          required: true
+        - label: This is not a security vulnerability (security vulnerabilities must be reported privately - see `SECURITY.md`).
+          required: true

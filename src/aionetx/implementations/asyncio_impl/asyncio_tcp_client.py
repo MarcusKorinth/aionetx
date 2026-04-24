@@ -1,0 +1,423 @@
+"""
+Asyncio TCP client with explicit supervision and lifecycle publication.
+
+This module owns client-side connect/reconnect orchestration and keeps
+connection-level behavior in :class:`AsyncioTcpConnection`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import Awaitable, Callable
+from types import TracebackType
+
+from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
+from aionetx.api.component_lifecycle_state import ComponentLifecycleState
+from aionetx.api.connection_protocol import ConnectionProtocol
+from aionetx.api.connection_lifecycle import ConnectionState
+from aionetx.api.error_policy import ErrorPolicy
+from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
+from aionetx.api.network_event_handler_protocol import NetworkEventHandlerProtocol
+from aionetx.api.tcp_client import TcpClientProtocol, TcpClientSettings
+from aionetx.implementations.asyncio_impl._tcp_client_connect import (
+    connect_once,
+    start_heartbeat_sender,
+    stop_heartbeat_sender,
+    wait_until_client_connected,
+)
+from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
+from aionetx.implementations.asyncio_impl._tcp_client_runtime import (
+    _ClientRuntimeAccessors,
+    _ClientRuntimeState,
+)
+from aionetx.implementations.asyncio_impl.identifier_utils import (
+    tcp_client_component_id,
+)
+from aionetx.implementations.asyncio_impl.event_dispatcher import (
+    AsyncioEventDispatcher,
+    DispatcherRuntimeStats,
+)
+from aionetx.implementations.asyncio_impl.lifecycle_internal import (
+    LifecycleRole,
+    LifecycleTransitionPublisher,
+    emit_lifecycle_event,
+)
+from aionetx.implementations.asyncio_impl.runtime_utils import (
+    ReconnectBackoff,
+    assert_running_on_owner_loop,
+    validate_heartbeat_provider,
+)
+from aionetx.implementations.asyncio_impl.tcp_client_supervision import (
+    TcpClientConnectionSupervisor,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
+    """
+    Managed asyncio TCP client with optional reconnect and heartbeats.
+
+    The client owns component lifecycle state and supervision. Individual
+    socket read/write behavior remains in :class:`AsyncioTcpConnection`.
+    """
+
+    def __init__(
+        self,
+        settings: TcpClientSettings,
+        event_handler: NetworkEventHandlerProtocol,
+        heartbeat_provider: HeartbeatProviderProtocol | None = None,
+        connection_opener: Callable[
+            ..., Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]
+        ]
+        | None = None,
+    ) -> None:
+        settings.validate()
+        validate_heartbeat_provider(
+            heartbeat_settings=settings.heartbeat,
+            heartbeat_provider=heartbeat_provider,
+        )
+        self._settings = settings
+        self._heartbeat_provider = heartbeat_provider
+        # Seam for deterministic tests and explicit connect-attempt control.
+        self._connection_opener = connection_opener or asyncio.open_connection
+        self._runtime = _ClientRuntimeState()
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._state_lock = asyncio.Lock()
+        self._lifecycle_state = ComponentLifecycleState.STOPPED
+        self._backoff = ReconnectBackoff(settings.reconnect)
+        self._status_changed = asyncio.Event()
+        self._runtime.connection_closed_event.set()
+        self._connection_supervisor = TcpClientConnectionSupervisor(self)
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
+        self._component_id = tcp_client_component_id(settings.host, settings.port)
+        self._logger = logging.LoggerAdapter(
+            logger, {"component": "tcp_client", "host": settings.host, "port": settings.port}
+        )
+        self._event_dispatcher = AsyncioEventDispatcher(
+            event_handler=event_handler,
+            delivery=settings.event_delivery,
+            logger=self._logger,
+            error_source=self._component_id,
+            stop_component_callback=self.stop,
+        )
+        self._lifecycle_publisher = LifecycleTransitionPublisher(
+            component_name=self._component_id,
+            resource_id=self._component_id,
+            role=LifecycleRole.TCP_CLIENT,
+            get_state=lambda: self._lifecycle_state,
+            set_state=lambda state: setattr(self, "_lifecycle_state", state),
+            on_state_applied=self._on_lifecycle_state_applied,
+        )
+
+    @property
+    def connection(self) -> ConnectionProtocol | None:
+        """
+        Return the current live connection when connected.
+
+        Returns:
+            ConnectionProtocol | None: Active connection object, or ``None``
+            when no connected session is currently available.
+        """
+        if self._connection is None or self._connection.state == ConnectionState.CLOSED:
+            return None
+        return self._connection
+
+    @property
+    def lifecycle_state(self) -> ComponentLifecycleState:
+        """Current component lifecycle state exposed by the managed client."""
+        return self._lifecycle_state
+
+    def __repr__(self) -> str:
+        return (
+            f"AsyncioTcpClient("
+            f"host={self._settings.host!r}, "
+            f"port={self._settings.port!r}, "
+            f"state={self._lifecycle_state.value!r})"
+        )
+
+    @property
+    def dispatcher_runtime_stats(self) -> DispatcherRuntimeStats:
+        """Dispatcher operational snapshot for runtime diagnostics."""
+        return self._event_dispatcher.runtime_stats
+
+    def _assert_owner_loop(self) -> None:
+        """
+        Raise RuntimeError if called outside the owner event loop.
+
+        Also pins ``_owner_loop`` on first call so all subsequent guard checks
+        use the same loop identity drawn from ``runtime_utils.asyncio`` - not
+        from a potentially test-patched module-level asyncio import.
+        """
+        self._owner_loop = assert_running_on_owner_loop(
+            class_name=type(self).__name__, owner_loop=self._owner_loop
+        )
+
+    async def start(self) -> None:
+        """Start lifecycle supervision and begin connect attempts."""
+        self._assert_owner_loop()
+        self._logger.debug("Starting TCP client.")
+        starting_event: ComponentLifecycleChangedEvent | None = None
+        running_event: ComponentLifecycleChangedEvent | None = None
+        async with self._state_lock:
+            if self._lifecycle_state in (
+                ComponentLifecycleState.STARTING,
+                ComponentLifecycleState.RUNNING,
+            ):
+                self._logger.debug("TCP client start called while already running.")
+                return
+            self._last_connect_error = None
+            self._has_started = True
+            # Keep dispatcher startup and the initial lifecycle transitions in one
+            # locked section so stop() cannot observe a half-started client.
+            await self._event_dispatcher.start()
+            starting_event = self._apply_lifecycle_state(ComponentLifecycleState.STARTING)
+            self._supervisor_task = asyncio.create_task(
+                self._supervise(), name="tcp-client-supervisor"
+            )
+            running_event = self._apply_lifecycle_state(ComponentLifecycleState.RUNNING)
+        try:
+            await self._emit_lifecycle_event(starting_event)
+            await self._emit_lifecycle_event(running_event)
+        except BaseException:
+            await self._rollback_failed_startup()
+            raise
+
+    async def stop(self) -> None:
+        """Stop supervision, close active resources, and publish STOPPED."""
+        self._assert_owner_loop()
+        self._logger.debug("Stopping TCP client.")
+        stopping_event: ComponentLifecycleChangedEvent | None = None
+        stopped_event: ComponentLifecycleChangedEvent | None = None
+        should_stop_dispatcher = False
+        await_supervisor_completion_only = False
+        skip_await_supervisor = False
+        current_task = asyncio.current_task()
+        async with self._state_lock:
+            if self._lifecycle_state in (
+                ComponentLifecycleState.STOPPING,
+                ComponentLifecycleState.STOPPED,
+            ):
+                supervisor_task = self._supervisor_task
+                if supervisor_task is not None and supervisor_task.done():
+                    self._supervisor_task = None
+                    supervisor_task = None
+                else:
+                    await_supervisor_completion_only = supervisor_task is not None
+            else:
+                stopping_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPING)
+                supervisor_task = self._supervisor_task
+                self._supervisor_task = None
+                should_stop_dispatcher = True
+                skip_await_supervisor = (
+                    current_task is not None
+                    and self._event_dispatcher.current_task_is_worker()
+                    and supervisor_task is not None
+                )
+        inline_delivery_context = (
+            self._event_dispatcher.inline_delivery_context()
+            if self._event_dispatcher.current_task_is_worker()
+            else contextlib.nullcontext()
+        )
+        with inline_delivery_context:
+            first_error: BaseException | None = None
+            try:
+                await self._emit_lifecycle_event(stopping_event)
+            except BaseException as error:
+                first_error = error
+            try:
+                if supervisor_task is not None and not skip_await_supervisor:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        if not await_supervisor_completion_only:
+                            supervisor_task.cancel()
+                        await supervisor_task
+                    if self._supervisor_task is supervisor_task:
+                        self._supervisor_task = None
+                await self._stop_heartbeat_sender()
+                await self._close_current_connection()
+                if (
+                    supervisor_task is not None
+                    and skip_await_supervisor
+                    and not await_supervisor_completion_only
+                ):
+                    supervisor_task.cancel()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            if should_stop_dispatcher:
+                async with self._state_lock:
+                    stopped_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
+                if first_error is None:
+                    try:
+                        await self._emit_lifecycle_event(stopped_event)
+                    except BaseException as error:
+                        first_error = error
+                try:
+                    await self._event_dispatcher.stop()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
+        self._logger.debug("TCP client stopped.")
+
+    async def __aenter__(self) -> AsyncioTcpClient:
+        """Start the client and return ``self``."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Stop the client unconditionally."""
+        await self.stop()
+
+    async def wait_until_connected(
+        self, timeout_seconds: float | None = None, poll_interval_seconds: float = 0.1
+    ) -> ConnectionProtocol:
+        """
+        Wait for an active connected connection.
+
+        Raises:
+            ValueError: If ``poll_interval_seconds`` is less than or equal to zero.
+            ConnectionError: If the client stops before a connection is available.
+            asyncio.TimeoutError: If ``timeout_seconds`` elapses first.
+        """
+        self._assert_owner_loop()
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be > 0.")
+        coro = wait_until_client_connected(
+            get_connection=lambda: self.connection,
+            get_lifecycle_state=lambda: self._lifecycle_state,
+            get_has_started=lambda: self._has_started,
+            get_last_connect_error=lambda: self._last_connect_error,
+            get_reconnect_enabled=lambda: self._settings.reconnect.enabled,
+            get_status_version=lambda: self._status_version,
+            status_changed=self._status_changed,
+            host=self._settings.host,
+            port=self._settings.port,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        if timeout_seconds is None:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=timeout_seconds)
+
+    async def _supervise(self) -> None:
+        """Delegate the connect/reconnect loop to the supervision helper."""
+        await self._connection_supervisor.run()
+
+    async def _rollback_failed_startup(self) -> None:
+        """Clean up startup-owned resources after lifecycle publication fails."""
+        async with self._state_lock:
+            supervisor_task = self._supervisor_task
+            self._supervisor_task = None
+            if self._lifecycle_state == ComponentLifecycleState.RUNNING:
+                self._apply_lifecycle_state(ComponentLifecycleState.STOPPING)
+                self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
+            elif self._lifecycle_state == ComponentLifecycleState.STARTING:
+                self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
+        if supervisor_task is not None:
+            supervisor_task.cancel()
+            with contextlib.suppress(BaseException):
+                await supervisor_task
+        with contextlib.suppress(BaseException):
+            await self._stop_heartbeat_sender()
+        with contextlib.suppress(BaseException):
+            await self._close_current_connection()
+        with contextlib.suppress(BaseException):
+            await self._event_dispatcher.stop()
+
+    async def _connect_once(self) -> None:
+        """Open one TCP session and attach connection-level event handling."""
+        connection = await connect_once(
+            settings=self._settings,
+            connection_opener=self._connection_opener,
+            event_dispatcher=self._event_dispatcher,
+            on_closed_callback=self._on_connection_closed,
+            logger=self._logger,
+            component_id=self._component_id,
+        )
+        self._connection = connection
+        self._connection_closed_event.clear()
+        self._notify_status_changed()
+        await self._start_heartbeat_sender(connection)
+
+    async def _start_heartbeat_sender(self, connection: AsyncioTcpConnection) -> None:
+        """Create and retain the optional heartbeat sender bound to ``connection``."""
+        self._heartbeat_sender = await start_heartbeat_sender(
+            connection=connection,
+            settings=self._settings,
+            heartbeat_provider=self._heartbeat_provider,
+            event_dispatcher=self._event_dispatcher,
+            logger=self._logger,
+        )
+
+    async def _stop_heartbeat_sender(self) -> None:
+        """Stop and detach the current heartbeat sender, if one exists."""
+        sender = self._heartbeat_sender
+        self._heartbeat_sender = None
+        await stop_heartbeat_sender(sender=sender, logger=self._logger)
+
+    async def _close_current_connection(self) -> None:
+        """Detach and close the current connection, if one is tracked."""
+        connection = self._connection
+        if connection is not None and connection.state != ConnectionState.CLOSED:
+            try:
+                await connection.close()
+            finally:
+                if self._connection is connection:
+                    self._connection = None
+                self._connection_closed_event.set()
+                self._notify_status_changed()
+            return
+        self._connection = None
+        self._connection_closed_event.set()
+        self._notify_status_changed()
+
+    async def _on_connection_closed(self, connection: AsyncioTcpConnection) -> None:
+        """Detach the closed connection, notify waiters, and stop heartbeats."""
+        if self._connection is connection:
+            self._connection = None
+            if self._lifecycle_state != ComponentLifecycleState.STOPPING:
+                self._connection_closed_event.set()
+                self._notify_status_changed()
+        await self._stop_heartbeat_sender()
+
+    def _on_lifecycle_state_applied(self, target: ComponentLifecycleState) -> None:
+        """Mirror published lifecycle state into runtime flags and wait conditions."""
+        self._running = target in (
+            ComponentLifecycleState.STARTING,
+            ComponentLifecycleState.RUNNING,
+        )
+        self._notify_status_changed()
+
+    def _apply_lifecycle_state(
+        self, target: ComponentLifecycleState
+    ) -> ComponentLifecycleChangedEvent | None:
+        """Apply one lifecycle transition and return the corresponding event, if any."""
+        return self._lifecycle_publisher.apply(target)
+
+    async def _emit_lifecycle_event(self, event: ComponentLifecycleChangedEvent | None) -> None:
+        """Emit a lifecycle event when the transition publisher produced one."""
+        await emit_lifecycle_event(dispatcher=self._event_dispatcher, event=event)
+
+    async def _transition_lifecycle_state(self, target: ComponentLifecycleState) -> None:
+        """Convenience helper that applies and emits a lifecycle transition."""
+        event = self._apply_lifecycle_state(target)
+        await self._emit_lifecycle_event(event)
+
+    def _resolve_error_policy(self) -> ErrorPolicy:
+        """Resolve the effective error policy after considering reconnect settings."""
+        if self._settings.error_policy is not None:
+            return self._settings.error_policy
+        return ErrorPolicy.RETRY if self._settings.reconnect.enabled else ErrorPolicy.FAIL_FAST
+
+    def _notify_status_changed(self) -> None:
+        """Bump the status version and wake polling/waiting helpers."""
+        self._status_version += 1
+        self._status_changed.set()

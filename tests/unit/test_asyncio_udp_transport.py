@@ -1,0 +1,753 @@
+"""
+Contract tests for the asyncio UDP receiver and sender implementations.
+
+These tests focus on lifecycle rollback, lazy socket creation, fallback
+polling, payload and target validation, and deterministic shutdown. Receiver
+and sender coverage live together because the public UDP API is asymmetric but
+the two components still share socket and lifecycle invariants.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import socket
+
+import pytest
+
+from aionetx.api.component_lifecycle_state import ComponentLifecycleState
+from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
+from aionetx.api.connection_events import ConnectionClosedEvent
+from aionetx.api.connection_events import ConnectionOpenedEvent
+from aionetx.api.connection_lifecycle import ConnectionState
+from aionetx.api.errors import NetworkConfigurationError, NetworkRuntimeError
+from aionetx.api.event_delivery_settings import (
+    EventDeliverySettings,
+    EventDispatchMode,
+    EventHandlerFailurePolicy,
+)
+from aionetx.api.udp import UdpInvalidTargetError
+from aionetx.api.udp import UdpReceiverSettings
+from aionetx.api.udp import UdpSenderStoppedError
+from aionetx.api.udp import UdpSenderSettings
+from aionetx.implementations.asyncio_impl import asyncio_udp_receiver as udp_receiver_module
+from aionetx.implementations.asyncio_impl import asyncio_udp_sender as udp_sender_module
+from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import AsyncioUdpReceiver
+from aionetx.implementations.asyncio_impl.asyncio_udp_sender import AsyncioUdpSender
+
+
+class NoopHandler:
+    async def on_event(self, event) -> None:
+        return None
+
+
+class FailOnOpenedHandler:
+    async def on_event(self, event) -> None:
+        if isinstance(event, ConnectionOpenedEvent):
+            raise RuntimeError("boom-on-opened")
+
+
+class FailOnLifecycleStateHandler:
+    def __init__(self, state: ComponentLifecycleState) -> None:
+        self._state = state
+
+    async def on_event(self, event) -> None:
+        if isinstance(event, ComponentLifecycleChangedEvent) and event.current == self._state:
+            raise RuntimeError(f"udp-{self._state.value}-publication-failed")
+
+
+def _get_unused_udp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_start_failure_cleans_dispatcher_and_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_bind(self: socket.socket, address: tuple[str, int]) -> None:
+        raise OSError("bind-failed")
+
+    monkeypatch.setattr(socket.socket, "bind", failing_bind)
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=21001),
+        event_handler=NoopHandler(),
+    )
+
+    with pytest.raises(OSError, match="bind-failed"):
+        await receiver.start()
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    # Verify that the dispatcher background worker was cleaned up via the public contract.
+    assert not receiver._event_dispatcher.is_running
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_start_failure_rolls_back_without_closed_event(
+    awaitable_recording_event_handler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_bind(self: socket.socket, address: tuple[str, int]) -> None:
+        raise OSError("bind-failed")
+
+    monkeypatch.setattr(socket.socket, "bind", failing_bind)
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=21011),
+        event_handler=awaitable_recording_event_handler,
+    )
+
+    with pytest.raises(OSError, match="bind-failed"):
+        await receiver.start()
+
+    lifecycle_states = [
+        event.current
+        for event in awaitable_recording_event_handler.lifecycle_events
+        if event.resource_id == receiver._connection_id  # type: ignore[attr-defined]
+    ]
+    assert lifecycle_states == [ComponentLifecycleState.STARTING, ComponentLifecycleState.STOPPED]
+    assert awaitable_recording_event_handler.closed_events == []
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_opened_handler_failure_rolls_back_runtime_resources() -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.INLINE,
+                handler_failure_policy=EventHandlerFailurePolicy.RAISE_IN_INLINE_MODE,
+            ),
+        ),
+        event_handler=FailOnOpenedHandler(),
+    )
+
+    with pytest.raises(RuntimeError, match="boom-on-opened"):
+        await receiver.start()
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert not receiver._event_dispatcher.is_running  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_starting_lifecycle_failure_rolls_back_dispatcher() -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.INLINE,
+                handler_failure_policy=EventHandlerFailurePolicy.RAISE_IN_INLINE_MODE,
+            ),
+        ),
+        event_handler=FailOnLifecycleStateHandler(ComponentLifecycleState.STARTING),
+    )
+
+    with pytest.raises(RuntimeError, match="udp-starting-publication-failed"):
+        await receiver.start()
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_receive_loop_runtime_failure_emits_error_and_stops(
+    awaitable_recording_event_handler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingLoop:
+        async def sock_recvfrom(self, _sock: socket.socket, _size: int):
+            raise RuntimeError("recv-failed")
+
+    monkeypatch.setattr(udp_receiver_module.asyncio, "get_running_loop", lambda: _FailingLoop())
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=21002),
+        event_handler=awaitable_recording_event_handler,
+    )
+    await receiver.start()
+    await asyncio.wait_for(awaitable_recording_event_handler.error_observed.wait(), timeout=1.0)
+    await asyncio.wait_for(awaitable_recording_event_handler.connection_closed.wait(), timeout=1.0)
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    # lifecycle_state == STOPPED is the public invariant for socket release;
+    # no need to inspect the private _socket attribute.
+    assert (
+        awaitable_recording_event_handler.closed_events[-1].previous_state
+        == ConnectionState.CONNECTED
+    )
+    assert awaitable_recording_event_handler.closed_events[-1].metadata is not None
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_stop_lifecycle_failure_still_closes_socket_and_stops_dispatcher() -> (
+    None
+):
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.INLINE,
+                handler_failure_policy=EventHandlerFailurePolicy.RAISE_IN_INLINE_MODE,
+            ),
+        ),
+        event_handler=FailOnLifecycleStateHandler(ComponentLifecycleState.STOPPING),
+    )
+
+    await receiver.start()
+    with pytest.raises(RuntimeError, match="udp-stopping-publication-failed"):
+        await receiver.stop()
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_stop_cancellation_still_detaches_receive_task_and_socket() -> None:
+    stopping_seen = asyncio.Event()
+
+    class BlockingStoppingHandler:
+        async def on_event(self, event) -> None:
+            if (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current == ComponentLifecycleState.STOPPING
+            ):
+                stopping_seen.set()
+                await asyncio.Event().wait()
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=BlockingStoppingHandler(),
+    )
+
+    await receiver.start()
+    original_task = receiver._task  # type: ignore[attr-defined]
+    stop_task = asyncio.create_task(receiver.stop())
+    await asyncio.wait_for(stopping_seen.wait(), timeout=1.0)
+    stop_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert original_task is not None and original_task.done()
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_inline_handler_can_stop_from_bytes_received_without_self_await() -> (
+    None
+):
+    stopped = asyncio.Event()
+
+    class StopFromBytesHandler:
+        def __init__(self) -> None:
+            self.receiver: AsyncioUdpReceiver | None = None
+
+        async def on_event(self, event) -> None:
+            if self.receiver is not None and type(event).__name__ == "BytesReceivedEvent":
+                await self.receiver.stop()
+                stopped.set()
+
+    port = _get_unused_udp_port()
+    handler = StopFromBytesHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=port)
+    )
+    try:
+        await receiver.start()
+        await sender.send(b"stop-from-handler")
+        await asyncio.wait_for(stopped.wait(), timeout=1.0)
+        assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+        assert receiver._task is None  # type: ignore[attr-defined]
+    finally:
+        await sender.stop()
+        await receiver.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_nonblocking_fallback_uses_bounded_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _LoopWithoutSockSendTo:
+        pass
+
+    class _TransientBlockingSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
+            self.calls += 1
+            if self.calls < 3:
+                raise BlockingIOError
+            return None
+
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 0)
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(
+        udp_sender_module.asyncio, "get_running_loop", lambda: _LoopWithoutSockSendTo()
+    )
+    monkeypatch.setattr(udp_sender_module.asyncio, "sleep", fake_sleep)
+
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=12345)
+    )
+    sock = _TransientBlockingSocket()
+    await sender._send_nonblocking(sock, b"payload", ("127.0.0.1", 12345))  # type: ignore[arg-type,attr-defined]
+
+    assert sock.calls == 3
+    assert sleep_delays == [
+        sender._WOULD_BLOCK_INITIAL_DELAY_SECONDS,
+        sender._WOULD_BLOCK_INITIAL_DELAY_SECONDS * 2,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_nonblocking_fallback_uses_bounded_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _LoopWithoutSockRecvFrom:
+        pass
+
+    class _TransientBlockingSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            self.calls += 1
+            if self.calls < 3:
+                raise BlockingIOError
+            return (b"payload", ("127.0.0.1", 1111))
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(udp_receiver_module.asyncio, "sleep", fake_sleep)
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=21009),
+        event_handler=NoopHandler(),
+    )
+    sock = _TransientBlockingSocket()
+    data, sender = await receiver._recv_nonblocking(_LoopWithoutSockRecvFrom(), sock, 1024)  # type: ignore[arg-type,attr-defined]
+
+    assert data == b"payload"
+    assert sender == ("127.0.0.1", 1111)
+    assert sock.calls == 3
+    assert sleep_delays == [
+        receiver._WOULD_BLOCK_INITIAL_DELAY_SECONDS,
+        receiver._WOULD_BLOCK_INITIAL_DELAY_SECONDS * 2,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_nonblocking_fallback_logs_one_warning_per_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _LoopWithoutSockRecvFrom:
+        pass
+
+    class _TransientBlockingSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            self.calls += 1
+            if self.calls in (1, 3):
+                raise BlockingIOError
+            return (b"payload", ("127.0.0.1", 1111))
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(udp_receiver_module.asyncio, "sleep", fake_sleep)
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=21010),
+        event_handler=NoopHandler(),
+    )
+    sock = _TransientBlockingSocket()
+
+    with caplog.at_level(logging.WARNING):
+        await receiver._recv_nonblocking(_LoopWithoutSockRecvFrom(), sock, 1024)  # type: ignore[arg-type,attr-defined]
+        await receiver._recv_nonblocking(_LoopWithoutSockRecvFrom(), sock, 1024)  # type: ignore[arg-type,attr-defined]
+
+    warning_messages = [
+        message
+        for message in caplog.messages
+        if "fallback polling because the event loop does not expose sock_recvfrom" in message
+    ]
+    assert warning_messages == [
+        "UDP is using recvfrom() fallback polling because the event loop does not expose sock_recvfrom()."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_constructor_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
+    socket_calls: list[tuple[int, int, int]] = []
+    original_socket = socket.socket
+
+    def tracking_socket(family: int, stype: int, proto: int = 0):
+        socket_calls.append((family, stype, proto))
+        return original_socket(family, stype, proto)
+
+    monkeypatch.setattr(udp_sender_module.socket, "socket", tracking_socket)
+
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=12345)
+    )
+    await sender.stop()
+
+    assert socket_calls == []
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_first_send_initializes_socket() -> None:
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=_get_unused_udp_port())
+    )
+    try:
+        # Verify lazy socket initialization: no socket before first send.
+        assert not sender.is_socket_initialized
+        await sender.send(b"first")
+        assert sender.is_socket_initialized
+    finally:
+        await sender.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_accepts_bytes_like_payloads() -> None:
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=_get_unused_udp_port())
+    )
+    try:
+        await sender.send(b"bytes")
+        await sender.send(bytearray(b"bytearray"))
+        await sender.send(memoryview(b"memoryview"))
+    finally:
+        await sender.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_stop_before_first_send_is_safe_and_send_after_stop_fails() -> None:
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=12345)
+    )
+    await sender.stop()
+    await sender.stop()
+
+    with pytest.raises(UdpSenderStoppedError, match="stopped") as exc_info:
+        await sender.send(b"after-stop")
+    assert isinstance(exc_info.value, NetworkRuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_validates_payload_and_target() -> None:
+    sender = AsyncioUdpSender(settings=UdpSenderSettings())
+    try:
+        with pytest.raises(TypeError, match="bytes-like"):
+            await sender.send("not-bytes")  # type: ignore[arg-type]
+        with pytest.raises(UdpInvalidTargetError, match="target host") as exc_info:
+            await sender.send(b"ok")
+        assert isinstance(exc_info.value, NetworkConfigurationError)
+
+        with pytest.raises(UdpInvalidTargetError, match="target host"):
+            await sender.send(b"ok", host="   ", port=9999)
+
+        with pytest.raises(UdpInvalidTargetError, match="target host"):
+            await sender.send(b"ok", host=object(), port=9999)  # type: ignore[arg-type]
+
+        with pytest.raises(UdpInvalidTargetError, match="between 1 and 65535") as invalid_port_exc:
+            await sender.send(b"ok", host="127.0.0.1", port=70000)
+        assert isinstance(invalid_port_exc.value, NetworkConfigurationError)
+
+        with pytest.raises(UdpInvalidTargetError, match="target port"):
+            await sender.send(b"ok", host="127.0.0.1", port=9999.0)  # type: ignore[arg-type]
+    finally:
+        await sender.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_sets_broadcast_socket_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[tuple[int, int, object]] = []
+    original_setsockopt = socket.socket.setsockopt
+
+    def tracking_setsockopt(self: socket.socket, level: int, optname: int, value) -> None:
+        observed.append((level, optname, value))
+        return original_setsockopt(self, level, optname, value)
+
+    monkeypatch.setattr(socket.socket, "setsockopt", tracking_setsockopt)
+
+    receiver_port = _get_unused_udp_port()
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(
+            default_host="255.255.255.255",
+            default_port=receiver_port,
+            enable_broadcast=True,
+        )
+    )
+    try:
+        with contextlib.suppress(OSError):
+            await sender.send(b"broadcast")
+    finally:
+        await sender.stop()
+
+    assert any(
+        level == socket.SOL_SOCKET and optname == socket.SO_BROADCAST
+        for level, optname, _ in observed
+    )
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_target_resolution_prefers_send_arguments_over_defaults() -> None:
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=11000),
+    )
+    seen_targets: list[tuple[str, int]] = []
+
+    async def fake_send_nonblocking(sock, payload: bytes, target: tuple[str, int]) -> None:  # type: ignore[no-untyped-def]
+        seen_targets.append(target)
+
+    sender._send_nonblocking = fake_send_nonblocking  # type: ignore[method-assign,assignment]
+    try:
+        await sender.send(b"default")
+        await sender.send(b"host-only", host="127.0.0.2")
+        await sender.send(b"port-only", port=12000)
+        await sender.send(b"both", host="127.0.0.3", port=13000)
+    finally:
+        await sender.stop()
+
+    assert seen_targets == [
+        ("127.0.0.1", 11000),
+        ("127.0.0.2", 11000),
+        ("127.0.0.1", 12000),
+        ("127.0.0.3", 13000),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_stop_does_not_await_dispatcher_while_holding_state_lock() -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=NoopHandler(),
+    )
+    await receiver.start()
+
+    async def dispatcher_stop_requiring_state_lock() -> None:
+        async with receiver._state_lock:  # type: ignore[attr-defined]
+            return None
+
+    receiver._event_dispatcher.stop = dispatcher_stop_requiring_state_lock  # type: ignore[method-assign]
+    await asyncio.wait_for(receiver.stop(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_stop_from_starting_state_does_not_emit_closed_event(
+    awaitable_recording_event_handler,
+) -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=awaitable_recording_event_handler,
+    )
+
+    receiver._runtime.lifecycle_state = ComponentLifecycleState.STARTING  # type: ignore[attr-defined]
+    receiver._runtime.connection_state = ConnectionState.CREATED  # type: ignore[attr-defined]
+
+    await receiver.stop()
+
+    assert awaitable_recording_event_handler.closed_events == []
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_stop_emits_stopping_closed_stopped_in_order(
+    awaitable_recording_event_handler,
+) -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=awaitable_recording_event_handler,
+    )
+    await receiver.start()
+    await receiver.stop()
+
+    stop_relevant_events = [
+        event
+        for event in awaitable_recording_event_handler.events
+        if (
+            isinstance(event, ConnectionClosedEvent)
+            or (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current
+                in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            )
+        )
+    ]
+    assert [type(event).__name__ for event in stop_relevant_events] == [
+        "ComponentLifecycleChangedEvent",
+        "ConnectionClosedEvent",
+        "ComponentLifecycleChangedEvent",
+    ]
+    assert isinstance(stop_relevant_events[0], ComponentLifecycleChangedEvent)
+    assert stop_relevant_events[0].current == ComponentLifecycleState.STOPPING
+    assert isinstance(stop_relevant_events[2], ComponentLifecycleChangedEvent)
+    assert stop_relevant_events[2].current == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_overlapping_stop_calls_publish_one_stop_sequence(
+    awaitable_recording_event_handler,
+) -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=awaitable_recording_event_handler,
+    )
+    await receiver.start()
+
+    await asyncio.gather(receiver.stop(), receiver.stop())
+
+    stop_lifecycle_events = [
+        event
+        for event in awaitable_recording_event_handler.lifecycle_events
+        if event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+    ]
+    assert [event.current for event in stop_lifecycle_events] == [
+        ComponentLifecycleState.STOPPING,
+        ComponentLifecycleState.STOPPED,
+    ]
+    assert len(awaitable_recording_event_handler.closed_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_rejects_illegal_lifecycle_transition() -> None:
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=NoopHandler(),
+    )
+
+    with pytest.raises(RuntimeError, match="Illegal lifecycle transition"):
+        await receiver._set_lifecycle_state(ComponentLifecycleState.RUNNING)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_closes_socket_when_bind_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Socket created before bind() must be closed if bind() raises OSError."""
+    closed_sockets: list[socket.socket] = []
+    original_socket_cls = socket.socket
+
+    class TrackingSocket(original_socket_cls):  # type: ignore[misc]
+        def bind(self, address: tuple[str, int]) -> None:
+            raise OSError("bind-failed")
+
+        def close(self) -> None:
+            closed_sockets.append(self)
+            super().close()
+
+    monkeypatch.setattr(udp_sender_module.socket, "socket", TrackingSocket)
+
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=12345)
+    )
+    with pytest.raises(OSError, match="bind-failed"):
+        await sender.send(b"trigger-socket-creation")
+
+    assert len(closed_sockets) == 1, "Socket must be closed when bind() fails"
+    # After a failed initialization the sender must not hold a socket reference.
+    assert not sender.is_socket_initialized
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_refreshes_connection_id_after_ephemeral_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_socket_cls = socket.socket
+
+    class TrackingSocket(original_socket_cls):  # type: ignore[misc]
+        def bind(self, address: tuple[str, int]) -> None:
+            self._bound_address = ("127.0.0.1", 30123)
+
+        def getsockname(self) -> tuple[str, int]:
+            return self._bound_address
+
+    monkeypatch.setattr(udp_sender_module.socket, "socket", TrackingSocket)
+
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(
+            default_host="127.0.0.1",
+            default_port=12345,
+            local_host="0.0.0.0",
+            local_port=0,
+        )
+    )
+
+    sock = sender._ensure_socket()  # type: ignore[attr-defined]
+    try:
+        assert sender._connection_id == "udp/sender/127.0.0.1/30123"  # type: ignore[attr-defined]
+        assert sender._logger.extra["connection_id"] == "udp/sender/127.0.0.1/30123"  # type: ignore[attr-defined]
+        assert sock is not None
+    finally:
+        await sender.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_sender_closes_socket_when_setsockopt_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Socket created before setsockopt() must be closed if setsockopt() raises OSError."""
+    closed_sockets: list[socket.socket] = []
+    original_socket_cls = socket.socket
+
+    class TrackingSocket(original_socket_cls):  # type: ignore[misc]
+        def setsockopt(self, level: int, optname: int, value: int) -> None:
+            raise OSError("setsockopt-failed")
+
+        def close(self) -> None:
+            closed_sockets.append(self)
+            super().close()
+
+    monkeypatch.setattr(udp_sender_module.socket, "socket", TrackingSocket)
+
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(
+            default_host="127.0.0.1", default_port=12345, enable_broadcast=True
+        )
+    )
+    with pytest.raises(OSError, match="setsockopt-failed"):
+        await sender.send(b"trigger-socket-creation")
+
+    assert len(closed_sockets) == 1, "Socket must be closed when setsockopt() fails"
+    # After a failed initialization the sender must not hold a socket reference.
+    assert not sender.is_socket_initialized

@@ -1,0 +1,41 @@
+name: codeql
+
+on:
+  push:
+    branches: ["main", "release-readiness"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Run weekly on Monday at 08:00 UTC independent of push activity.
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: CodeQL — Python security analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # CodeQL is always non-blocking for pre-release; results appear in the
+    # Security tab without gating the required CI trust envelope.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4
+        with:
+          languages: python
+          # Use the default security-and-quality query suite for broad coverage.
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4
+        with:
+          category: "/language:python"

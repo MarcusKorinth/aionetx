@@ -1,0 +1,34 @@
+version: 2
+updates:
+  # Python package dependencies (dev extras in pyproject.toml)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "python"
+    # Group all dev dep bumps into a single PR to reduce noise
+    groups:
+      dev-dependencies:
+        patterns:
+          - "*"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      action-updates:
+        patterns:
+          - "*"
+      security-patches:
+        applies-to: security-updates
+        patterns:
+          - "*"

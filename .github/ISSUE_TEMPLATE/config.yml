@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions, usage help, design discussions
+    url: https://github.com/MarcusKorinth/aionetx/discussions/categories/q-a
+    about: Please ask questions and discuss usage patterns in Discussions Q&A rather than opening an issue. Bugs and concrete feature proposals still belong in this tracker.
+  - name: Ideas and brainstorming
+    url: https://github.com/MarcusKorinth/aionetx/discussions
+    about: For early-stage ideas that are not yet a concrete feature proposal, use Discussions. Open a feature request here only when you have a specific behavior change in mind.
+  - name: Report a security vulnerability
+    url: https://github.com/MarcusKorinth/aionetx/security/advisories/new
+    about: Do not file public issues for suspected vulnerabilities. Use GitHub Private Vulnerability Reporting, or see SECURITY.md for the email fallback.
