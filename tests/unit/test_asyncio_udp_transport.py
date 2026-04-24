@@ -31,7 +31,9 @@ from aionetx.api.udp import UdpInvalidTargetError
 from aionetx.api.udp import UdpReceiverSettings
 from aionetx.api.udp import UdpSenderStoppedError
 from aionetx.api.udp import UdpSenderSettings
-from aionetx.implementations.asyncio_impl import asyncio_udp_receiver as udp_receiver_module
+from aionetx.implementations.asyncio_impl import (
+    _asyncio_datagram_receiver_base as datagram_base_module,
+)
 from aionetx.implementations.asyncio_impl import asyncio_udp_sender as udp_sender_module
 from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import AsyncioUdpReceiver
 from aionetx.implementations.asyncio_impl.asyncio_udp_sender import AsyncioUdpSender
@@ -167,7 +169,7 @@ async def test_udp_receiver_receive_loop_runtime_failure_emits_error_and_stops(
         async def sock_recvfrom(self, _sock: socket.socket, _size: int):
             raise RuntimeError("recv-failed")
 
-    monkeypatch.setattr(udp_receiver_module.asyncio, "get_running_loop", lambda: _FailingLoop())
+    monkeypatch.setattr(datagram_base_module.asyncio, "get_running_loop", lambda: _FailingLoop())
 
     receiver = AsyncioUdpReceiver(
         settings=UdpReceiverSettings(host="127.0.0.1", port=21002),
@@ -244,7 +246,7 @@ async def test_udp_receiver_stop_cancellation_still_detaches_receive_task_and_so
     # Supported Python releases differ in whether this caller cancellation
     # remains visible after inline handler-failure handling. Cleanup is stable.
     with contextlib.suppress(asyncio.CancelledError):
-        await stop_task
+        _ = await stop_task
 
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._socket is None  # type: ignore[attr-defined]
@@ -358,7 +360,7 @@ async def test_udp_receiver_nonblocking_fallback_uses_bounded_backoff(
     async def fake_sleep(delay: float) -> None:
         sleep_delays.append(delay)
 
-    monkeypatch.setattr(udp_receiver_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(datagram_base_module.asyncio, "sleep", fake_sleep)
 
     receiver = AsyncioUdpReceiver(
         settings=UdpReceiverSettings(host="127.0.0.1", port=21009),
@@ -397,7 +399,7 @@ async def test_udp_receiver_nonblocking_fallback_logs_one_warning_per_receiver(
     async def fake_sleep(_delay: float) -> None:
         return None
 
-    monkeypatch.setattr(udp_receiver_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(datagram_base_module.asyncio, "sleep", fake_sleep)
 
     receiver = AsyncioUdpReceiver(
         settings=UdpReceiverSettings(host="127.0.0.1", port=21010),

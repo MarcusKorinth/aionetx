@@ -122,7 +122,7 @@ class TcpServerProtocol(ManagedTransportProtocol, Protocol):
 
         Rejected or already-closed connections are never part of this tuple.
         """
-        ...
+        raise NotImplementedError
 
     async def wait_until_running(
         self,
@@ -138,7 +138,7 @@ class TcpServerProtocol(ManagedTransportProtocol, Protocol):
             asyncio.TimeoutError: When ``timeout_seconds`` is provided and
                 timeout expires.
         """
-        ...
+        raise NotImplementedError
 
     async def broadcast(self, data: BytesLike) -> None:
         """
@@ -149,7 +149,7 @@ class TcpServerProtocol(ManagedTransportProtocol, Protocol):
         observable through events and may still cause this call to raise after
         best-effort delivery/cleanup.
         """
-        ...
+        raise NotImplementedError
 
 
 __all__ = (

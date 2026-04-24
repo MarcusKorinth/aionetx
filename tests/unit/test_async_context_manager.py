@@ -72,9 +72,13 @@ async def test_tcp_server_async_context_manager_stops_on_exception() -> None:
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
         event_handler=_NoopHandler(),
     )
-    with pytest.raises(ValueError, match="test-error"):
+    try:
         async with server:
             raise ValueError("test-error")
+    except ValueError as error:
+        assert str(error) == "test-error"
+    else:
+        pytest.fail("async context manager body did not raise")
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
 
 

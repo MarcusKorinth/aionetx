@@ -25,4 +25,4 @@ class HeartbeatProviderProtocol(Protocol):
         Returns:
             A ``HeartbeatResult`` indicating whether bytes should be sent and which payload.
         """
-        ...
+        raise NotImplementedError

@@ -357,7 +357,7 @@ async def test_server_broadcast_handles_concurrent_client_disconnect(
 
     stop_task = asyncio.create_task(disconnecting_client.stop())
     await server.broadcast(b"race-broadcast")
-    await stop_task
+    _ = await stop_task
 
     await wait_for_condition(
         lambda: (

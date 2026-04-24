@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable
+from typing import cast
 
 from aionetx.api.connection_protocol import ConnectionProtocol
 from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
@@ -107,7 +109,7 @@ class AsyncioHeartbeatSender:
             self._logger.debug("Stopping heartbeat sender for %s.", self._connection.connection_id)
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await task
+                _ = await cast(Awaitable[object], task)
 
     async def _run(self) -> None:
         """

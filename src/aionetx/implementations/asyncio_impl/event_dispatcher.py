@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import cast
 
 from aionetx.api.event_delivery_settings import (
     EventBackpressurePolicy,
@@ -262,7 +263,7 @@ class AsyncioEventDispatcher:
             self._dropped_stop_phase_total += len(self._queue)
             self._queue.clear()
             return
-        await worker_task
+        _ = await cast(Awaitable[object], worker_task)
 
     async def emit(self, event: NetworkEvent) -> None:
         """

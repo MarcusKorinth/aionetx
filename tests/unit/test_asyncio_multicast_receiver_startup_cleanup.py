@@ -24,10 +24,13 @@ from aionetx.api.event_delivery_settings import (
     EventHandlerFailurePolicy,
 )
 from aionetx.api.multicast_receiver_settings import MulticastReceiverSettings
+from aionetx.implementations.asyncio_impl import (
+    _asyncio_datagram_receiver_base as datagram_base_module,
+)
+from aionetx.implementations.asyncio_impl import asyncio_multicast_receiver as multicast_module
 from aionetx.implementations.asyncio_impl.asyncio_multicast_receiver import (
     AsyncioMulticastReceiver,
 )
-from aionetx.implementations.asyncio_impl import asyncio_multicast_receiver as multicast_module
 
 
 class NoopHandler:
@@ -253,7 +256,7 @@ async def test_multicast_receive_loop_runtime_failure_emits_error_and_stops(
         async def sock_recvfrom(self, _sock: socket.socket, _size: int):
             raise RuntimeError("recv-failed")
 
-    monkeypatch.setattr(multicast_module.asyncio, "get_running_loop", lambda: _FailingLoop())
+    monkeypatch.setattr(datagram_base_module.asyncio, "get_running_loop", lambda: _FailingLoop())
 
     receiver = AsyncioMulticastReceiver(
         settings=MulticastReceiverSettings(

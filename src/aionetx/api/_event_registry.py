@@ -168,3 +168,15 @@ def validate_network_event_registry_conformance(
 
 
 validate_network_event_registry_conformance(NetworkEvent, NETWORK_EVENT_REGISTRY)
+
+__all__ = (
+    "EventHandlerMethod",
+    "EventRegistryEntry",
+    "EventType",
+    "NETWORK_EVENT_HANDLER_METHODS",
+    "NETWORK_EVENT_RECORDING_BUCKETS",
+    "NETWORK_EVENT_REGISTRY",
+    "NETWORK_EVENT_TYPES",
+    "NetworkEvent",
+    "validate_network_event_registry_conformance",
+)

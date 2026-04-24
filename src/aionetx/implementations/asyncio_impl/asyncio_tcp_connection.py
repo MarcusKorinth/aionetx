@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, cast
 
 from aionetx.api.bytes_like import BytesLike
 from aionetx.api.bytes_received_event import BytesReceivedEvent
@@ -217,7 +217,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
             if close_task.done() and close_task.cancelled():
                 raise
             cancellation_requested = True
-            await close_task
+            _ = await cast(Awaitable[object], close_task)
         if cancellation_requested:
             raise asyncio.CancelledError
 
@@ -258,7 +258,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
                         try:
                             result = callback(self)
                             if asyncio.iscoroutine(result):
-                                await result
+                                _ = await result
                         except Exception as error:
                             if _warning_limiter.should_log(
                                 f"tcp-connection-close-callback:{self._connection_id}"
@@ -341,7 +341,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
             if publication_task.done() and publication_task.cancelled():
                 raise
             cancelled_during_emit = True
-            await publication_task
+            _ = await cast(Awaitable[object], publication_task)
         if cancelled_during_emit:
             raise asyncio.CancelledError
 

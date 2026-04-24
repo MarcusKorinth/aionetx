@@ -7,7 +7,6 @@ group membership management, and multicast-specific cleanup behavior.
 
 from __future__ import annotations
 
-import asyncio  # noqa: F401 - test seam: monkeypatched in unit tests
 import contextlib
 import logging
 import socket

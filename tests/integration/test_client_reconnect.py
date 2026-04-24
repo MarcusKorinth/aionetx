@@ -123,7 +123,7 @@ async def test_tcp_client_reconnects_after_server_appears(recording_event_handle
         if delayed_server_task is not None:
             delayed_server_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await delayed_server_task
+                _ = await delayed_server_task
         await client.stop()
         if server is not None:
             server.close()
@@ -637,7 +637,7 @@ async def test_cancelling_connect_waiter_does_not_break_subsequent_waiters(
         await wait_for_condition(lambda: cancelled_waiter.done() is False, timeout_seconds=0.5)
         cancelled_waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await cancelled_waiter
+            _ = await cancelled_waiter
 
         surviving_waiter = asyncio.create_task(client.wait_until_connected(timeout_seconds=2.0))
         await wait_for_condition(lambda: surviving_waiter.done() is False, timeout_seconds=0.5)
@@ -687,7 +687,7 @@ async def test_supervisor_cancellation_during_connect_attempt_finalizes_without_
     assert supervisor is not None
     supervisor.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await supervisor
+        _ = await supervisor
 
     release_connect.set()
     await asyncio.wait_for(client.stop(), timeout=1.0)

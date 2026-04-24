@@ -457,7 +457,7 @@ async def test_server_wait_until_running_succeeds(recording_event_handler) -> No
     )
     start_task = asyncio.create_task(server.start())
     await asyncio.wait_for(server.wait_until_running(timeout_seconds=1.0), timeout=1.0)
-    await start_task
+    _ = await start_task
     assert server.lifecycle_state == ComponentLifecycleState.RUNNING
     await server.stop()
 

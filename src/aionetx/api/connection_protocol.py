@@ -28,27 +28,27 @@ class ConnectionProtocol(ByteSenderProtocol, Protocol):
     @property
     def connection_id(self) -> str:
         """Return a stable identifier used for correlation in emitted events."""
-        ...
+        raise NotImplementedError
 
     @property
     def role(self) -> ConnectionRole:
         """Return the logical role of the connection endpoint."""
-        ...
+        raise NotImplementedError
 
     @property
     def state(self) -> ConnectionState:
         """Return the current lifecycle state."""
-        ...
+        raise NotImplementedError
 
     @property
     def is_connected(self) -> bool:
         """Return ``True`` when ``send`` is expected to succeed."""
-        ...
+        raise NotImplementedError
 
     @property
     def metadata(self) -> ConnectionMetadata:
         """Return immutable transport metadata for this connection."""
-        ...
+        raise NotImplementedError
 
     async def send(self, data: BytesLike) -> None:
         """
@@ -63,7 +63,7 @@ class ConnectionProtocol(ByteSenderProtocol, Protocol):
             OSError: When the underlying transport accepts the write but later
                 reports a socket or stream failure while flushing.
         """
-        ...
+        raise NotImplementedError
 
     async def close(self) -> None:
         """
@@ -72,4 +72,4 @@ class ConnectionProtocol(ByteSenderProtocol, Protocol):
         Implementations should be safe to call repeatedly. After close, future
         ``send()`` calls must fail rather than silently succeeding.
         """
-        ...
+        raise NotImplementedError

@@ -268,6 +268,7 @@ async def handle_accepted_client(
     """Initialize one accepted socket into managed connection state."""
     peer_info = writer.get_extra_info("peername")
     remote_host, remote_port = _extract_remote_peer_address(peer_info)
+    connection: AsyncioTcpConnection | None = None
     rejection_event: ConnectionRejectedEvent | None = None
     async with state_lock:
         connection_id = get_connection_id()
@@ -278,7 +279,6 @@ async def handle_accepted_client(
                 get_lifecycle_state().value,
             )
             should_reject = True
-            connection = None
         elif len(connections) >= max_connections:
             logger.warning(
                 "Rejecting accepted TCP client connection %s because max_connections=%s is reached.",
@@ -286,7 +286,6 @@ async def handle_accepted_client(
                 max_connections,
             )
             should_reject = True
-            connection = None
             rejection_event = ConnectionRejectedEvent(
                 resource_id=component_id,
                 connection_id=connection_id,
@@ -339,7 +338,7 @@ async def handle_accepted_client(
             heartbeat_senders=heartbeat_senders,
             logger=logger,
         )
-    except BaseException as error:
+    except (Exception, asyncio.CancelledError) as error:
         logger.warning("Failed to initialize connection %s: %s", connection_id, error)
         if isinstance(error, Exception):
             try:
@@ -360,5 +359,5 @@ async def handle_accepted_client(
                 connection_id,
                 close_error,
             )
-        if not isinstance(error, Exception):
+        if isinstance(error, asyncio.CancelledError):
             raise

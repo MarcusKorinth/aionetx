@@ -764,7 +764,7 @@ async def test_client_reconnect_wait_returns_early_when_stop_changes_status(
     should_continue = await client._connection_supervisor._wait_for_reconnect_delay_or_stop(  # type: ignore[attr-defined]
         delay_seconds=10.0
     )
-    await stop_task
+    _ = await stop_task
 
     assert should_continue is False
 

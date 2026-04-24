@@ -9,10 +9,12 @@ public API state and resource ownership.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
+from aionetx.api.component_lifecycle_state import ComponentLifecycleState
 from aionetx.api.connection_lifecycle import ConnectionState
 from aionetx.api.error_policy import ErrorPolicy
 from aionetx.api.network_error_event import NetworkErrorEvent
@@ -21,13 +23,59 @@ from aionetx.api.reconnect_events import (
     ReconnectAttemptStartedEvent,
     ReconnectScheduledEvent,
 )
+from aionetx.api.tcp_client import TcpClientSettings
+from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
+from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from aionetx.implementations.asyncio_impl.lifecycle_internal import (
     apply_stopped_transition_if_stopping,
     apply_stopping_transition_if_active,
 )
+from aionetx.implementations.asyncio_impl.runtime_utils import ReconnectBackoff
 
-if TYPE_CHECKING:
-    from aionetx.implementations.asyncio_impl.asyncio_tcp_client import AsyncioTcpClient
+
+class _TcpClientForSupervision(Protocol):
+    """Structural view of the private client hooks used by supervision."""
+
+    _attempt_counter: int
+    _backoff: ReconnectBackoff
+    _component_id: str
+    _connection: AsyncioTcpConnection | None
+    _event_dispatcher: AsyncioEventDispatcher
+    _last_connect_error: Exception | None
+    _lifecycle_state: ComponentLifecycleState
+    _logger: logging.LoggerAdapter[logging.Logger]
+    _running: bool
+    _settings: TcpClientSettings
+    _state_lock: asyncio.Lock
+    _status_changed: asyncio.Event
+    _status_version: int
+
+    @property
+    def _connection_closed_event(self) -> asyncio.Event:
+        raise NotImplementedError
+
+    def _apply_lifecycle_state(
+        self, target: ComponentLifecycleState
+    ) -> ComponentLifecycleChangedEvent | None:
+        raise NotImplementedError
+
+    async def _close_current_connection(self) -> None:
+        raise NotImplementedError
+
+    async def _connect_once(self) -> None:
+        raise NotImplementedError
+
+    async def _emit_lifecycle_event(self, event: ComponentLifecycleChangedEvent | None) -> None:
+        raise NotImplementedError
+
+    def _notify_status_changed(self) -> None:
+        raise NotImplementedError
+
+    def _resolve_error_policy(self) -> ErrorPolicy:
+        raise NotImplementedError
+
+    async def _stop_heartbeat_sender(self) -> None:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -94,7 +142,7 @@ class TcpClientConnectionSupervisor:
                                                +-- retry enabled -----------> sleep -> next attempt
     """
 
-    def __init__(self, client: "AsyncioTcpClient") -> None:
+    def __init__(self, client: _TcpClientForSupervision) -> None:
         self._client = client
 
     async def run(self) -> None:

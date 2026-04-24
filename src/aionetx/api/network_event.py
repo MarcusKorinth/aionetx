@@ -49,3 +49,5 @@ from typing import TypeAlias
 from aionetx.api._event_registry import NetworkEvent as _NetworkEvent
 
 NetworkEvent: TypeAlias = _NetworkEvent
+
+__all__ = ("NetworkEvent",)

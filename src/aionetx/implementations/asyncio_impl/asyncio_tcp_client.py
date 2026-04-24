@@ -12,6 +12,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from types import TracebackType
+from typing import cast
 
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
@@ -181,7 +182,7 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         try:
             await self._emit_lifecycle_event(starting_event)
             await self._emit_lifecycle_event(running_event)
-        except BaseException:
+        except (Exception, asyncio.CancelledError):
             await self._rollback_failed_startup()
             raise
 
@@ -225,14 +226,14 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
             first_error: BaseException | None = None
             try:
                 await self._emit_lifecycle_event(stopping_event)
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 first_error = error
             try:
                 if supervisor_task is not None and not skip_await_supervisor:
                     with contextlib.suppress(asyncio.CancelledError):
                         if not await_supervisor_completion_only:
                             supervisor_task.cancel()
-                        await supervisor_task
+                        _ = await cast(Awaitable[object], supervisor_task)
                     if self._supervisor_task is supervisor_task:
                         self._supervisor_task = None
                 await self._stop_heartbeat_sender()
@@ -243,7 +244,7 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     and not await_supervisor_completion_only
                 ):
                     supervisor_task.cancel()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if first_error is None:
                     first_error = error
             if should_stop_dispatcher:
@@ -252,11 +253,11 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                 if first_error is None:
                     try:
                         await self._emit_lifecycle_event(stopped_event)
-                    except BaseException as error:
+                    except (Exception, asyncio.CancelledError) as error:
                         first_error = error
                 try:
                     await self._event_dispatcher.stop()
-                except BaseException as error:
+                except (Exception, asyncio.CancelledError) as error:
                     if first_error is None:
                         first_error = error
             if first_error is not None:
@@ -323,13 +324,13 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                 self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
         if supervisor_task is not None:
             supervisor_task.cancel()
-            with contextlib.suppress(BaseException):
-                await supervisor_task
-        with contextlib.suppress(BaseException):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                _ = await cast(Awaitable[object], supervisor_task)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await self._stop_heartbeat_sender()
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await self._close_current_connection()
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await self._event_dispatcher.stop()
 
     async def _connect_once(self) -> None:

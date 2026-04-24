@@ -11,7 +11,9 @@ import asyncio
 import contextlib
 import logging
 import socket
+from collections.abc import Awaitable
 from types import TracebackType
+from typing import cast
 
 from aionetx.api.bytes_like import BytesLike
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
@@ -150,7 +152,7 @@ class AsyncioTcpServer(TcpServerProtocol):
             self._notify_status_changed()
         try:
             await self._emit_lifecycle_event(lifecycle_event)
-        except BaseException:
+        except (Exception, asyncio.CancelledError):
             await self._rollback_failed_startup()
             raise
         server: asyncio.AbstractServer | None = None
@@ -188,7 +190,7 @@ class AsyncioTcpServer(TcpServerProtocol):
             self._notify_status_changed()
         try:
             await self._emit_lifecycle_event(lifecycle_event)
-        except BaseException:
+        except (Exception, asyncio.CancelledError):
             await self._rollback_failed_startup(server=server)
             raise
 
@@ -200,6 +202,8 @@ class AsyncioTcpServer(TcpServerProtocol):
         should_transition_to_stopped = False
         stop_waiter: asyncio.Future[None] | None = None
         owns_stop = False
+        heartbeat_senders: tuple[AsyncioHeartbeatSender, ...] = ()
+        connections: tuple[AsyncioTcpConnection, ...] = ()
         async with self._state_lock:
             self._logger.debug("Stopping TCP server.")
             if (
@@ -224,14 +228,11 @@ class AsyncioTcpServer(TcpServerProtocol):
                 self._heartbeat_senders.clear()
                 connections = tuple(self._connections.values())
                 self._connections.clear()
-            else:
-                heartbeat_senders = ()
-                connections = ()
         if not owns_stop:
             if stop_waiter is not None:
                 if self._event_dispatcher.current_task_is_worker():
                     return
-                await stop_waiter
+                _ = await cast(Awaitable[object], stop_waiter)
             return
         inline_delivery_context = (
             self._event_dispatcher.inline_delivery_context()
@@ -243,7 +244,7 @@ class AsyncioTcpServer(TcpServerProtocol):
                 first_error: BaseException | None = None
                 try:
                     await self._emit_lifecycle_event(stopping_event)
-                except BaseException as error:
+                except (Exception, asyncio.CancelledError) as error:
                     first_error = error
                 try:
                     if server is not None:
@@ -269,7 +270,7 @@ class AsyncioTcpServer(TcpServerProtocol):
                         )
                     if server is not None:
                         await server.wait_closed()
-                except BaseException as error:
+                except (Exception, asyncio.CancelledError) as error:
                     if first_error is None:
                         first_error = error
                 if should_transition_to_stopped:
@@ -281,21 +282,21 @@ class AsyncioTcpServer(TcpServerProtocol):
                     if first_error is None:
                         try:
                             await self._emit_lifecycle_event(stopped_event)
-                        except BaseException as error:
+                        except (Exception, asyncio.CancelledError) as error:
                             first_error = error
                     try:
                         await self._event_dispatcher.stop()
-                    except BaseException as error:
+                    except (Exception, asyncio.CancelledError) as error:
                         if first_error is None:
                             first_error = error
                 self._notify_status_changed()
                 self._logger.debug("TCP server stopped.")
                 if first_error is not None:
                     raise first_error
-        except BaseException as error:
+        except (Exception, asyncio.CancelledError) as error:
             if stop_waiter is not None and not stop_waiter.done():
                 stop_waiter.set_exception(error)
-                with contextlib.suppress(BaseException):
+                with contextlib.suppress(Exception, asyncio.CancelledError):
                     stop_waiter.exception()
             raise
         else:
@@ -344,7 +345,7 @@ class AsyncioTcpServer(TcpServerProtocol):
             poll_interval_seconds=poll_interval_seconds,
         )
         if timeout_seconds is None:
-            await coro
+            _ = await cast(Awaitable[object], coro)
             return
         await asyncio.wait_for(coro, timeout=timeout_seconds)
 
@@ -444,7 +445,7 @@ class AsyncioTcpServer(TcpServerProtocol):
                 server_to_close.close()
                 with contextlib.suppress(Exception):
                     await server_to_close.wait_closed()
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await self._event_dispatcher.stop()
 
     def _build_connection_id(self, peer_info: object, sequence: int) -> str:

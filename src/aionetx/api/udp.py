@@ -56,7 +56,7 @@ class UdpSenderProtocol(ByteSenderProtocol, Protocol):
             UdpSenderStoppedError: If the sender has already been stopped.
             OSError: If the underlying UDP socket reports a send failure.
         """
-        ...
+        raise NotImplementedError
 
     async def stop(self) -> None:
         """
@@ -66,11 +66,11 @@ class UdpSenderProtocol(ByteSenderProtocol, Protocol):
         transition. Implementations must be idempotent. After stop, send()
         must raise.
         """
-        ...
+        raise NotImplementedError
 
     async def __aenter__(self) -> UdpSenderProtocol:
         """Return ``self``; UDP sender is lazy and needs no explicit start."""
-        ...
+        raise NotImplementedError
 
     async def __aexit__(
         self,
@@ -79,7 +79,7 @@ class UdpSenderProtocol(ByteSenderProtocol, Protocol):
         exc_tb: TracebackType | None,
     ) -> None:
         """Close the sender's socket unconditionally."""
-        ...
+        raise NotImplementedError
 
 
 @dataclass(frozen=True, slots=True)

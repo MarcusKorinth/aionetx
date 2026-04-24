@@ -145,9 +145,8 @@ class _AsyncioDatagramReceiverBase:
         """
         await self._stop_datagram_receiver(socket_cleanup=self._cleanup_socket)
 
-    def _cleanup_socket(self, sock: socket.socket) -> None:
+    def _cleanup_socket(self, _sock: socket.socket) -> None:
         """Subclass extension point for socket-specific cleanup before close."""
-        del sock
 
     @property
     def _running(self) -> bool:
@@ -266,23 +265,23 @@ class _AsyncioDatagramReceiverBase:
         first_error: BaseException | None = None
         try:
             await self._publish_stopping_transition(snapshot)
-        except BaseException as error:
+        except (Exception, asyncio.CancelledError) as error:
             first_error = error
         try:
             await self._teardown_stop_resources(snapshot=snapshot, socket_cleanup=socket_cleanup)
-        except BaseException as error:
+        except (Exception, asyncio.CancelledError) as error:
             if first_error is None:
                 first_error = error
         if first_error is None:
             try:
                 await self._publish_closed_event_if_needed(snapshot)
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 first_error = error
         await self._publish_stopped_transition_if_needed(snapshot, emit_event=first_error is None)
         if snapshot.stop_dispatcher:
             try:
                 await self._event_dispatcher.stop()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if first_error is None:
                     first_error = error
         if first_error is not None:
@@ -353,7 +352,7 @@ class _AsyncioDatagramReceiverBase:
             if snapshot.task is not asyncio.current_task():
                 snapshot.task.cancel()
                 try:
-                    await snapshot.task
+                    _ = await cast("asyncio.Task[object]", snapshot.task)
                 except asyncio.CancelledError as error:
                     current_task = asyncio.current_task()
                     cancelling = getattr(current_task, "cancelling", None)
@@ -440,7 +439,7 @@ class _AsyncioDatagramReceiverBase:
             starting_event = self._apply_lifecycle_state(ComponentLifecycleState.STARTING)
         try:
             await self._emit_lifecycle_event(starting_event)
-        except BaseException:
+        except (Exception, asyncio.CancelledError):
             await self._rollback_failed_starting_publication()
             raise
         return True
@@ -465,8 +464,8 @@ class _AsyncioDatagramReceiverBase:
             await self._event_dispatcher.emit(
                 ConnectionOpenedEvent(resource_id=metadata.connection_id, metadata=metadata)
             )
-        except BaseException:
-            with contextlib.suppress(BaseException):
+        except (Exception, asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await self._stop_datagram_receiver(socket_cleanup=self._cleanup_socket)
             raise
         async with self._state_lock:
@@ -505,5 +504,5 @@ class _AsyncioDatagramReceiverBase:
                 self._connection_metadata = None
                 self._connection_state = ConnectionState.CREATED
                 self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await self._event_dispatcher.stop()

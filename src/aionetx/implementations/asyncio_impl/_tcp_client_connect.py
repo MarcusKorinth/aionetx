@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
 from aionetx.api.connection_lifecycle import ConnectionRole
 from aionetx.api.connection_protocol import ConnectionProtocol
+from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
+from aionetx.api.tcp_client import TcpClientSettings
 from aionetx.implementations.asyncio_impl.asyncio_heartbeat_sender import AsyncioHeartbeatSender
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from aionetx.implementations.asyncio_impl.identifier_utils import tcp_client_connection_id
@@ -26,8 +28,6 @@ from aionetx.implementations.asyncio_impl.runtime_utils import (
 )
 
 if TYPE_CHECKING:
-    from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
-    from aionetx.api.tcp_client import TcpClientSettings
     from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
 
 _warning_limiter = WarningRateLimiter(interval_seconds=30.0)
@@ -35,7 +35,7 @@ _warning_limiter = WarningRateLimiter(interval_seconds=30.0)
 
 async def connect_once(
     *,
-    settings: "TcpClientSettings",
+    settings: TcpClientSettings,
     connection_opener: Callable[..., Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]],
     event_dispatcher: AsyncioEventDispatcher,
     on_closed_callback: Callable[["AsyncioTcpConnection"], Awaitable[None] | None],
@@ -76,8 +76,8 @@ async def connect_once(
     )
     try:
         await connection.start()
-    except BaseException:
-        with contextlib.suppress(BaseException):
+    except (Exception, asyncio.CancelledError):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await connection.close()
         raise
     return connection
@@ -102,8 +102,8 @@ def _apply_tcp_keepalive(
 async def start_heartbeat_sender(
     *,
     connection: "AsyncioTcpConnection",
-    settings: "TcpClientSettings",
-    heartbeat_provider: "HeartbeatProviderProtocol | None",
+    settings: TcpClientSettings,
+    heartbeat_provider: HeartbeatProviderProtocol | None,
     event_dispatcher: AsyncioEventDispatcher,
     logger: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> "AsyncioHeartbeatSender | None":

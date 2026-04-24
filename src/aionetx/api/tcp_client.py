@@ -115,7 +115,7 @@ class TcpClientProtocol(ManagedTransportProtocol, Protocol):
     @property
     def connection(self) -> ConnectionProtocol | None:
         """Return active connection if connected, otherwise ``None``."""
-        ...
+        raise NotImplementedError
 
     async def wait_until_connected(
         self,
@@ -141,7 +141,7 @@ class TcpClientProtocol(ManagedTransportProtocol, Protocol):
             The currently active connection object. The returned connection is
             still subject to later disconnect/close events.
         """
-        ...
+        raise NotImplementedError
 
 
 __all__ = (

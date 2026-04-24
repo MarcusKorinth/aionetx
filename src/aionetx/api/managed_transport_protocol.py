@@ -36,7 +36,7 @@ class ManagedTransportProtocol(Protocol):
     @property
     def lifecycle_state(self) -> ComponentLifecycleState:
         """Return current component lifecycle state."""
-        ...
+        raise NotImplementedError
 
     async def start(self) -> None:
         """
@@ -46,7 +46,7 @@ class ManagedTransportProtocol(Protocol):
         must be a no-op. Successful return means the managed runtime owns its
         background resources and lifecycle publication has begun.
         """
-        ...
+        raise NotImplementedError
 
     async def stop(self) -> None:
         """
@@ -56,11 +56,11 @@ class ManagedTransportProtocol(Protocol):
         returns, owned background tasks and transport resources must no longer
         continue running on behalf of the component.
         """
-        ...
+        raise NotImplementedError
 
     async def __aenter__(self: _TManagedTransport) -> _TManagedTransport:
         """Start the component and return ``self`` for use as a context variable."""
-        ...
+        raise NotImplementedError
 
     async def __aexit__(
         self,
@@ -69,4 +69,4 @@ class ManagedTransportProtocol(Protocol):
         exc_tb: TracebackType | None,
     ) -> None:
         """Stop the component unconditionally, regardless of any exception."""
-        ...
+        raise NotImplementedError

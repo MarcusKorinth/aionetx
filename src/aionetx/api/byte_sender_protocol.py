@@ -32,4 +32,4 @@ class ByteSenderProtocol(Protocol):
         by the local transport path; it does not guarantee remote delivery.
         Role-specific protocols document their concrete exceptions.
         """
-        ...
+        raise NotImplementedError

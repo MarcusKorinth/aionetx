@@ -56,7 +56,7 @@ class NetworkFactory(Protocol):
                 provider is missing or does not satisfy the async provider
                 contract.
         """
-        ...
+        raise NotImplementedError
 
     def create_tcp_server(
         self,
@@ -81,7 +81,7 @@ class NetworkFactory(Protocol):
                 provider is missing or does not satisfy the async provider
                 contract.
         """
-        ...
+        raise NotImplementedError
 
     def create_multicast_receiver(
         self,
@@ -98,7 +98,7 @@ class NetworkFactory(Protocol):
         Returns:
             A transport implementing ``MulticastReceiverProtocol``.
         """
-        ...
+        raise NotImplementedError
 
     def create_udp_receiver(
         self,
@@ -115,7 +115,7 @@ class NetworkFactory(Protocol):
         Returns:
             A transport implementing ``UdpReceiverProtocol``.
         """
-        ...
+        raise NotImplementedError
 
     def create_udp_sender(self, settings: UdpSenderSettings) -> UdpSenderProtocol:
         """
@@ -127,4 +127,4 @@ class NetworkFactory(Protocol):
         Returns:
             A transport implementing ``UdpSenderProtocol``.
         """
-        ...
+        raise NotImplementedError

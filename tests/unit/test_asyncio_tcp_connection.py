@@ -644,7 +644,7 @@ async def test_tcp_connection_close_cancellation_during_closed_event_emit_still_
         allow_closed_event_handler.set()
 
         with pytest.raises(asyncio.CancelledError):
-            await close_task
+            _ = await close_task
 
     assert connection.state == ConnectionState.CLOSED
     assert closed_event_count == 1
@@ -836,7 +836,7 @@ async def test_tcp_connection_close_cancellation_still_reaches_closed_and_emits_
         close_task.cancel()
         allow_callback_return.set()
         with pytest.raises(asyncio.CancelledError):
-            await close_task
+            _ = await close_task
 
         await wait_for_condition(
             lambda: connection.state == ConnectionState.CLOSED, timeout_seconds=1.0

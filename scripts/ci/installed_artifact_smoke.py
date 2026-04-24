@@ -6,16 +6,15 @@ from collections.abc import Callable
 from importlib.metadata import version as package_version
 
 import aionetx
-from aionetx import (
-    AsyncioNetworkFactory,
-    BytesReceivedEvent,
-    TcpReconnectSettings,
-    TcpClientSettings,
-    TcpServerSettings,
-    UdpReceiverSettings,
-    UdpSenderSettings,
-)
 from aionetx.api import NetworkEvent, ReconnectAttemptFailedEvent
+
+AsyncioNetworkFactory = aionetx.AsyncioNetworkFactory
+BytesReceivedEvent = aionetx.BytesReceivedEvent
+TcpClientSettings = aionetx.TcpClientSettings
+TcpReconnectSettings = aionetx.TcpReconnectSettings
+TcpServerSettings = aionetx.TcpServerSettings
+UdpReceiverSettings = aionetx.UdpReceiverSettings
+UdpSenderSettings = aionetx.UdpSenderSettings
 
 # Verify __version__ is present, non-empty, and matches expected pyproject.toml version.
 assert hasattr(aionetx, "__version__"), "aionetx.__version__ is missing from installed package"

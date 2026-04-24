@@ -17,4 +17,4 @@ class NetworkEventHandlerProtocol(Protocol):
 
     async def on_event(self, event: NetworkEvent) -> None:
         """Handle one emitted transport event."""
-        ...
+        raise NotImplementedError
