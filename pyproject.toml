@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aionetx"
+version = "0.1.0"
+description = "Reusable raw-byte network layer for TCP, UDP sender/receiver, and multicast"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "Marcus Korinth"},
+]
+dependencies = []
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+keywords = ["asyncio", "networking", "tcp", "udp", "multicast"]
+
+[project.urls]
+Repository = "https://github.com/MarcusKorinth/aionetx"
+Documentation = "https://github.com/MarcusKorinth/aionetx#readme"
+Issues = "https://github.com/MarcusKorinth/aionetx/issues"
+Changelog = "https://github.com/MarcusKorinth/aionetx/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    "coverage>=7.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "tomli>=2.0; python_version < '3.11'",
+]
+dev-hypothesis = [
+    "aionetx[dev]",
+    "hypothesis>=6.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aionetx = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "--strict-markers",
+]
+markers = [
+    "behavior_critical: runtime-semantic checks for lifecycle, ordering, concurrency, cancellation, or failure behavior",
+    "integration_confidence: end-to-end transport scenarios validating user-observable integration behavior",
+    "asyncio: marks tests that require pytest-asyncio",
+    "integration: marks integration tests",
+    "integration_smoke: marks required intermediate-version integration smoke tests",
+    "integration_semantic: marks required intermediate-version semantic integration shard tests",
+    "multicast: marks environment-sensitive multicast tests",
+    "slow: marks timing-sensitive or long-running tests",
+    "reliability_smoke: marks deterministic reliability-sensitive smoke tests that are required in CI",
+    "hypothesis: marks property-based tests that require the hypothesis package (opt-in, not a required CI gate)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["aionetx"]
+mypy_path = "src"
+explicit_package_bases = true

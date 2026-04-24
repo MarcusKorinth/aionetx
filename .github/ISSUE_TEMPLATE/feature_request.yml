@@ -1,0 +1,66 @@
+name: Feature request
+description: Propose a concrete behavior change or new capability for aionetx.
+title: "[feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a feature.
+
+        Before filing, please check:
+        - **Early-stage ideas and "wouldn't it be cool if..."** belong in [Discussions → Ideas](https://github.com/MarcusKorinth/aionetx/discussions). Open a feature request issue only when you have a concrete behavior change in mind (you can describe inputs, outputs, and user-visible API).
+        - aionetx is a deliberately narrow **raw-byte asyncio transport library**. Features that belong in higher-layer frameworks (HTTP, messaging, TLS, service-mesh concerns) are generally out of scope — see the "What this library is not for" section in README.
+        - Search [existing issues](https://github.com/MarcusKorinth/aionetx/issues?q=is%3Aissue) to avoid duplicates.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What pain point does this address? Describe the use case, not the solution yet.
+      placeholder: e.g. "When using the TCP client with reconnect, I cannot observe whether the current attempt is still within the initial backoff window or has moved to steady state."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The concrete behavior change. Include the user-visible API surface you have in mind (types, method signatures, event names).
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case context
+      description: Where in your application does this help? A realistic scenario helps evaluate whether the change belongs in aionetx or in a layer above it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Considered alternatives
+      description: Other approaches you weighed (workarounds, different API shapes, doing nothing) and why you chose the proposal above.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to related issues, prior discussions, or similar APIs in other libraries.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: I have searched existing issues and discussions and confirmed this is not already proposed.
+          required: true
+        - label: This proposal is about raw-byte transport behavior (lifecycle, events, backpressure, reconnect, multicast, typing) — not a higher-layer protocol concern.
+          required: true
