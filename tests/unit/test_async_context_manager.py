@@ -23,6 +23,10 @@ class _NoopHandler:
         return None
 
 
+async def _raise_test_error() -> None:
+    raise ValueError("test-error")
+
+
 def _get_unused_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -72,13 +76,9 @@ async def test_tcp_server_async_context_manager_stops_on_exception() -> None:
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
         event_handler=_NoopHandler(),
     )
-    try:
+    with pytest.raises(ValueError, match="test-error"):
         async with server:
-            raise ValueError("test-error")
-    except ValueError as error:
-        assert str(error) == "test-error"
-    else:
-        pytest.fail("async context manager body did not raise")
+            await _raise_test_error()
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
 
 
