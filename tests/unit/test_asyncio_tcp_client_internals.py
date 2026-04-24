@@ -36,6 +36,7 @@ from aionetx.implementations.asyncio_impl import (
 )
 from aionetx.implementations.asyncio_impl import _tcp_client_connect as tcp_client_connect_module
 from aionetx.implementations.asyncio_impl.asyncio_tcp_client import AsyncioTcpClient
+from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
 from tests.internal_asyncio_impl_refs import WarningRateLimiter
 
 
@@ -962,17 +963,18 @@ async def test_client_open_event_failure_closes_partially_started_connection_wit
 
 
 @pytest.mark.asyncio
-async def test_client_supervisor_cancellation_during_connection_start_closes_partial_connection() -> (
-    None
-):
+async def test_client_supervisor_cancellation_during_connection_start_closes_partial_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     server_connection_opened = asyncio.Event()
-    release_server_connection = asyncio.Event()
+    server_saw_eof = asyncio.Event()
+    connection_start_called = asyncio.Event()
 
     async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         server_connection_opened.set()
         try:
-            await release_server_connection.wait()
-            await reader.read()
+            if await reader.read() == b"":
+                server_saw_eof.set()
         finally:
             writer.close()
             await writer.wait_closed()
@@ -982,13 +984,15 @@ async def test_client_supervisor_cancellation_during_connection_start_closes_par
         port = server.sockets[0].getsockname()[1]
         await asyncio.wait_for(server.start_serving(), timeout=1.0)
 
-        class _CancelTaskOnOpenedEvent:
+        async def _cancel_connection_start(self: AsyncioTcpConnection) -> None:
+            connection_start_called.set()
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(AsyncioTcpConnection, "start", _cancel_connection_start)
+
+        class _NoopHandler:
             async def on_event(self, event) -> None:
-                if isinstance(event, ConnectionOpenedEvent):
-                    task = asyncio.current_task()
-                    assert task is not None
-                    task.cancel()
-                    await asyncio.sleep(0)
+                return None
 
         client = AsyncioTcpClient(
             settings=TcpClientSettings(
@@ -1000,11 +1004,13 @@ async def test_client_supervisor_cancellation_during_connection_start_closes_par
                     handler_failure_policy=EventHandlerFailurePolicy.LOG_ONLY,
                 ),
             ),
-            event_handler=_CancelTaskOnOpenedEvent(),
+            event_handler=_NoopHandler(),
         )
 
         await client.start()
+        await asyncio.wait_for(connection_start_called.wait(), timeout=1.0)
         await asyncio.wait_for(server_connection_opened.wait(), timeout=1.0)
+        await asyncio.wait_for(server_saw_eof.wait(), timeout=1.0)
 
         async def _wait_until_stopped() -> None:
             while client.lifecycle_state != tcp_client_module.ComponentLifecycleState.STOPPED:
@@ -1023,5 +1029,3 @@ async def test_client_supervisor_cancellation_during_connection_start_closes_par
             and not task.done()
         ]
         assert leaked_read_loops == []
-
-        release_server_connection.set()

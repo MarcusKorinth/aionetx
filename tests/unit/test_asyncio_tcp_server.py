@@ -49,6 +49,11 @@ def _unused_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _is_timeout_error(error: BaseException) -> bool:
+    """Accept timeout classes used by supported Python asyncio versions."""
+    return isinstance(error, (TimeoutError, asyncio.TimeoutError))
+
+
 class _GoodConnection:
     """Connection double that records sent payloads and supports normal close."""
 
@@ -301,7 +306,7 @@ async def test_server_broadcast_timeout_closes_stalled_connection_and_emits_erro
     assert stalled.state == ConnectionState.CLOSED
     assert stalled.close_calls == 1
     assert recording_event_handler.error_events
-    assert isinstance(recording_event_handler.error_events[-1].error, TimeoutError)
+    assert _is_timeout_error(recording_event_handler.error_events[-1].error)
 
 
 @pytest.mark.asyncio
@@ -761,7 +766,7 @@ async def test_server_idle_timeout_closes_inactive_connection_and_emits_timeout_
         interval_seconds=0.01,
     )
 
-    assert isinstance(recording_event_handler.error_events[-1].error, TimeoutError)
+    assert _is_timeout_error(recording_event_handler.error_events[-1].error)
 
     writer.close()
     with contextlib.suppress(Exception):
