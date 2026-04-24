@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   analyze:
-    name: CodeQL — Python security analysis
+    name: CodeQL - Python security analysis
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # CodeQL is always non-blocking for pre-release; results appear in the

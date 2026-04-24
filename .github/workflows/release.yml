@@ -53,7 +53,7 @@ jobs:
 
   # Tier: packaging/release verification
   cross_platform_portability_smoke:
-    name: Release trust gate — cross-platform portability smoke (${{ matrix.os }})
+    name: Release trust gate - cross-platform portability smoke (${{ matrix.os }})
     needs: [verify_tag_version]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
@@ -123,7 +123,7 @@ jobs:
         run: pytest tests/unit/test_api_symbol_sources.py -k "api_symbol" --tb=short -q
 
   ruff_checks:
-    name: Release trust gate — Ruff
+    name: Release trust gate - Ruff
     needs: [verify_tag_version]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -142,7 +142,7 @@ jobs:
         run: ruff format --check .
 
   mypy_supported_bounds:
-    name: Release trust gate — Mypy (${{ matrix.python-version }})
+    name: Release trust gate - Mypy (${{ matrix.python-version }})
     needs: [verify_tag_version]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -163,7 +163,7 @@ jobs:
 
   # Tier: runtime-semantic trust gates
   required_behavior_tests:
-    name: Release trust gate — required behavior tests (${{ matrix.python-version }})
+    name: Release trust gate - required behavior tests (${{ matrix.python-version }})
     needs: [verify_tag_version]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -204,7 +204,7 @@ jobs:
 
   # Tier: integration confidence
   integration_tests_supported_bounds:
-    name: Release trust gate — integration tests (${{ matrix.python-version }})
+    name: Release trust gate - integration tests (${{ matrix.python-version }})
     needs: [required_behavior_tests]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -224,7 +224,7 @@ jobs:
         run: pytest -q -m "integration and not multicast and not slow" --timeout=60
 
   integration_smoke_tests_intermediate_versions:
-    name: Release trust gate — integration smoke tests (${{ matrix.python-version }})
+    name: Release trust gate - integration smoke tests (${{ matrix.python-version }})
     needs: [required_behavior_tests]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -244,7 +244,7 @@ jobs:
         run: pytest -q -m "integration_smoke and not multicast and not slow" --timeout=60
 
   integration_semantic_tests_intermediate_versions:
-    name: Release trust gate — integration semantic shard (${{ matrix.python-version }})
+    name: Release trust gate - integration semantic shard (${{ matrix.python-version }})
     needs: [required_behavior_tests]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -267,7 +267,7 @@ jobs:
 
   # Tier: focused runtime reliability contracts
   reliability_smoke_tests:
-    name: Release trust gate — reliability smoke tests
+    name: Release trust gate - reliability smoke tests
     needs: [required_behavior_tests]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -284,7 +284,7 @@ jobs:
         run: pytest -q -m "reliability_smoke" --timeout=60
 
   multicast_contract_required:
-    name: Release trust gate — deterministic multicast contract
+    name: Release trust gate - deterministic multicast contract
     needs: [required_behavior_tests]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -302,7 +302,7 @@ jobs:
 
   # Tier: runtime trust aggregate gate
   required_suite_with_coverage:
-    name: Release trust gate — required suite with coverage
+    name: Release trust gate - required suite with coverage
     needs: [api_symbol_stability, ruff_checks, mypy_supported_bounds, integration_tests_supported_bounds, integration_smoke_tests_intermediate_versions, integration_semantic_tests_intermediate_versions, required_behavior_tests, behavior_critical_tests, reliability_smoke_tests, multicast_contract_required]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -320,7 +320,7 @@ jobs:
 
   # Tier: reproducible build verification (release runs only)
   verify_reproducible_build:
-    name: Release trust gate — wheel reproducibility
+    name: Release trust gate - wheel reproducibility
     needs: [verify_tag_version]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -381,7 +381,7 @@ jobs:
           echo "- CI-only non-blocking secondary lanes remain outside release trust gates by design"
 
   release_codeql_gate:
-    name: Release trust gate — CodeQL alerts
+    name: Release trust gate - CodeQL alerts
     needs: [verify_tag_version]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -465,7 +465,7 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Tier: supply-chain trust (SBOM + SLSA provenance — tag-triggered only)
+  # Tier: supply-chain trust (SBOM + SLSA provenance - tag-triggered only)
   generate_sbom:
     name: Generate SBOM (SPDX JSON)
     needs: verify_and_build
