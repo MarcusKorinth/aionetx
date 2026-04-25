@@ -835,7 +835,7 @@ Choose direct `asyncio` if you need very custom low-level control and are comfor
 
 ## Installation and local development
 
-Install the released package:
+After the first public release is published to PyPI, install it with:
 
 ```bash
 pip install aionetx
