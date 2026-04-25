@@ -10,6 +10,35 @@ rebuilds of the same release ref.
 - The reference value is `git log -1 --format=%ct <ref>`.
 - Reproducibility means the same source tree and build inputs produce identical artifacts.
 
+## Release asset verification
+
+For an official release, verify that the release identity and artifacts
+all point to the same version:
+
+1. Check that the GitHub Release tag, PyPI version, `pyproject.toml`
+   version, and `CHANGELOG.md` entry agree.
+2. Confirm that the tag is in the `MarcusKorinth/aionetx` repository.
+3. Download the wheel, source distribution, and `aionetx-sbom.spdx.json`
+   from the GitHub Release or the package index.
+4. Verify GitHub artifact attestations for each release asset:
+
+```bash
+gh attestation verify aionetx-*.whl --repo MarcusKorinth/aionetx
+gh attestation verify aionetx-*.tar.gz --repo MarcusKorinth/aionetx
+gh attestation verify aionetx-sbom.spdx.json --repo MarcusKorinth/aionetx
+```
+
+The expected release identity is:
+
+- source repository: `MarcusKorinth/aionetx`
+- release workflow: `.github/workflows/release.yml`
+- publishing mechanism: GitHub Actions OIDC trusted publishing
+
+Reject artifacts whose attestations point to a different repository,
+workflow, or release version. The reproducible build recipe below is a
+secondary check that independent rebuilds produce the same wheel and
+source distribution for the tagged ref.
+
 ## Third-party verification recipe
 
 1. Check out the exact release ref.

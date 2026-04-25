@@ -18,9 +18,8 @@ jobs:
     name: CodeQL - Python security analysis
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # CodeQL is always non-blocking for pre-release; results appear in the
-    # Security tab without gating the required CI trust envelope.
-    continue-on-error: true
+    # CodeQL analysis itself is required. Security-alert thresholds are
+    # enforced by branch protection/code-scanning settings and release gates.
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
