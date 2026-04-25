@@ -28,7 +28,7 @@ git commit -s
 
 By signing off, you assert that you have the right to submit the
 contribution under the project license. Pull requests with unsigned
-commits are not accepted once the repository DCO check is enabled.
+commits are not accepted.
 
 ## Project-specific expectations
 
@@ -158,10 +158,12 @@ A commit body is optional for:
 - small `test` changes
 - trivial `chore` or `ci` updates
 
-### Line length
+### Readability
 
 - header: max 72 characters
-- body: wrap at 72 characters per line
+- body: keep paragraphs readable in GitHub and terminal tools; avoid
+  very long lines, but wrap where it improves clarity rather than to
+  satisfy a fixed column count
 
 ### Footer
 

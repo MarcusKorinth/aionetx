@@ -5,6 +5,7 @@
 [![Coverage gate](https://img.shields.io/badge/coverage%20gate-%E2%89%A585%25-brightgreen)](https://github.com/MarcusKorinth/aionetx/blob/main/.github/workflows/ci.yml)
 [![Typing](https://img.shields.io/badge/typing-py.typed-blueviolet)](https://github.com/MarcusKorinth/aionetx/blob/main/src/aionetx/py.typed)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![OpenSSF Baseline](https://www.bestpractices.dev/projects/12644/baseline)](https://www.bestpractices.dev/projects/12644)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/MarcusKorinth/aionetx/badge)](https://securityscorecards.dev/viewer/?uri=github.com/MarcusKorinth/aionetx)
 
 `aionetx` is an asyncio-first transport library for reusable TCP and UDP communication primitives.
