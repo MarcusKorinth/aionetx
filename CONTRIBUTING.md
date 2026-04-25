@@ -28,7 +28,7 @@ git commit -s
 
 By signing off, you assert that you have the right to submit the
 contribution under the project license. Pull requests with unsigned
-commits are not accepted once the repository DCO check is enabled.
+commits are not accepted.
 
 ## Project-specific expectations
 
