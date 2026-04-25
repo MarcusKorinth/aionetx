@@ -11,6 +11,25 @@ Thanks for contributing.
 By participating in this project you agree to abide by the
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Developer Certificate of Origin
+
+All code contributions must be made with Developer Certificate of
+Origin (DCO) sign-off. Add a `Signed-off-by` trailer to every commit:
+
+```text
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+The usual Git command is:
+
+```bash
+git commit -s
+```
+
+By signing off, you assert that you have the right to submit the
+contribution under the project license. Pull requests with unsigned
+commits are not accepted once the repository DCO check is enabled.
+
 ## Project-specific expectations
 
 These rules are critical and must be preserved:

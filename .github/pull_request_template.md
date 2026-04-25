@@ -26,6 +26,7 @@ Keep the PR focused on one concern. Refactoring-only and behavior-change PRs are
 
 ## Checklist
 
+- [ ] All commits include a DCO `Signed-off-by` line (`git commit -s`) or are otherwise DCO-compliant.
 - [ ] Tests added or updated for new or changed behavior (or explicitly explain why none are needed).
 - [ ] `CHANGELOG.md` `[Unreleased]` section updated if the change is user-visible.
 - [ ] If this changes a documented public contract, the relevant docs/README sections were updated in the same PR.
