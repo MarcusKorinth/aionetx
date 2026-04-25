@@ -145,6 +145,41 @@ def assert_running_on_owner_loop(
     return current_loop
 
 
+async def await_task_completion_preserving_cancellation(task: asyncio.Task[object]) -> None:
+    """
+    Await an internal task without swallowing caller cancellation.
+
+    This helper is for shutdown paths that may cancel and await a child task.
+    ``CancelledError`` from the child task is expected during shutdown and is
+    suppressed.  Cancellation of the caller, however, is delayed only long
+    enough for the shielded child task to settle and is then re-raised.
+    """
+    caller_cancelled = False
+    while True:
+        try:
+            _ = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            cancelling = getattr(current_task, "cancelling", None)
+            if (
+                current_task is not None and callable(cancelling) and cancelling()
+            ) or not task.done():
+                caller_cancelled = True
+                # Keep awaiting the shielded child task so repeated caller
+                # cancellations cannot detach the internal cleanup task.  The
+                # ``not task.done()`` fallback preserves this contract on
+                # Python 3.10, where Task.cancelling() is unavailable.
+                if task.done():
+                    break
+                continue
+            if task.done() and task.cancelled():
+                break
+            break
+    if caller_cancelled:
+        raise asyncio.CancelledError
+
+
 def validate_async_event_handler(event_handler: NetworkEventHandlerProtocol) -> None:
     """
     Validate the runtime contract for ``NetworkEventHandlerProtocol``.

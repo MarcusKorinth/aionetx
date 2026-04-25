@@ -48,6 +48,7 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     ReconnectBackoff,
     assert_running_on_owner_loop,
+    await_task_completion_preserving_cancellation,
     validate_heartbeat_provider,
 )
 from aionetx.implementations.asyncio_impl.tcp_client_supervision import (
@@ -230,12 +231,21 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                 first_error = error
             try:
                 if supervisor_task is not None and not skip_await_supervisor:
-                    with contextlib.suppress(asyncio.CancelledError):
+                    try:
                         if not await_supervisor_completion_only:
                             supervisor_task.cancel()
-                        _ = await cast(Awaitable[object], supervisor_task)
-                    if self._supervisor_task is supervisor_task:
-                        self._supervisor_task = None
+                        await await_task_completion_preserving_cancellation(
+                            cast(asyncio.Task[object], supervisor_task)
+                        )
+                    finally:
+                        if self._supervisor_task is supervisor_task:
+                            self._supervisor_task = None
+            except (Exception, asyncio.CancelledError) as error:
+                if first_error is None:
+                    first_error = error
+            try:
+                # A cancelled supervisor wait must not skip local resource cleanup.
+                # Preserve the first error, finish teardown, then re-raise below.
                 await self._stop_heartbeat_sender()
                 await self._close_current_connection()
                 if (

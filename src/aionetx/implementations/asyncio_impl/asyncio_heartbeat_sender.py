@@ -9,9 +9,7 @@ reports failures through the shared event dispatcher.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from collections.abc import Awaitable
 from typing import cast
 
 from aionetx.api.connection_protocol import ConnectionProtocol
@@ -19,7 +17,10 @@ from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
 from aionetx.api.heartbeat import HeartbeatRequest, HeartbeatResult, TcpHeartbeatSettings
 from aionetx.api.network_error_event import NetworkErrorEvent
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
-from aionetx.implementations.asyncio_impl.runtime_utils import WarningRateLimiter
+from aionetx.implementations.asyncio_impl.runtime_utils import (
+    WarningRateLimiter,
+    await_task_completion_preserving_cancellation,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -108,8 +109,7 @@ class AsyncioHeartbeatSender:
         if task is not None:
             self._logger.debug("Stopping heartbeat sender for %s.", self._connection.connection_id)
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                _ = await cast(Awaitable[object], task)
+            await await_task_completion_preserving_cancellation(cast(asyncio.Task[object], task))
 
     async def _run(self) -> None:
         """

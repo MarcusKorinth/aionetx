@@ -296,6 +296,76 @@ async def test_client_supervisor_shutdown_resources_stops_heartbeat_before_conne
 
 
 @pytest.mark.asyncio
+async def test_client_stop_preserves_caller_cancellation_after_supervisor_cleanup(
+    recording_event_handler,
+) -> None:
+    client = AsyncioTcpClient(
+        settings=TcpClientSettings(
+            host="127.0.0.1", port=45681, reconnect=TcpReconnectSettings(enabled=False)
+        ),
+        event_handler=recording_event_handler,
+    )
+    supervisor_cancel_seen = asyncio.Event()
+    release_supervisor = asyncio.Event()
+    call_order: list[str] = []
+
+    async def blocking_supervisor() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            supervisor_cancel_seen.set()
+            await release_supervisor.wait()
+            raise
+
+    async def fake_stop_heartbeat() -> None:
+        call_order.append("heartbeat-stop")
+
+    async def fake_close_connection() -> None:
+        call_order.append("connection-close")
+
+    supervisor_task = asyncio.create_task(blocking_supervisor())
+    client._running = True  # type: ignore[attr-defined]
+    client._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    client._supervisor_task = supervisor_task  # type: ignore[attr-defined]
+    client._stop_heartbeat_sender = fake_stop_heartbeat  # type: ignore[attr-defined,method-assign]
+    client._close_current_connection = fake_close_connection  # type: ignore[attr-defined,method-assign]
+    await client._event_dispatcher.start()  # type: ignore[attr-defined]
+    stop_task = asyncio.create_task(client.stop())
+
+    try:
+        await asyncio.wait_for(supervisor_cancel_seen.wait(), timeout=1.0)
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not stop_task.done()
+
+        release_supervisor.set()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        assert call_order == ["heartbeat-stop", "connection-close"]
+        assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+        assert client._supervisor_task is None  # type: ignore[attr-defined]
+        assert client._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    finally:
+        release_supervisor.set()
+        if not stop_task.done():
+            stop_task.cancel()
+            try:
+                await stop_task
+            except asyncio.CancelledError:
+                pass
+        if not supervisor_task.done():
+            supervisor_task.cancel()
+            try:
+                await supervisor_task
+            except asyncio.CancelledError:
+                pass
+        if client._event_dispatcher.is_running:  # type: ignore[attr-defined]
+            await client._event_dispatcher.stop()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_client_connect_attempt_clears_cached_last_connect_error_before_new_attempt(
     recording_event_handler,
 ) -> None:
