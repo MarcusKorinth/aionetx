@@ -4,9 +4,7 @@ All notable user-visible changes to `aionetx` are documented in this file.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-04-24
-
-Initial public alpha release.
+Planned contents for the initial public alpha release (`0.1.0`).
 
 ### Added
 
