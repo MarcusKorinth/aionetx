@@ -825,7 +825,8 @@ Choose direct `asyncio` if you need very custom low-level control and are comfor
 - `docs/reproducible_build.md`: release artifact verification, provenance/SBOM checks, and reproducible rebuild recipe
 - `docs/breaking_changes/README.md`: compatibility-note format and expectations for supported upgrade-path changes
 - `CHANGELOG.md`: user-visible changes per release, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format
-- `SECURITY.md`: supported versions, private vulnerability reporting, security-scope boundaries, secrets policy, SCA/SAST thresholds, and threat model
+- `SECURITY.md`: supported versions, private vulnerability reporting, security-scope boundaries, secrets policy, SCA/SAST thresholds, threat model, and security assurance case
+- `GOVERNANCE.md`: decision model, project roles, access review expectations, and current single-maintainer continuity limits
 - `SUPPORT.md`: how to get help, report issues, and ask questions
 - `CONTRIBUTING.md`: concise contribution workflow, DCO sign-off, and review expectations
 - `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1, community standards, and enforcement contact

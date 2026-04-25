@@ -130,6 +130,64 @@ event queues with configurable backpressure, no payload logging by
 default, CodeQL, Dependabot, release provenance checks, OIDC trusted
 publishing, artifact attestations, and branch protection rules.
 
+## Security Assurance Case
+
+The project's security assurance case is based on a deliberately narrow
+scope: `aionetx` provides transport primitives and lifecycle/event
+semantics, but does not provide authentication, authorization,
+encryption, message framing, payload validation, or application
+protocol security.
+
+Security requirements:
+
+- transport resources must be cleaned up deterministically after normal
+  shutdown, handler failure, cancellation, and startup rollback
+- event delivery must make backpressure behavior explicit instead of
+  silently growing unbounded queues
+- user payload bytes must not be logged by default
+- release artifacts must be built by the documented release workflow and
+  be traceable to the repository, workflow, and release version
+- dependency and static-analysis findings above the documented
+  thresholds must be triaged before release
+
+Trust boundaries:
+
+- remote peers are untrusted sources of bytes
+- user event handlers are application code and may fail, block, or
+  cancel
+- CI/release workflows are trusted only when running from the protected
+  repository and expected workflow identity
+- package consumers trust published artifacts only after checking the
+  release version, provenance, and attestations
+
+Secure design arguments:
+
+- the transport-only boundary avoids mixing network I/O with application
+  protocol, authentication, authorization, or business logic
+- lifecycle state transitions are explicit and covered by automated
+  tests, reducing ambiguity around startup, shutdown, and cleanup
+- event backpressure is configurable and bounded by default settings
+  rather than relying on unlimited memory growth
+- the package has no runtime dependencies outside the Python standard
+  library, reducing supply-chain exposure for installed users
+- releases use GitHub OIDC trusted publishing and artifact attestations
+  instead of long-lived PyPI upload tokens stored in the repository
+
+Common weakness mitigations:
+
+- resource leaks are countered with lifecycle and cleanup tests for
+  sockets, tasks, dispatcher shutdown, and startup rollback
+- unbounded event growth is countered with bounded dispatcher queues and
+  explicit backpressure policies
+- accidental sensitive payload logging is countered by avoiding raw
+  payload logging in library code
+- dependency and workflow drift are countered with Dependabot,
+  dependency review, pinned GitHub Actions, CodeQL, Ruff, mypy, and
+  required CI gates
+- release substitution risk is countered with version checks,
+  reproducible-build guidance, SBOM generation, artifact attestations,
+  and documented verification steps
+
 ## Out of Scope
 
 The following are **not** treated as security vulnerabilities because
