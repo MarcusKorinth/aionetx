@@ -158,10 +158,12 @@ A commit body is optional for:
 - small `test` changes
 - trivial `chore` or `ci` updates
 
-### Line length
+### Readability
 
 - header: max 72 characters
-- body: wrap at 72 characters per line
+- body: keep paragraphs readable in GitHub and terminal tools; avoid
+  very long lines, but wrap where it improves clarity rather than to
+  satisfy a fixed column count
 
 ### Footer
 
