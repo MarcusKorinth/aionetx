@@ -163,7 +163,9 @@ class AsyncioTcpServer(TcpServerProtocol):
                 self._handle_client,
                 sock=listening_socket,
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
+            # CancelledError is not an Exception on supported Python versions,
+            # but startup cancellation still owns rollback before propagating.
             lifecycle_event = None
             if listening_socket is not None:
                 with contextlib.suppress(Exception):
@@ -171,9 +173,11 @@ class AsyncioTcpServer(TcpServerProtocol):
             async with self._state_lock:
                 self._server = None
                 lifecycle_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
-            await self._emit_lifecycle_event(lifecycle_event)
-            await self._event_dispatcher.stop()
-            self._notify_status_changed()
+            try:
+                await self._emit_lifecycle_event(lifecycle_event)
+            finally:
+                await self._stop_dispatcher_during_startup_rollback()
+                self._notify_status_changed()
             raise
 
         lifecycle_event = None
@@ -447,6 +451,25 @@ class AsyncioTcpServer(TcpServerProtocol):
                     await server_to_close.wait_closed()
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await self._event_dispatcher.stop()
+
+    async def _stop_dispatcher_during_startup_rollback(self) -> None:
+        """
+        Stop dispatcher cleanup before propagating startup cancellation.
+
+        The startup task owns dispatcher cleanup once it has published STARTING.
+        If the caller cancels again while rollback is already stopping the
+        dispatcher, cleanup must still converge before cancellation is re-raised.
+        """
+        stop_task = asyncio.create_task(
+            self._event_dispatcher.stop(),
+            name=f"{self._component_id}-startup-rollback-dispatcher-stop",
+        )
+        try:
+            await asyncio.shield(stop_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(stop_task)
+            raise
 
     def _build_connection_id(self, peer_info: object, sequence: int) -> str:
         """Build the stable per-connection identifier used by server-side events."""
