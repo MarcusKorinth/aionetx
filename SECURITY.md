@@ -101,6 +101,35 @@ the project publishes a VEX-style justification or equivalent advisory
 note explaining why the vulnerable component or code path is not
 exploitable in this project.
 
+## Threat Model and Attack Surface
+
+Primary actors:
+
+- application developers embedding `aionetx`
+- remote TCP, UDP, or multicast peers
+- local processes that can interact with sockets or event handlers
+- maintainers and collaborators with repository or release access
+- CI/CD and package release workflows
+
+Assets that need protection:
+
+- sockets, file descriptors, and asyncio tasks owned by transports
+- lifecycle state and event stream integrity
+- package artifacts, release provenance, and security advisories
+- repository settings, CI credentials, and package publishing authority
+
+Main attack surfaces:
+
+- raw network input delivered to user handlers
+- handler exceptions, cancellation, and backpressure behavior
+- lifecycle transitions, reconnect loops, heartbeat loops, and cleanup
+- CI workflow inputs, dependency updates, and release metadata
+
+Current mitigations include explicit lifecycle state tests, bounded
+event queues with configurable backpressure, no payload logging by
+default, CodeQL, Dependabot, release provenance checks, OIDC trusted
+publishing, artifact attestations, and branch protection rules.
+
 ## Out of Scope
 
 The following are **not** treated as security vulnerabilities because
