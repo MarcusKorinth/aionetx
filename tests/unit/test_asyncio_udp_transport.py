@@ -59,6 +59,39 @@ class FailOnLifecycleStateHandler:
             raise RuntimeError(f"udp-{self._state.value}-publication-failed")
 
 
+class BlockingStoppingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.stopping_seen = asyncio.Event()
+        self.release_stopping = asyncio.Event()
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STOPPING
+        ):
+            self.stopping_seen.set()
+            await self.release_stopping.wait()
+
+
+class StopAgainOnStoppingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.receiver: AsyncioUdpReceiver | None = None
+        self.reentered_stop = asyncio.Event()
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            self.receiver is not None
+            and isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STOPPING
+        ):
+            await self.receiver.stop()
+            self.reentered_stop.set()
+
+
 def _get_unused_udp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -632,27 +665,157 @@ async def test_udp_receiver_stop_emits_stopping_closed_stopped_in_order(
 
 
 @pytest.mark.asyncio
-async def test_udp_receiver_overlapping_stop_calls_publish_one_stop_sequence(
-    awaitable_recording_event_handler,
-) -> None:
+async def test_udp_receiver_overlapping_stop_calls_publish_one_stop_sequence() -> None:
+    handler = BlockingStoppingHandler()
     receiver = AsyncioUdpReceiver(
         settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
-        event_handler=awaitable_recording_event_handler,
+        event_handler=handler,
     )
-    await receiver.start()
+    first_stop_task: asyncio.Task[None] | None = None
+    second_stop_task: asyncio.Task[None] | None = None
+    try:
+        await receiver.start()
+        original_task = receiver._task  # type: ignore[attr-defined]
 
-    await asyncio.gather(receiver.stop(), receiver.stop())
+        first_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.wait_for(handler.stopping_seen.wait(), timeout=1.0)
+
+        second_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        assert not second_stop_task.done()
+
+        handler.release_stopping.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_stop_task, second_stop_task),
+            timeout=1.0,
+        )
+
+        stop_lifecycle_events = [
+            event
+            for event in handler.events
+            if (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current
+                in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            )
+        ]
+        closed_events = [
+            event for event in handler.events if isinstance(event, ConnectionClosedEvent)
+        ]
+        assert [event.current for event in stop_lifecycle_events] == [
+            ComponentLifecycleState.STOPPING,
+            ComponentLifecycleState.STOPPED,
+        ]
+        assert len(closed_events) == 1
+        assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+        assert receiver._socket is None  # type: ignore[attr-defined]
+        assert receiver._task is None  # type: ignore[attr-defined]
+        assert original_task is not None and original_task.done()
+        assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    finally:
+        handler.release_stopping.set()
+        for task in (first_stop_task, second_stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        await receiver.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_cancelled_waiting_stop_does_not_cancel_owner_waiter() -> None:
+    handler = BlockingStoppingHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=handler,
+    )
+    first_stop_task: asyncio.Task[None] | None = None
+    second_stop_task: asyncio.Task[None] | None = None
+    third_stop_task: asyncio.Task[None] | None = None
+    try:
+        await receiver.start()
+
+        first_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.wait_for(handler.stopping_seen.wait(), timeout=1.0)
+
+        second_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        second_stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second_stop_task
+
+        third_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        assert not third_stop_task.done()
+
+        handler.release_stopping.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_stop_task, third_stop_task),
+            timeout=1.0,
+        )
+
+        stop_lifecycle_events = [
+            event
+            for event in handler.events
+            if (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current
+                in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            )
+        ]
+        closed_events = [
+            event for event in handler.events if isinstance(event, ConnectionClosedEvent)
+        ]
+        assert [event.current for event in stop_lifecycle_events] == [
+            ComponentLifecycleState.STOPPING,
+            ComponentLifecycleState.STOPPED,
+        ]
+        assert len(closed_events) == 1
+        assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+        assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    finally:
+        handler.release_stopping.set()
+        for task in (first_stop_task, second_stop_task, third_stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        await receiver.stop()
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_inline_stop_reentry_does_not_self_await() -> None:
+    handler = StopAgainOnStoppingHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+
+    await receiver.start()
+    await asyncio.wait_for(receiver.stop(), timeout=1.0)
 
     stop_lifecycle_events = [
         event
-        for event in awaitable_recording_event_handler.lifecycle_events
-        if event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+        for event in handler.events
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+        )
     ]
+    closed_events = [event for event in handler.events if isinstance(event, ConnectionClosedEvent)]
+    assert handler.reentered_stop.is_set()
     assert [event.current for event in stop_lifecycle_events] == [
         ComponentLifecycleState.STOPPING,
         ComponentLifecycleState.STOPPED,
     ]
-    assert len(awaitable_recording_event_handler.closed_events) == 1
+    assert len(closed_events) == 1
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

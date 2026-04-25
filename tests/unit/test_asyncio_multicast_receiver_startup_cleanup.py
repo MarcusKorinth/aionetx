@@ -9,8 +9,9 @@ the environment refuses multicast operations.
 
 from __future__ import annotations
 
-import socket
 import asyncio
+import contextlib
+import socket
 
 import pytest
 
@@ -42,6 +43,22 @@ class FailOnOpenedHandler:
     async def on_event(self, event) -> None:
         if isinstance(event, ConnectionOpenedEvent):
             raise RuntimeError("boom-on-opened")
+
+
+class BlockingStoppingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.stopping_seen = asyncio.Event()
+        self.release_stopping = asyncio.Event()
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STOPPING
+        ):
+            self.stopping_seen.set()
+            await self.release_stopping.wait()
 
 
 @pytest.mark.asyncio
@@ -298,9 +315,8 @@ async def test_multicast_receiver_stop_from_starting_state_does_not_emit_closed_
 
 
 @pytest.mark.asyncio
-async def test_multicast_receiver_overlapping_stop_calls_publish_one_stop_sequence(
-    awaitable_recording_event_handler,
-) -> None:
+async def test_multicast_receiver_overlapping_stop_calls_publish_one_stop_sequence() -> None:
+    handler = BlockingStoppingHandler()
     receiver = AsyncioMulticastReceiver(
         settings=MulticastReceiverSettings(
             group_ip="239.255.0.4",
@@ -308,26 +324,54 @@ async def test_multicast_receiver_overlapping_stop_calls_publish_one_stop_sequen
             bind_ip="0.0.0.0",
             interface_ip="127.0.0.1",
         ),
-        event_handler=awaitable_recording_event_handler,
+        event_handler=handler,
     )
-    await receiver.start()
+    first_stop_task: asyncio.Task[None] | None = None
+    second_stop_task: asyncio.Task[None] | None = None
+    try:
+        await receiver.start()
+        original_task = receiver._task  # type: ignore[attr-defined]
 
-    await asyncio.gather(receiver.stop(), receiver.stop())
+        first_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.wait_for(handler.stopping_seen.wait(), timeout=1.0)
 
-    stop_relevant_events = [
-        event
-        for event in awaitable_recording_event_handler.events
-        if (
-            isinstance(event, ConnectionClosedEvent)
-            or (
+        second_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        assert not second_stop_task.done()
+
+        handler.release_stopping.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_stop_task, second_stop_task),
+            timeout=1.0,
+        )
+
+        stop_lifecycle_events = [
+            event
+            for event in handler.events
+            if (
                 isinstance(event, ComponentLifecycleChangedEvent)
                 and event.current
                 in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
             )
-        )
-    ]
-    assert [type(event).__name__ for event in stop_relevant_events] == [
-        "ComponentLifecycleChangedEvent",
-        "ConnectionClosedEvent",
-        "ComponentLifecycleChangedEvent",
-    ]
+        ]
+        closed_events = [
+            event for event in handler.events if isinstance(event, ConnectionClosedEvent)
+        ]
+        assert [event.current for event in stop_lifecycle_events] == [
+            ComponentLifecycleState.STOPPING,
+            ComponentLifecycleState.STOPPED,
+        ]
+        assert len(closed_events) == 1
+        assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+        assert receiver._socket is None  # type: ignore[attr-defined]
+        assert receiver._task is None  # type: ignore[attr-defined]
+        assert original_task is not None and original_task.done()
+        assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    finally:
+        handler.release_stopping.set()
+        for task in (first_stop_task, second_stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        await receiver.stop()
