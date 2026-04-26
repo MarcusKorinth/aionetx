@@ -37,6 +37,8 @@ from aionetx.implementations.asyncio_impl import (
 from aionetx.implementations.asyncio_impl import asyncio_udp_sender as udp_sender_module
 from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import AsyncioUdpReceiver
 from aionetx.implementations.asyncio_impl.asyncio_udp_sender import AsyncioUdpSender
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 
 
 class NoopHandler:
@@ -278,8 +280,7 @@ async def test_udp_receiver_stop_cancellation_still_detaches_receive_task_and_so
 
     # Supported Python releases differ in whether this caller cancellation
     # remains visible after inline handler-failure handling. Cleanup is stable.
-    with contextlib.suppress(asyncio.CancelledError):
-        _ = await stop_task
+    await drain_awaitable_ignoring_cancelled(stop_task)
 
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._socket is None  # type: ignore[attr-defined]
@@ -332,14 +333,12 @@ async def test_udp_receiver_stop_cancellation_waits_for_receive_task_cleanup(
         assert stop_task.done() is False
 
         release_task.set()
-        with pytest.raises(asyncio.CancelledError):
-            await stop_task
+        await assert_awaitable_cancelled(stop_task)
     finally:
         release_task.set()
         if not stop_task.done():
             stop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stop_task
+            await drain_awaitable_ignoring_cancelled(stop_task)
 
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._socket is None  # type: ignore[attr-defined]
@@ -777,8 +776,7 @@ async def test_udp_receiver_overlapping_stop_calls_publish_one_stop_sequence() -
         for task in (first_stop_task, second_stop_task):
             if task is not None and not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                await drain_awaitable_ignoring_cancelled(task)
         await receiver.stop()
 
 
@@ -801,8 +799,7 @@ async def test_udp_receiver_cancelled_waiting_stop_does_not_cancel_owner_waiter(
         second_stop_task = asyncio.create_task(receiver.stop())
         await asyncio.sleep(0)
         second_stop_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await second_stop_task
+        await assert_awaitable_cancelled(second_stop_task)
 
         third_stop_task = asyncio.create_task(receiver.stop())
         await asyncio.sleep(0)
@@ -838,8 +835,7 @@ async def test_udp_receiver_cancelled_waiting_stop_does_not_cancel_owner_waiter(
         for task in (first_stop_task, second_stop_task, third_stop_task):
             if task is not None and not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                await drain_awaitable_ignoring_cancelled(task)
         await receiver.stop()
 
 

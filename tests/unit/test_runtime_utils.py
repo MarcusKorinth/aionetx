@@ -5,6 +5,8 @@ import asyncio
 import pytest
 
 from aionetx.implementations.asyncio_impl import runtime_utils as runtime_utils_module
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.internal_asyncio_impl_refs import await_task_completion_preserving_cancellation
 
 
@@ -47,19 +49,12 @@ async def test_task_await_helper_preserves_caller_cancellation_without_task_canc
         assert not awaiter_task.done()
 
         release_child.set()
-        with pytest.raises(asyncio.CancelledError):
-            await awaiter_task
+        await assert_awaitable_cancelled(awaiter_task)
     finally:
         release_child.set()
         if not awaiter_task.done():
             awaiter_task.cancel()
-            try:
-                await awaiter_task
-            except asyncio.CancelledError:
-                pass
+            await drain_awaitable_ignoring_cancelled(awaiter_task)
         if not child_task.done():
             child_task.cancel()
-            try:
-                await child_task
-            except asyncio.CancelledError:
-                pass
+            await drain_awaitable_ignoring_cancelled(child_task)

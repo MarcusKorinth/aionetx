@@ -10,7 +10,6 @@ the environment refuses multicast operations.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import socket
 
 import pytest
@@ -32,6 +31,7 @@ from aionetx.implementations.asyncio_impl import asyncio_multicast_receiver as m
 from aionetx.implementations.asyncio_impl.asyncio_multicast_receiver import (
     AsyncioMulticastReceiver,
 )
+from tests.helpers import drain_awaitable_ignoring_cancelled
 
 
 class NoopHandler:
@@ -372,6 +372,5 @@ async def test_multicast_receiver_overlapping_stop_calls_publish_one_stop_sequen
         for task in (first_stop_task, second_stop_task):
             if task is not None and not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                await drain_awaitable_ignoring_cancelled(task)
         await receiver.stop()

@@ -16,6 +16,8 @@ from aionetx.api.network_error_event import NetworkErrorEvent
 from aionetx.api._event_registry import NETWORK_EVENT_TYPES
 from aionetx.implementations.asyncio_impl.asyncio_heartbeat_sender import AsyncioHeartbeatSender
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.helpers import wait_for_condition
 
 
@@ -170,8 +172,7 @@ async def test_heartbeat_sender_stop_preserves_caller_cancellation_after_task_cl
         assert not stop_task.done()
 
         release_task.set()
-        with pytest.raises(asyncio.CancelledError):
-            await stop_task
+        await assert_awaitable_cancelled(stop_task)
 
         assert sender.is_running is False
         assert sender._task is None  # type: ignore[attr-defined]
@@ -180,16 +181,10 @@ async def test_heartbeat_sender_stop_preserves_caller_cancellation_after_task_cl
         release_task.set()
         if not stop_task.done():
             stop_task.cancel()
-            try:
-                await stop_task
-            except asyncio.CancelledError:
-                pass
+            await drain_awaitable_ignoring_cancelled(stop_task)
         if not heartbeat_task.done():
             heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
+            await drain_awaitable_ignoring_cancelled(heartbeat_task)
         await dispatcher.stop()
 
 

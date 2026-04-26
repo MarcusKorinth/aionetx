@@ -37,6 +37,8 @@ from aionetx.implementations.asyncio_impl import (
 from aionetx.implementations.asyncio_impl import _tcp_client_connect as tcp_client_connect_module
 from aionetx.implementations.asyncio_impl.asyncio_tcp_client import AsyncioTcpClient
 from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.internal_asyncio_impl_refs import WarningRateLimiter
 
 
@@ -340,8 +342,7 @@ async def test_client_stop_preserves_caller_cancellation_after_supervisor_cleanu
         assert not stop_task.done()
 
         release_supervisor.set()
-        with pytest.raises(asyncio.CancelledError):
-            await stop_task
+        await assert_awaitable_cancelled(stop_task)
 
         assert call_order == ["heartbeat-stop", "connection-close"]
         assert client.lifecycle_state == ComponentLifecycleState.STOPPED
@@ -351,16 +352,10 @@ async def test_client_stop_preserves_caller_cancellation_after_supervisor_cleanu
         release_supervisor.set()
         if not stop_task.done():
             stop_task.cancel()
-            try:
-                await stop_task
-            except asyncio.CancelledError:
-                pass
+            await drain_awaitable_ignoring_cancelled(stop_task)
         if not supervisor_task.done():
             supervisor_task.cancel()
-            try:
-                await supervisor_task
-            except asyncio.CancelledError:
-                pass
+            await drain_awaitable_ignoring_cancelled(supervisor_task)
         if client._event_dispatcher.is_running:  # type: ignore[attr-defined]
             await client._event_dispatcher.stop()  # type: ignore[attr-defined]
 
@@ -423,10 +418,7 @@ async def test_client_concurrent_stop_waits_for_owner_without_duplicate_cleanup(
         for task in (owner_stop_task, locals().get("waiter_stop_task")):
             if isinstance(task, asyncio.Task) and not task.done():
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                await drain_awaitable_ignoring_cancelled(task)
         if client._event_dispatcher.is_running:  # type: ignore[attr-defined]
             await client._event_dispatcher.stop()  # type: ignore[attr-defined]
 

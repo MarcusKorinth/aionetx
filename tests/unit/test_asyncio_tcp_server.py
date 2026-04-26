@@ -38,6 +38,8 @@ from aionetx.implementations.asyncio_impl._tcp_server_helpers import handle_acce
 from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
 from aionetx.implementations.asyncio_impl.asyncio_tcp_server import AsyncioTcpServer
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.helpers import wait_for_condition
 
 
@@ -415,8 +417,7 @@ async def test_server_cancelled_overlapping_stop_does_not_cancel_owner_waiter(
         second_stop = asyncio.create_task(server.stop())
         await asyncio.sleep(0)
         second_stop.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await second_stop
+        await assert_awaitable_cancelled(second_stop)
 
         assert stop_waiter.cancelled() is False
 
@@ -431,8 +432,7 @@ async def test_server_cancelled_overlapping_stop_does_not_cancel_owner_waiter(
         blocking.release_close.set()
         if not first_stop.done():
             first_stop.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await first_stop
+            await drain_awaitable_ignoring_cancelled(first_stop)
 
     assert blocking.close_attempts == 1
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
@@ -517,8 +517,7 @@ async def test_server_start_cancellation_rolls_back_state_and_closes_listener(
     await asyncio.wait_for(start_server_entered.wait(), timeout=1.0)
     start_task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await start_task
+    await assert_awaitable_cancelled(start_task)
 
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
     assert server._server is None  # type: ignore[attr-defined]
@@ -581,8 +580,7 @@ async def test_server_start_cancellation_finishes_dispatcher_stop_when_cancelled
 
     release_dispatcher_stop.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await start_task
+    await assert_awaitable_cancelled(start_task)
 
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
     assert server._server is None  # type: ignore[attr-defined]
