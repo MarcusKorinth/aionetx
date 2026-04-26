@@ -426,8 +426,7 @@ async def test_server_cancelled_overlapping_stop_does_not_cancel_owner_waiter(
         assert third_stop.done() is False
 
         blocking.release_close.set()
-        await first_stop
-        await third_stop
+        assert await asyncio.gather(first_stop, third_stop) == [None, None]
     finally:
         blocking.release_close.set()
         if not first_stop.done():
