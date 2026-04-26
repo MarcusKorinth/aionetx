@@ -45,6 +45,7 @@ Protocol framing, parsing, and business logic remain in your application.
   - [Lifecycle model](#lifecycle-model)
   - [Unified event integration](#unified-event-integration)
   - [Event delivery and backpressure](#event-delivery-and-backpressure)
+  - [TCP send timeout behavior](#tcp-send-timeout-behavior)
 - [Practical examples](#practical-examples)
   - [Buffer TCP chunks into fixed-size frames (1359 bytes)](#1-buffer-tcp-chunks-into-fixed-size-frames-1359-bytes)
   - [Receive bytes with one handler](#2-receive-bytes-with-one-handler)
@@ -458,6 +459,14 @@ deterministic-shutdown cutoffs.
 
 For lifecycle/cancellation/shutdown contract details, see `docs/architecture.md` and the runtime/integration tests in `tests/`.
 
+### TCP send timeout behavior
+
+TCP `ConnectionProtocol.send()` writes bytes and waits for the underlying `asyncio.StreamWriter.drain()` to complete. TCP client and server connections limit that drain wait by default with `connection_send_timeout_seconds=30.0`.
+
+Set `connection_send_timeout_seconds=None` only when you intentionally want OS/backpressure-controlled sends that may wait indefinitely behind a slow or non-reading peer. When the configured timeout expires, direct `send()` raises `asyncio.TimeoutError`; managed heartbeat sends emit `NetworkErrorEvent` and stop the heartbeat sender, while server broadcast closes the failed recipient connection.
+
+For TCP servers, `broadcast_send_timeout_seconds` is an outer per-recipient broadcast wrapper. Setting it to `None` disables only that broadcast wrapper; accepted connections can still time out via `connection_send_timeout_seconds`.
+
 ---
 
 ## Practical examples
@@ -704,7 +713,7 @@ Verification interpretation summary is provided here; architecture-level rationa
 aionetx runs on Linux, macOS, and Windows. Some runtime behavior differs per platform, and timing guarantees are explicitly best-effort. Before deploying to latency-sensitive or regulated contexts, review:
 
 - [`docs/platform_notes.md`](docs/platform_notes.md) - socket bind reuse/exclusivity semantics, multicast binding notes, and the UDP `sock_sendto()` / `sock_recvfrom()` fallback on Windows `ProactorEventLoop` (per-operation wake latency up to ~20 ms)
-- [`docs/timing_and_latency.md`](docs/timing_and_latency.md) - what aionetx does and does not guarantee about reconnect, heartbeat, and datagram timing; suitability and non-suitability guidance for regulated, safety-adjacent, and latency-sensitive contexts
+- [`docs/timing_and_latency.md`](docs/timing_and_latency.md) - what aionetx does and does not guarantee about TCP send flushes, reconnect, heartbeat, and datagram timing; suitability and non-suitability guidance for regulated, safety-adjacent, and latency-sensitive contexts
 - [`docs/logging.md`](docs/logging.md) - logger hierarchy, structured context keys, warnings to alert on, and a minimal `dictConfig` snippet
 
 ### How to read CI at a glance
@@ -886,6 +895,7 @@ For the full logger hierarchy, structured context keys, recommended levels, and 
 - choose `EventDeliverySettings` intentionally (`BACKGROUND + BLOCK` is a solid default)
 - keep handler code non-blocking; offload slow work
 - implement explicit TCP framing (length-prefix, delimiter, or fixed-size)
+- choose TCP connect/send/idle timeouts deliberately; disable `connection_send_timeout_seconds` only when indefinite backpressure waits are intentional
 - set reconnect and heartbeat parameters deliberately for your environment
 - enable debug logs during integration, then lower verbosity in steady state
 - add app-level integration tests for framing, reconnect, and shutdown behavior
