@@ -11,5 +11,6 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - asyncio-first TCP client and server transport primitives
 - UDP sender, UDP receiver, and IPv4 multicast receiver primitives
 - explicit lifecycle events, event delivery settings, and backpressure policies
+- bounded TCP send flushes with configurable per-connection send timeouts
 - optional TCP client reconnect and heartbeat support
 - tests, examples, typing metadata, and CI/release verification gates

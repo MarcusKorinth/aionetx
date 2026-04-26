@@ -220,8 +220,7 @@ async def _connect_once_with_blocking_writer(
 ) -> tuple[AsyncioTcpConnection, _BlockingDrainWriter, AsyncioEventDispatcher]:
     writer = _BlockingDrainWriter()
 
-    async def _open_connection(*, host: str, port: int):
-        del host, port
+    async def _open_connection(**_kwargs: object):
         return asyncio.StreamReader(), writer
 
     dispatcher = AsyncioEventDispatcher(

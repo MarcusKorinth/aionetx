@@ -99,8 +99,7 @@ class _FailingTrackedConnection(_FailingConnection):
 class _TimeoutConnection(_FailingTrackedConnection):
     """Failing sender that models an inner connection-level send timeout."""
 
-    async def send(self, data: bytes) -> None:
-        del data
+    async def send(self, _data: bytes) -> None:
         raise TimeoutError("connection-send-timeout")
 
 
