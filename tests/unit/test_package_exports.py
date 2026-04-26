@@ -8,6 +8,9 @@ module layout, implementation namespaces, or complete export lists.
 
 from __future__ import annotations
 
+import importlib
+from types import ModuleType
+
 import aionetx
 import pytest
 
@@ -19,6 +22,9 @@ from aionetx import (
     TcpServerSettings,
 )
 from aionetx.api import (
+    ByteSenderProtocol,
+    BytesLike,
+    ManagedTransportProtocol,
     MulticastReceiverProtocol,
     NetworkConfigurationError,
     NetworkLayerError,
@@ -33,6 +39,10 @@ from aionetx.api import (
 )
 
 
+def _api_module() -> ModuleType:
+    return importlib.import_module("aionetx.api")
+
+
 def test_package_root_exports_recommended_entry_points() -> None:
     assert aionetx.AsyncioNetworkFactory is AsyncioNetworkFactory
     assert aionetx.TcpClientSettings is TcpClientSettings
@@ -42,7 +52,7 @@ def test_package_root_exports_recommended_entry_points() -> None:
 
 
 def test_aionetx_api_exports_transport_protocols_for_advanced_usage() -> None:
-    import aionetx.api as api
+    api = _api_module()
 
     assert api.TcpClientProtocol is TcpClientProtocol
     assert api.TcpServerProtocol is TcpServerProtocol
@@ -51,15 +61,23 @@ def test_aionetx_api_exports_transport_protocols_for_advanced_usage() -> None:
     assert api.MulticastReceiverProtocol is MulticastReceiverProtocol
 
 
+def test_aionetx_api_exports_bytes_capability_types() -> None:
+    api = _api_module()
+
+    assert api.BytesLike is BytesLike
+    assert api.ByteSenderProtocol is ByteSenderProtocol
+    assert api.ManagedTransportProtocol is ManagedTransportProtocol
+
+
 def test_aionetx_api_exports_udp_send_exceptions() -> None:
-    import aionetx.api as api
+    api = _api_module()
 
     assert api.UdpSenderStoppedError is UdpSenderStoppedError
     assert api.UdpInvalidTargetError is UdpInvalidTargetError
 
 
 def test_aionetx_api_exports_exception_bases_and_typed_router() -> None:
-    import aionetx.api as api
+    api = _api_module()
 
     assert api.NetworkLayerError is NetworkLayerError
     assert api.NetworkConfigurationError is NetworkConfigurationError

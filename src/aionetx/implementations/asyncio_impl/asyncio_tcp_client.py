@@ -48,6 +48,7 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     ReconnectBackoff,
     assert_running_on_owner_loop,
+    await_task_completion_preserving_cancellation,
     validate_heartbeat_provider,
 )
 from aionetx.implementations.asyncio_impl.tcp_client_supervision import (
@@ -87,6 +88,8 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         self._runtime = _ClientRuntimeState()
         self._supervisor_task: asyncio.Task[None] | None = None
         self._state_lock = asyncio.Lock()
+        self._stop_waiter: asyncio.Future[None] | None = None
+        self._stop_owner_task: asyncio.Task[object] | None = None
         self._lifecycle_state = ComponentLifecycleState.STOPPED
         self._backoff = ReconnectBackoff(settings.reconnect)
         self._status_changed = asyncio.Event()
@@ -195,19 +198,53 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         should_stop_dispatcher = False
         await_supervisor_completion_only = False
         skip_await_supervisor = False
+        stop_waiter: asyncio.Future[None] | None = None
+        owns_stop = False
         current_task = asyncio.current_task()
         async with self._state_lock:
-            if self._lifecycle_state in (
-                ComponentLifecycleState.STOPPING,
-                ComponentLifecycleState.STOPPED,
+            if self._stop_waiter is not None:
+                if current_task is self._stop_owner_task:
+                    # Inline STOPPING handlers can re-enter stop() from the
+                    # owner task; waiting on the owner waiter would deadlock.
+                    return
+                stop_waiter = self._stop_waiter
+            elif (
+                self._lifecycle_state == ComponentLifecycleState.STOPPED
+                and self._supervisor_task is None
+                and self._heartbeat_sender is None
+                and self._connection is None
+                and not self._event_dispatcher.is_running
             ):
+                return
+            else:
+                # Publish the shared waiter before slow teardown so overlapping
+                # stop callers join this stop path instead of planning another.
+                loop = (
+                    current_task.get_loop()
+                    if current_task is not None
+                    else asyncio.get_event_loop()
+                )
+                stop_waiter = loop.create_future()
+                self._stop_waiter = stop_waiter
+                self._stop_owner_task = current_task
+                owns_stop = True
+            if owns_stop and self._lifecycle_state == ComponentLifecycleState.STOPPING:
                 supervisor_task = self._supervisor_task
                 if supervisor_task is not None and supervisor_task.done():
                     self._supervisor_task = None
                     supervisor_task = None
                 else:
                     await_supervisor_completion_only = supervisor_task is not None
-            else:
+                should_stop_dispatcher = self._event_dispatcher.is_running
+            elif owns_stop and self._lifecycle_state == ComponentLifecycleState.STOPPED:
+                supervisor_task = self._supervisor_task
+                if supervisor_task is not None and supervisor_task.done():
+                    self._supervisor_task = None
+                    supervisor_task = None
+                else:
+                    await_supervisor_completion_only = supervisor_task is not None
+                should_stop_dispatcher = self._event_dispatcher.is_running
+            elif owns_stop:
                 stopping_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPING)
                 supervisor_task = self._supervisor_task
                 self._supervisor_task = None
@@ -217,51 +254,82 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     and self._event_dispatcher.current_task_is_worker()
                     and supervisor_task is not None
                 )
+        if not owns_stop:
+            if stop_waiter is not None and not self._event_dispatcher.current_task_is_worker():
+                await asyncio.shield(stop_waiter)
+            return
         inline_delivery_context = (
             self._event_dispatcher.inline_delivery_context()
             if self._event_dispatcher.current_task_is_worker()
             else contextlib.nullcontext()
         )
-        with inline_delivery_context:
-            first_error: BaseException | None = None
-            try:
-                await self._emit_lifecycle_event(stopping_event)
-            except (Exception, asyncio.CancelledError) as error:
-                first_error = error
-            try:
-                if supervisor_task is not None and not skip_await_supervisor:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        if not await_supervisor_completion_only:
-                            supervisor_task.cancel()
-                        _ = await cast(Awaitable[object], supervisor_task)
-                    if self._supervisor_task is supervisor_task:
-                        self._supervisor_task = None
-                await self._stop_heartbeat_sender()
-                await self._close_current_connection()
-                if (
-                    supervisor_task is not None
-                    and skip_await_supervisor
-                    and not await_supervisor_completion_only
-                ):
-                    supervisor_task.cancel()
-            except (Exception, asyncio.CancelledError) as error:
-                if first_error is None:
-                    first_error = error
-            if should_stop_dispatcher:
-                async with self._state_lock:
-                    stopped_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
-                if first_error is None:
-                    try:
-                        await self._emit_lifecycle_event(stopped_event)
-                    except (Exception, asyncio.CancelledError) as error:
-                        first_error = error
+        try:
+            with inline_delivery_context:
+                first_error: BaseException | None = None
                 try:
-                    await self._event_dispatcher.stop()
+                    await self._emit_lifecycle_event(stopping_event)
+                except (Exception, asyncio.CancelledError) as error:
+                    first_error = error
+                try:
+                    if supervisor_task is not None and not skip_await_supervisor:
+                        try:
+                            if not await_supervisor_completion_only:
+                                supervisor_task.cancel()
+                            await await_task_completion_preserving_cancellation(
+                                cast(asyncio.Task[object], supervisor_task)
+                            )
+                        finally:
+                            if self._supervisor_task is supervisor_task:
+                                self._supervisor_task = None
                 except (Exception, asyncio.CancelledError) as error:
                     if first_error is None:
                         first_error = error
-            if first_error is not None:
-                raise first_error
+                try:
+                    # A cancelled supervisor wait must not skip local resource cleanup.
+                    # Preserve the first error, finish teardown, then re-raise below.
+                    await self._stop_heartbeat_sender()
+                    await self._close_current_connection()
+                    if (
+                        supervisor_task is not None
+                        and skip_await_supervisor
+                        and not await_supervisor_completion_only
+                    ):
+                        supervisor_task.cancel()
+                except (Exception, asyncio.CancelledError) as error:
+                    if first_error is None:
+                        first_error = error
+                if should_stop_dispatcher:
+                    async with self._state_lock:
+                        if self._lifecycle_state == ComponentLifecycleState.STOPPING:
+                            stopped_event = self._apply_lifecycle_state(
+                                ComponentLifecycleState.STOPPED
+                            )
+                    if first_error is None:
+                        try:
+                            await self._emit_lifecycle_event(stopped_event)
+                        except (Exception, asyncio.CancelledError) as error:
+                            first_error = error
+                    try:
+                        await self._event_dispatcher.stop()
+                    except (Exception, asyncio.CancelledError) as error:
+                        if first_error is None:
+                            first_error = error
+                if first_error is not None:
+                    raise first_error
+        except (Exception, asyncio.CancelledError) as error:
+            if stop_waiter is not None and not stop_waiter.done():
+                stop_waiter.set_exception(error)
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    stop_waiter.exception()
+            raise
+        else:
+            if stop_waiter is not None and not stop_waiter.done():
+                stop_waiter.set_result(None)
+        finally:
+            async with self._state_lock:
+                if self._stop_waiter is stop_waiter:
+                    self._stop_waiter = None
+                    self._stop_owner_task = None
         self._logger.debug("TCP client stopped.")
 
     async def __aenter__(self) -> AsyncioTcpClient:

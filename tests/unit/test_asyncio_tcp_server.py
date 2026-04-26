@@ -38,6 +38,8 @@ from aionetx.implementations.asyncio_impl._tcp_server_helpers import handle_acce
 from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
 from aionetx.implementations.asyncio_impl.asyncio_tcp_server import AsyncioTcpServer
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.helpers import wait_for_condition
 
 
@@ -395,6 +397,47 @@ async def test_server_concurrent_stop_waits_for_active_teardown(
 
 
 @pytest.mark.asyncio
+async def test_server_cancelled_overlapping_stop_does_not_cancel_owner_waiter(
+    recording_event_handler,
+) -> None:
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(host="127.0.0.1", port=12349, max_connections=64),
+        event_handler=recording_event_handler,
+    )
+    blocking = _BlockingCloseConnection("server:blocking-close:2")
+    server._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    server._connections = {blocking.connection_id: blocking}  # type: ignore[attr-defined,dict-item]
+
+    first_stop = asyncio.create_task(server.stop())
+    try:
+        await asyncio.wait_for(blocking.close_started.wait(), timeout=1.0)
+        stop_waiter = server._stop_waiter  # type: ignore[attr-defined]
+        assert stop_waiter is not None
+
+        second_stop = asyncio.create_task(server.stop())
+        await asyncio.sleep(0)
+        second_stop.cancel()
+        await assert_awaitable_cancelled(second_stop)
+
+        assert stop_waiter.cancelled() is False
+
+        third_stop = asyncio.create_task(server.stop())
+        await asyncio.sleep(0)
+        assert third_stop.done() is False
+
+        blocking.release_close.set()
+        assert await asyncio.gather(first_stop, third_stop) == [None, None]
+    finally:
+        blocking.release_close.set()
+        if not first_stop.done():
+            first_stop.cancel()
+            await drain_awaitable_ignoring_cancelled(first_stop)
+
+    assert blocking.close_attempts == 1
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
 async def test_server_lifecycle_events_preserve_start_stop_order(recording_event_handler) -> None:
     port = _unused_tcp_port()
     server = AsyncioTcpServer(
@@ -446,6 +489,102 @@ async def test_server_start_rolls_back_state_and_allows_retry(
     await server.start()
     assert server.lifecycle_state == ComponentLifecycleState.RUNNING
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_server_start_cancellation_rolls_back_state_and_closes_listener(
+    recording_event_handler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _unused_tcp_port()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
+        event_handler=recording_event_handler,
+    )
+    start_server_entered = asyncio.Event()
+    release_start_server = asyncio.Event()
+
+    async def cancelled_start_server(*args, **kwargs):
+        del args, kwargs
+        start_server_entered.set()
+        await release_start_server.wait()
+        raise AssertionError("start_server should not resume after task cancellation")
+
+    monkeypatch.setattr(asyncio, "start_server", cancelled_start_server)
+
+    start_task = asyncio.create_task(server.start())
+    await asyncio.wait_for(start_server_entered.wait(), timeout=1.0)
+    start_task.cancel()
+
+    await assert_awaitable_cancelled(start_task)
+
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert server._server is None  # type: ignore[attr-defined]
+    assert server._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", port))
+
+    component_events = [
+        event
+        for event in recording_event_handler.lifecycle_events
+        if event.resource_id == f"tcp/server/127.0.0.1/{port}"
+    ]
+    assert [event.current for event in component_events] == [
+        ComponentLifecycleState.STARTING,
+        ComponentLifecycleState.STOPPED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_start_cancellation_finishes_dispatcher_stop_when_cancelled_again(
+    recording_event_handler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=_unused_tcp_port(),
+            max_connections=64,
+        ),
+        event_handler=recording_event_handler,
+    )
+    start_server_entered = asyncio.Event()
+    dispatcher_stop_entered = asyncio.Event()
+    release_dispatcher_stop = asyncio.Event()
+    dispatcher_stop_completed = asyncio.Event()
+    original_dispatcher_stop = server._event_dispatcher.stop  # type: ignore[attr-defined]
+
+    async def cancelled_start_server(*args, **kwargs):
+        del args, kwargs
+        start_server_entered.set()
+        await asyncio.Event().wait()
+
+    async def delayed_dispatcher_stop() -> None:
+        dispatcher_stop_entered.set()
+        await release_dispatcher_stop.wait()
+        await original_dispatcher_stop()
+        dispatcher_stop_completed.set()
+
+    monkeypatch.setattr(asyncio, "start_server", cancelled_start_server)
+    server._event_dispatcher.stop = delayed_dispatcher_stop  # type: ignore[method-assign,attr-defined]
+
+    start_task = asyncio.create_task(server.start())
+    await asyncio.wait_for(start_server_entered.wait(), timeout=1.0)
+    start_task.cancel()
+    await asyncio.wait_for(dispatcher_stop_entered.wait(), timeout=1.0)
+    start_task.cancel()
+    await asyncio.sleep(0)
+
+    assert not start_task.done()
+
+    release_dispatcher_stop.set()
+
+    await assert_awaitable_cancelled(start_task)
+
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert server._server is None  # type: ignore[attr-defined]
+    assert dispatcher_stop_completed.is_set()
+    assert server._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 # Wait helpers and bootstrap state reporting.

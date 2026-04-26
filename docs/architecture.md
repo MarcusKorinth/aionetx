@@ -45,12 +45,12 @@ No public `FAILED` lifecycle state exists.
 
 - `STOPPED -> STARTING`
 - `STARTING -> RUNNING`
-- `STARTING -> STOPPING`
 - `STARTING -> STOPPED` (startup rollback)
+- `STARTING -> STOPPING` (shutdown requested during startup)
 - `RUNNING -> STOPPING`
 - `STOPPING -> STOPPED`
 
-State transitions must remain monotonic and understandable. Concurrent lifecycle calls must converge without illegal transitions.
+State transitions must remain monotonic and understandable. Concurrent lifecycle calls must converge without illegal transitions, duplicate terminal publication, or detached cleanup tasks.
 
 Failures are surfaced through events (network/reconnect/close/error), not via a separate lifecycle enum.
 
@@ -61,9 +61,11 @@ the semantic test suite:
 
 - Once `stop()` returns with state `STOPPED`, no further user callback is
   invoked from the component's internal tasks.
+- Startup cancellation must roll back partial resources and leave the component
+  in the same terminal `STOPPED` state as other startup failures.
 - `STOPPING` is a terminal-in-progress state, not a re-entrant steady state:
-  repeated stop requests converge on the same shutdown path instead of creating
-  new transition branches.
+  repeated or overlapping stop requests converge on the same shutdown path
+  instead of creating new transition branches.
 - Lifecycle publication remains monotonic: managed components do not publish
   illegal backward transitions.
 - Terminal lifecycle publication happens at most once per shutdown sequence.
@@ -73,7 +75,8 @@ the semantic test suite:
 Primary integration contract:
 
 ```python
-async def on_event(self, event: NetworkEvent) -> None
+async def on_event(self, event: NetworkEvent) -> None:
+    ...
 ```
 
 `BaseNetworkEventHandler` is a convenience layer over this contract.
@@ -103,7 +106,7 @@ async def on_event(self, event: NetworkEvent) -> None
 be added in minor releases as the observability surface grows. Stability
 guarantees are:
 
-- Existing event dataclasses and their field shapes are stable â€” fields
+- Existing event dataclasses and their field shapes are stable - fields
   are not renamed, retyped, or removed without a deprecation cycle and a
   CHANGELOG entry when compatibility expectations change.
 - Additions to the union are called out under **Added** in the CHANGELOG.

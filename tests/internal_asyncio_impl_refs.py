@@ -21,6 +21,7 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     ReconnectBackoff,
     WarningRateLimiter,
+    await_task_completion_preserving_cancellation,
     validate_heartbeat_provider,
 )
 
@@ -31,6 +32,7 @@ __all__ = (
     "apply_stopped_transition_if_stopping",
     "apply_stopping_transition_if_active",
     "assert_legal_lifecycle_transition",
+    "await_task_completion_preserving_cancellation",
     "multicast_receiver_component_id",
     "tcp_client_component_id",
     "tcp_client_connection_id",

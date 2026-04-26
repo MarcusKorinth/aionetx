@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import asyncio
 import logging
 
 import pytest
@@ -14,6 +16,8 @@ from aionetx.api.network_error_event import NetworkErrorEvent
 from aionetx.api._event_registry import NETWORK_EVENT_TYPES
 from aionetx.implementations.asyncio_impl.asyncio_heartbeat_sender import AsyncioHeartbeatSender
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
+from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.helpers import wait_for_condition
 
 
@@ -67,6 +71,11 @@ class InvalidResultHeartbeatProvider:
 class InvalidPayloadHeartbeatProvider:
     async def create_heartbeat(self, request: HeartbeatRequest) -> HeartbeatResult:
         return HeartbeatResult(should_send=True, payload="bad-payload")  # type: ignore[arg-type]
+
+
+class InvalidShouldSendHeartbeatProvider:
+    async def create_heartbeat(self, request: HeartbeatRequest) -> HeartbeatResult:
+        return HeartbeatResult(should_send="yes", payload=b"hb")  # type: ignore[arg-type]
 
 
 class FailingSendConnection(FakeConnection):
@@ -125,6 +134,58 @@ async def test_heartbeat_sender_start_and_stop_are_idempotent(recording_event_ha
 
     assert sender.is_running is False
     assert sender._task is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sender_stop_preserves_caller_cancellation_after_task_cleanup(
+    recording_event_handler,
+) -> None:
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    sender = AsyncioHeartbeatSender(
+        FakeConnection(),
+        TcpHeartbeatSettings(enabled=True, interval_seconds=1.0),
+        ToggleHeartbeatProvider(),
+        dispatcher,
+    )
+    task_cancel_seen = asyncio.Event()
+    release_task = asyncio.Event()
+
+    async def blocking_heartbeat_task() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            task_cancel_seen.set()
+            await release_task.wait()
+            raise
+
+    heartbeat_task = asyncio.create_task(blocking_heartbeat_task())
+    sender._running = True  # type: ignore[attr-defined]
+    sender._task = heartbeat_task  # type: ignore[attr-defined]
+    stop_task = asyncio.create_task(sender.stop())
+
+    try:
+        await asyncio.wait_for(task_cancel_seen.wait(), timeout=1.0)
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not stop_task.done()
+
+        release_task.set()
+        await assert_awaitable_cancelled(stop_task)
+
+        assert sender.is_running is False
+        assert sender._task is None  # type: ignore[attr-defined]
+        assert heartbeat_task.done()
+    finally:
+        release_task.set()
+        if not stop_task.done():
+            stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(stop_task)
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await drain_awaitable_ignoring_cancelled(heartbeat_task)
+        await dispatcher.stop()
 
 
 @pytest.mark.asyncio
@@ -205,6 +266,25 @@ async def test_heartbeat_sender_emits_error_for_invalid_payload_type(
         FakeConnection(),
         TcpHeartbeatSettings(enabled=True, interval_seconds=0.01),
         InvalidPayloadHeartbeatProvider(),  # type: ignore[arg-type]
+        dispatcher,
+    )
+    await sender.start()
+    await wait_for_condition(lambda: sender.is_running is False, timeout_seconds=1.0)
+    await dispatcher.stop()
+    assert recording_event_handler.error_events
+    assert isinstance(recording_event_handler.error_events[-1].error, TypeError)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sender_emits_error_for_invalid_should_send_type(
+    recording_event_handler,
+) -> None:
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    sender = AsyncioHeartbeatSender(
+        FakeConnection(),
+        TcpHeartbeatSettings(enabled=True, interval_seconds=0.01),
+        InvalidShouldSendHeartbeatProvider(),  # type: ignore[arg-type]
         dispatcher,
     )
     await sender.start()

@@ -6,7 +6,13 @@ from collections.abc import Callable
 from importlib.metadata import version as package_version
 
 import aionetx
-from aionetx.api import NetworkEvent, ReconnectAttemptFailedEvent
+from aionetx.api import (
+    ByteSenderProtocol,
+    BytesLike,
+    ManagedTransportProtocol,
+    NetworkEvent,
+    ReconnectAttemptFailedEvent,
+)
 
 AsyncioNetworkFactory = aionetx.AsyncioNetworkFactory
 BytesReceivedEvent = aionetx.BytesReceivedEvent
@@ -24,6 +30,13 @@ assert isinstance(aionetx.__version__, str) and aionetx.__version__, (
 assert aionetx.__version__ == package_version("aionetx"), (
     "aionetx.__version__ must match installed package metadata; "
     f"got {aionetx.__version__!r} vs {package_version('aionetx')!r}"
+)
+assert BytesLike is not None, "aionetx.api.BytesLike is missing from installed package"
+assert ByteSenderProtocol.__name__ == "ByteSenderProtocol", (
+    "aionetx.api.ByteSenderProtocol is missing from installed package"
+)
+assert ManagedTransportProtocol.__name__ == "ManagedTransportProtocol", (
+    "aionetx.api.ManagedTransportProtocol is missing from installed package"
 )
 
 

@@ -32,8 +32,11 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
     LifecycleTransitionPublisher,
     emit_lifecycle_event,
 )
-from aionetx.implementations.asyncio_impl.runtime_utils import WarningRateLimiter
-from aionetx.implementations.asyncio_impl.runtime_utils import assert_running_on_owner_loop
+from aionetx.implementations.asyncio_impl.runtime_utils import (
+    WarningRateLimiter,
+    assert_running_on_owner_loop,
+    await_task_completion_preserving_cancellation,
+)
 
 SocketCleanup = Callable[[socket.socket], None]
 _recv_fallback_warning_limiter = WarningRateLimiter(interval_seconds=300.0)
@@ -50,6 +53,8 @@ class _DatagramRuntimeState:
     connection_state: ConnectionState = ConnectionState.CREATED
     metadata: ConnectionMetadata | None = None
     recv_fallback_warning_emitted: bool = False
+    stop_waiter: asyncio.Future[None] | None = None
+    stop_owner_task: asyncio.Task[object] | None = None
 
 
 @dataclass(slots=True)
@@ -65,6 +70,8 @@ class _DatagramStopSnapshot:
         task: Receive task detached from runtime state.
         sock: Socket detached from runtime state.
         stopping_event: Precomputed STOPPING lifecycle event, if any.
+        stop_waiter: Shared waiter for overlapping stop callers.
+        owns_stop: Whether this snapshot owns teardown and terminal publication.
     """
 
     stop_dispatcher: bool = False
@@ -74,6 +81,13 @@ class _DatagramStopSnapshot:
     task: asyncio.Task[None] | None = None
     sock: socket.socket | None = None
     stopping_event: ComponentLifecycleChangedEvent | None = None
+    stop_waiter: asyncio.Future[None] | None = None
+    owns_stop: bool = False
+
+    @property
+    def waits_for_owner(self) -> bool:
+        """Whether this stop call should wait for an already-running stop path."""
+        return self.stop_waiter is not None and not self.owns_stop
 
     @property
     def is_noop(self) -> bool:
@@ -262,30 +276,62 @@ class _AsyncioDatagramReceiverBase:
             unlock    : emit STOPPED and stop dispatcher
         """
         snapshot = await self._plan_stop_snapshot()
+        if snapshot.waits_for_owner:
+            if self._event_dispatcher.current_task_is_worker():
+                return
+            # Non-owner stop callers observe the active owner stop path instead
+            # of planning another teardown. shield() prevents caller
+            # cancellation from cancelling the shared owner waiter.
+            await asyncio.shield(cast("asyncio.Future[None]", snapshot.stop_waiter))
+            return
+
         first_error: BaseException | None = None
+        stop_waiter = snapshot.stop_waiter if snapshot.owns_stop else None
         try:
-            await self._publish_stopping_transition(snapshot)
-        except (Exception, asyncio.CancelledError) as error:
-            first_error = error
-        try:
-            await self._teardown_stop_resources(snapshot=snapshot, socket_cleanup=socket_cleanup)
-        except (Exception, asyncio.CancelledError) as error:
-            if first_error is None:
-                first_error = error
-        if first_error is None:
             try:
-                await self._publish_closed_event_if_needed(snapshot)
+                await self._publish_stopping_transition(snapshot)
             except (Exception, asyncio.CancelledError) as error:
                 first_error = error
-        await self._publish_stopped_transition_if_needed(snapshot, emit_event=first_error is None)
-        if snapshot.stop_dispatcher:
             try:
-                await self._event_dispatcher.stop()
+                await self._teardown_stop_resources(
+                    snapshot=snapshot, socket_cleanup=socket_cleanup
+                )
             except (Exception, asyncio.CancelledError) as error:
                 if first_error is None:
                     first_error = error
-        if first_error is not None:
-            raise first_error
+            if first_error is None:
+                try:
+                    await self._publish_closed_event_if_needed(snapshot)
+                except (Exception, asyncio.CancelledError) as error:
+                    first_error = error
+            await self._publish_stopped_transition_if_needed(
+                snapshot, emit_event=first_error is None
+            )
+            if snapshot.stop_dispatcher:
+                try:
+                    await self._event_dispatcher.stop()
+                except (Exception, asyncio.CancelledError) as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
+        except (Exception, asyncio.CancelledError) as error:
+            if stop_waiter is not None and not stop_waiter.done():
+                stop_waiter.set_exception(error)
+                # Mark the exception as retrieved so failed owner stops do not
+                # leave an unhandled-Future warning behind.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    stop_waiter.exception()
+            raise
+        else:
+            if stop_waiter is not None and not stop_waiter.done():
+                stop_waiter.set_result(None)
+        finally:
+            if stop_waiter is not None:
+                async with self._state_lock:
+                    if self._runtime.stop_waiter is stop_waiter:
+                        self._runtime.stop_waiter = None
+                        self._runtime.stop_owner_task = None
 
     async def _plan_stop_snapshot(self) -> _DatagramStopSnapshot:
         """Detach stop-time resources under lock and return the resulting stop snapshot."""
@@ -293,9 +339,24 @@ class _AsyncioDatagramReceiverBase:
         async with self._state_lock:
             snapshot.previous_connection_state = self._connection_state
             pre_transition_lifecycle_state = self._lifecycle_state
+            current_task = asyncio.current_task()
+            if self._runtime.stop_waiter is not None:
+                if current_task is self._runtime.stop_owner_task:
+                    # Inline handlers may re-enter stop() from the owner task
+                    # while STOPPING is being published. Waiting on the owner
+                    # waiter here would self-deadlock.
+                    return snapshot
+                snapshot.stop_waiter = self._runtime.stop_waiter
+                return snapshot
             if self._is_fully_stopped_locked():
                 snapshot.stop_dispatcher = True
                 return snapshot
+
+            loop = current_task.get_loop() if current_task is not None else asyncio.get_event_loop()
+            snapshot.stop_waiter = loop.create_future()
+            snapshot.owns_stop = True
+            self._runtime.stop_waiter = snapshot.stop_waiter
+            self._runtime.stop_owner_task = current_task
 
             if self._lifecycle_state != ComponentLifecycleState.STOPPED:
                 snapshot.stopping_event = self._apply_lifecycle_state(
@@ -352,12 +413,11 @@ class _AsyncioDatagramReceiverBase:
             if snapshot.task is not asyncio.current_task():
                 snapshot.task.cancel()
                 try:
-                    _ = await cast("asyncio.Task[object]", snapshot.task)
+                    await await_task_completion_preserving_cancellation(
+                        cast("asyncio.Task[object]", snapshot.task)
+                    )
                 except asyncio.CancelledError as error:
-                    current_task = asyncio.current_task()
-                    cancelling = getattr(current_task, "cancelling", None)
-                    if current_task is not None and callable(cancelling) and cancelling():
-                        task_error = error
+                    task_error = error
 
         if snapshot.sock is not None:
             if socket_cleanup is not None:
