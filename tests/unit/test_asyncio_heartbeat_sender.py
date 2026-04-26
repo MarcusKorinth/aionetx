@@ -71,6 +71,11 @@ class InvalidPayloadHeartbeatProvider:
         return HeartbeatResult(should_send=True, payload="bad-payload")  # type: ignore[arg-type]
 
 
+class InvalidShouldSendHeartbeatProvider:
+    async def create_heartbeat(self, request: HeartbeatRequest) -> HeartbeatResult:
+        return HeartbeatResult(should_send="yes", payload=b"hb")  # type: ignore[arg-type]
+
+
 class FailingSendConnection(FakeConnection):
     def __init__(self) -> None:
         super().__init__()
@@ -266,6 +271,25 @@ async def test_heartbeat_sender_emits_error_for_invalid_payload_type(
         FakeConnection(),
         TcpHeartbeatSettings(enabled=True, interval_seconds=0.01),
         InvalidPayloadHeartbeatProvider(),  # type: ignore[arg-type]
+        dispatcher,
+    )
+    await sender.start()
+    await wait_for_condition(lambda: sender.is_running is False, timeout_seconds=1.0)
+    await dispatcher.stop()
+    assert recording_event_handler.error_events
+    assert isinstance(recording_event_handler.error_events[-1].error, TypeError)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sender_emits_error_for_invalid_should_send_type(
+    recording_event_handler,
+) -> None:
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    sender = AsyncioHeartbeatSender(
+        FakeConnection(),
+        TcpHeartbeatSettings(enabled=True, interval_seconds=0.01),
+        InvalidShouldSendHeartbeatProvider(),  # type: ignore[arg-type]
         dispatcher,
     )
     await sender.start()

@@ -38,6 +38,15 @@ class HeartbeatResult:
     should_send: bool
     payload: BytesLike = b""
 
+    def __post_init__(self) -> None:
+        # Validate the provider boundary here so the sender never has to rely
+        # on truthiness or partially-valid heartbeat results.
+        require_bool(
+            field_name="HeartbeatResult.should_send", value=self.should_send, error_type=TypeError
+        )
+        if not isinstance(self.payload, (bytes, bytearray, memoryview)):
+            raise TypeError("HeartbeatResult.payload must be bytes-like.")
+
 
 @dataclass(frozen=True, slots=True)
 class TcpHeartbeatSettings:
