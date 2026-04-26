@@ -49,6 +49,8 @@ def test_api_symbol_root_curated_exports_come_from_grouping_modules() -> None:
 def test_api_symbol_api_curated_exports_come_from_grouping_modules() -> None:
     grouped_sources = {
         "BaseNetworkEventHandler": "aionetx.api.events",
+        "ByteSenderProtocol": "aionetx.api.protocols",
+        "BytesLike": "aionetx.api.protocols",
         "BytesReceivedEvent": "aionetx.api.events",
         "ComponentLifecycleChangedEvent": "aionetx.api.events",
         "ConnectionClosedError": "aionetx.api.errors",
@@ -63,6 +65,7 @@ def test_api_symbol_api_curated_exports_come_from_grouping_modules() -> None:
         "HandlerFailurePolicyStopEvent": "aionetx.api.events",
         "HeartbeatProviderProtocol": "aionetx.api.protocols",
         "HeartbeatResult": "aionetx.api.heartbeat",
+        "ManagedTransportProtocol": "aionetx.api.protocols",
         "NetworkConfigurationError": "aionetx.api.errors",
         "MulticastReceiverProtocol": "aionetx.api.protocols",
         "MulticastReceiverSettings": "aionetx.api.settings",

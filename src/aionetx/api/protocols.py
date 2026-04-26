@@ -8,6 +8,7 @@ can import the protocol layer from one stable location.
 from __future__ import annotations
 
 from aionetx.api.byte_sender_protocol import ByteSenderProtocol
+from aionetx.api.bytes_like import BytesLike
 from aionetx.api.connection_protocol import ConnectionProtocol
 from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
 from aionetx.api.managed_transport_protocol import ManagedTransportProtocol
@@ -20,6 +21,7 @@ from aionetx.api.udp import UdpReceiverProtocol, UdpSenderProtocol
 
 __all__ = (
     "ByteSenderProtocol",
+    "BytesLike",
     "ConnectionProtocol",
     "HeartbeatProviderProtocol",
     "ManagedTransportProtocol",

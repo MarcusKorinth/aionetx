@@ -45,8 +45,11 @@ from aionetx.api.policies import (
     ReconnectJitter,
 )
 from aionetx.api.protocols import (
+    ByteSenderProtocol,
+    BytesLike,
     ConnectionProtocol,
     HeartbeatProviderProtocol,
+    ManagedTransportProtocol,
     MulticastReceiverProtocol,
     NetworkFactory,
     TcpClientProtocol,
@@ -76,6 +79,8 @@ from aionetx.api.typed_event_router import TypedEventRouter
 #   curated API surface so callers do not need to reach into internal modules.
 __all__ = (
     "BaseNetworkEventHandler",
+    "ByteSenderProtocol",
+    "BytesLike",
     "BytesReceivedEvent",
     "ComponentLifecycleChangedEvent",
     "ComponentLifecycleState",
@@ -99,6 +104,7 @@ __all__ = (
     "HeartbeatResult",
     "TcpHeartbeatSettings",
     "InvalidNetworkConfigurationError",
+    "ManagedTransportProtocol",
     "MulticastReceiverProtocol",
     "MulticastReceiverSettings",
     "NetworkConfigurationError",

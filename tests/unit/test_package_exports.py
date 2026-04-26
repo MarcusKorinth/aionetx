@@ -19,6 +19,9 @@ from aionetx import (
     TcpServerSettings,
 )
 from aionetx.api import (
+    ByteSenderProtocol,
+    BytesLike,
+    ManagedTransportProtocol,
     MulticastReceiverProtocol,
     NetworkConfigurationError,
     NetworkLayerError,
@@ -49,6 +52,14 @@ def test_aionetx_api_exports_transport_protocols_for_advanced_usage() -> None:
     assert api.UdpReceiverProtocol is UdpReceiverProtocol
     assert api.UdpSenderProtocol is UdpSenderProtocol
     assert api.MulticastReceiverProtocol is MulticastReceiverProtocol
+
+
+def test_aionetx_api_exports_bytes_capability_types() -> None:
+    import aionetx.api as api
+
+    assert api.BytesLike is BytesLike
+    assert api.ByteSenderProtocol is ByteSenderProtocol
+    assert api.ManagedTransportProtocol is ManagedTransportProtocol
 
 
 def test_aionetx_api_exports_udp_send_exceptions() -> None:
