@@ -62,6 +62,8 @@ class ConnectionProtocol(ByteSenderProtocol, Protocol):
             TypeError: If ``data`` is not bytes-like.
             OSError: When the underlying transport accepts the write but later
                 reports a socket or stream failure while flushing.
+            asyncio.TimeoutError: When the connection has a configured send
+                timeout and the write buffer does not drain in time.
         """
         raise NotImplementedError
 

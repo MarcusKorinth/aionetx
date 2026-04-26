@@ -39,8 +39,14 @@ class TcpServerSettings:
             ``None`` disables idle-timeout enforcement.
         broadcast_concurrency_limit: Maximum number of concurrent per-connection
             broadcast sends. Must be ``> 0``.
-        broadcast_send_timeout_seconds: Optional timeout applied to each individual
-            per-connection broadcast send. ``None`` disables the timeout.
+        broadcast_send_timeout_seconds: Optional outer timeout applied to each
+            individual per-connection broadcast send. ``None`` disables only
+            this broadcast-specific wrapper; ``connection_send_timeout_seconds``
+            may still bound the underlying connection ``send()``.
+        connection_send_timeout_seconds: Optional timeout applied to accepted
+            connection ``send()`` flushes, including direct connection sends,
+            heartbeat sends, and broadcast delivery. Must be ``> 0`` when set.
+            ``None`` disables send-timeout enforcement. Defaults to 30.0.
         heartbeat: Server-side TCP keep-alive scheduling policy. When
             ``enabled=True`` the configured ``HeartbeatProviderProtocol`` is
             asked every interval whether to send a heartbeat payload to each
@@ -59,6 +65,7 @@ class TcpServerSettings:
     connection_idle_timeout_seconds: float | None = None
     broadcast_concurrency_limit: int = 64
     broadcast_send_timeout_seconds: float | None = None
+    connection_send_timeout_seconds: float | None = 30.0
     heartbeat: TcpHeartbeatSettings = field(default_factory=TcpHeartbeatSettings)
     receive_buffer_size: int = 4096
     backlog: int = 100
@@ -96,6 +103,10 @@ class TcpServerSettings:
         require_optional_positive_finite_number(
             field_name="TcpServerSettings.broadcast_send_timeout_seconds",
             value=self.broadcast_send_timeout_seconds,
+        )
+        require_optional_positive_finite_number(
+            field_name="TcpServerSettings.connection_send_timeout_seconds",
+            value=self.connection_send_timeout_seconds,
         )
         require_positive_int(
             field_name="TcpServerSettings.receive_buffer_size",

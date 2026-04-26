@@ -388,6 +388,7 @@ class AsyncioTcpServer(TcpServerProtocol):
             max_connections=self._settings.max_connections,
             receive_buffer_size=self._settings.receive_buffer_size,
             idle_timeout_seconds=self._settings.connection_idle_timeout_seconds,
+            connection_send_timeout_seconds=self._settings.connection_send_timeout_seconds,
             on_closed_callback=self._on_connection_closed,
             heartbeat_settings=self._settings.heartbeat,
             heartbeat_provider=self._heartbeat_provider,

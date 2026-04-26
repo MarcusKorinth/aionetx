@@ -64,6 +64,39 @@ class _WriterWithPeerInfo:
         return None
 
 
+class _BlockingDrainWriter:
+    """Writer double whose drain can either block indefinitely or be released."""
+
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.drain_started = asyncio.Event()
+        self.release_drain = asyncio.Event()
+        self.closed = False
+
+    def get_extra_info(self, key: str, default=None):
+        if key == "peername":
+            return ("127.0.0.1", 45678)
+        if key == "sockname":
+            return ("127.0.0.1", 12345)
+        if key == "socket":
+            return None
+        return default
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await self.release_drain.wait()
+
+    def close(self) -> None:
+        self.closed = True
+        self.release_drain.set()
+
+    async def wait_closed(self) -> None:
+        self.closed = True
+
+
 class _WriterProxy:
     """Wrap a real writer while overriding metadata used by client internals."""
 
@@ -180,29 +213,29 @@ async def test_client_connection_uses_fallback_id_when_peer_info_invalid_and_mis
             await client.stop()
 
 
-@pytest.mark.asyncio
-async def test_connect_once_keeps_managed_send_timeout_unbounded(
+async def _connect_once_with_blocking_writer(
+    *,
     recording_event_handler,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    connection_send_timeout_seconds: float | None,
+) -> tuple[AsyncioTcpConnection, _BlockingDrainWriter, AsyncioEventDispatcher]:
+    writer = _BlockingDrainWriter()
+
     async def _open_connection(*, host: str, port: int):
         del host, port
-        return asyncio.StreamReader(), _WriterWithPeerInfo(("127.0.0.1", 45678))
+        return asyncio.StreamReader(), writer
 
-    async def _noop_start(self: AsyncioTcpConnection) -> None:
-        return None
-
-    monkeypatch.setattr(AsyncioTcpConnection, "start", _noop_start)
     dispatcher = AsyncioEventDispatcher(
         recording_event_handler,
         EventDeliverySettings(),
         logging.getLogger("test"),
     )
+    await dispatcher.start()
     connection = await tcp_client_connect_module.connect_once(
         settings=TcpClientSettings(
             host="127.0.0.1",
             port=12345,
             reconnect=TcpReconnectSettings(enabled=False),
+            connection_send_timeout_seconds=connection_send_timeout_seconds,
         ),
         connection_opener=_open_connection,
         event_dispatcher=dispatcher,
@@ -210,8 +243,54 @@ async def test_connect_once_keeps_managed_send_timeout_unbounded(
         logger=logging.getLogger("test"),
         component_id="tcp/client/127.0.0.1/12345",
     )
+    return connection, writer, dispatcher
 
-    assert connection._send_timeout_seconds is None  # type: ignore[attr-defined]
+
+@pytest.mark.asyncio
+async def test_connect_once_applies_connection_send_timeout_to_managed_connection(
+    recording_event_handler,
+) -> None:
+    connection, writer, dispatcher = await _connect_once_with_blocking_writer(
+        recording_event_handler=recording_event_handler,
+        connection_send_timeout_seconds=0.01,
+    )
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await connection.send(b"payload")
+
+        assert writer.writes == [b"payload"]
+        assert writer.drain_started.is_set()
+    finally:
+        await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_once_disabled_connection_send_timeout_waits_for_drain_completion(
+    recording_event_handler,
+) -> None:
+    connection, writer, dispatcher = await _connect_once_with_blocking_writer(
+        recording_event_handler=recording_event_handler,
+        connection_send_timeout_seconds=None,
+    )
+    send_task = asyncio.create_task(connection.send(b"payload"))
+
+    try:
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert send_task.done() is False
+
+        writer.release_drain.set()
+        assert await asyncio.wait_for(send_task, timeout=1.0) is None
+        assert writer.writes == [b"payload"]
+    finally:
+        writer.release_drain.set()
+        if not send_task.done():
+            send_task.cancel()
+        await connection.close()
+        await dispatcher.stop()
 
 
 @pytest.mark.asyncio
