@@ -37,6 +37,7 @@ from aionetx.implementations.asyncio_impl import (
 from aionetx.implementations.asyncio_impl import _tcp_client_connect as tcp_client_connect_module
 from aionetx.implementations.asyncio_impl.asyncio_tcp_client import AsyncioTcpClient
 from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
+from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from tests.helpers import assert_awaitable_cancelled
 from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.internal_asyncio_impl_refs import WarningRateLimiter
@@ -177,6 +178,40 @@ async def test_client_connection_uses_fallback_id_when_peer_info_invalid_and_mis
             assert connection.connection_id == f"tcp/client/127.0.0.1/{port}/connection"
         finally:
             await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_once_keeps_managed_send_timeout_unbounded(
+    recording_event_handler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _open_connection(*, host: str, port: int):
+        del host, port
+        return asyncio.StreamReader(), _WriterWithPeerInfo(("127.0.0.1", 45678))
+
+    async def _noop_start(self: AsyncioTcpConnection) -> None:
+        return None
+
+    monkeypatch.setattr(AsyncioTcpConnection, "start", _noop_start)
+    dispatcher = AsyncioEventDispatcher(
+        recording_event_handler,
+        EventDeliverySettings(),
+        logging.getLogger("test"),
+    )
+    connection = await tcp_client_connect_module.connect_once(
+        settings=TcpClientSettings(
+            host="127.0.0.1",
+            port=12345,
+            reconnect=TcpReconnectSettings(enabled=False),
+        ),
+        connection_opener=_open_connection,
+        event_dispatcher=dispatcher,
+        on_closed_callback=lambda _connection: None,
+        logger=logging.getLogger("test"),
+        component_id="tcp/client/127.0.0.1/12345",
+    )
+
+    assert connection._send_timeout_seconds is None  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

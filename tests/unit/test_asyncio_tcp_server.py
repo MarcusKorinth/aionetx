@@ -991,6 +991,50 @@ async def test_accepted_connection_start_cancelled_error_cleans_registered_conne
 
 
 @pytest.mark.asyncio
+async def test_accepted_connection_keeps_managed_send_timeout_unbounded(
+    recording_event_handler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: dict[str, AsyncioTcpConnection] = {}
+    writer = _FakeWriter()
+    dispatcher = AsyncioEventDispatcher(
+        recording_event_handler,
+        EventDeliverySettings(),
+        logging.getLogger("test"),
+    )
+
+    async def noop_start(self: AsyncioTcpConnection) -> None:
+        return None
+
+    def on_closed(connection: AsyncioTcpConnection) -> None:
+        connections.pop(connection.connection_id, None)
+
+    monkeypatch.setattr(AsyncioTcpConnection, "start", noop_start)
+
+    await handle_accepted_client(
+        reader=asyncio.StreamReader(),
+        writer=writer,  # type: ignore[arg-type]
+        state_lock=asyncio.Lock(),
+        get_lifecycle_state=lambda: ComponentLifecycleState.RUNNING,
+        get_connection_id=lambda: "server:accepted:send-timeout",
+        connections=connections,
+        event_dispatcher=dispatcher,
+        max_connections=64,
+        receive_buffer_size=4096,
+        idle_timeout_seconds=None,
+        on_closed_callback=on_closed,
+        heartbeat_settings=TcpHeartbeatSettings(enabled=False),
+        heartbeat_provider=None,
+        heartbeat_senders={},
+        component_id="tcp/server/127.0.0.1/12345",
+        logger=logging.getLogger("test"),
+    )
+
+    connection = connections["server:accepted:send-timeout"]
+    assert connection._send_timeout_seconds is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_accepted_connection_error_event_failure_still_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

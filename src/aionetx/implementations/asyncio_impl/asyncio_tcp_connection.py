@@ -7,6 +7,7 @@ import contextlib
 import logging
 from typing import Awaitable, Callable, cast
 
+from aionetx.api._validation import require_optional_positive_finite_number
 from aionetx.api.bytes_like import BytesLike
 from aionetx.api.bytes_received_event import BytesReceivedEvent
 from aionetx.api.errors import ConnectionClosedError
@@ -49,6 +50,8 @@ class AsyncioTcpConnection(ConnectionProtocol):
         receive_buffer_size: int,
         idle_timeout_seconds: float | None = None,
         on_closed_callback: ConnectionClosedCallback | None = None,
+        *,
+        send_timeout_seconds: float | None = 30.0,
     ) -> None:
         if not connection_id:
             raise ValueError("connection_id must not be empty.")
@@ -56,6 +59,11 @@ class AsyncioTcpConnection(ConnectionProtocol):
             raise ValueError("receive_buffer_size must be > 0.")
         if idle_timeout_seconds is not None and idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be > 0 when provided.")
+        send_timeout_seconds = require_optional_positive_finite_number(
+            field_name="send_timeout_seconds",
+            value=send_timeout_seconds,
+            error_type=ValueError,
+        )
         self._connection_id = connection_id
         self._role = role
         self._reader = reader
@@ -63,6 +71,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         self._event_dispatcher = event_dispatcher
         self._receive_buffer_size = receive_buffer_size
         self._idle_timeout_seconds = idle_timeout_seconds
+        self._send_timeout_seconds = send_timeout_seconds
         self._on_closed_callback = on_closed_callback
         self._state = ConnectionState.CREATED
         self._metadata = self._build_metadata()
@@ -135,13 +144,18 @@ class AsyncioTcpConnection(ConnectionProtocol):
             TypeError: If ``data`` is not bytes-like.
             OSError: If the underlying stream reports a socket failure while
                 flushing the write buffer.
+            asyncio.TimeoutError: If the write buffer does not drain within
+                the configured send timeout.
         """
         if self._state != ConnectionState.CONNECTED:
             raise ConnectionClosedError(f"Connection '{self._connection_id}' is not connected.")
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("send expects bytes-like data.")
         self._writer.write(bytes(data))
-        await self._writer.drain()
+        if self._send_timeout_seconds is None:
+            await self._writer.drain()
+            return
+        await asyncio.wait_for(self._writer.drain(), timeout=self._send_timeout_seconds)
 
     async def close(self) -> None:
         """

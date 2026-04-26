@@ -73,6 +73,9 @@ async def connect_once(
         event_dispatcher=event_dispatcher,
         receive_buffer_size=settings.receive_buffer_size,
         on_closed_callback=on_closed_callback,
+        # Public client settings do not expose send timeouts yet; keep the
+        # managed-client behavior unchanged until that contract exists.
+        send_timeout_seconds=None,
     )
     try:
         await connection.start()

@@ -305,6 +305,9 @@ async def handle_accepted_client(
                 receive_buffer_size=receive_buffer_size,
                 idle_timeout_seconds=idle_timeout_seconds,
                 on_closed_callback=on_closed_callback,
+                # Public server settings do not expose send timeouts yet; keep
+                # accepted-connection behavior unchanged until that contract exists.
+                send_timeout_seconds=None,
             )
             connections[connection_id] = connection
     if should_reject:
