@@ -395,6 +395,50 @@ async def test_server_concurrent_stop_waits_for_active_teardown(
 
 
 @pytest.mark.asyncio
+async def test_server_cancelled_overlapping_stop_does_not_cancel_owner_waiter(
+    recording_event_handler,
+) -> None:
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(host="127.0.0.1", port=12349, max_connections=64),
+        event_handler=recording_event_handler,
+    )
+    blocking = _BlockingCloseConnection("server:blocking-close:2")
+    server._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    server._connections = {blocking.connection_id: blocking}  # type: ignore[attr-defined,dict-item]
+
+    first_stop = asyncio.create_task(server.stop())
+    try:
+        await asyncio.wait_for(blocking.close_started.wait(), timeout=1.0)
+        stop_waiter = server._stop_waiter  # type: ignore[attr-defined]
+        assert stop_waiter is not None
+
+        second_stop = asyncio.create_task(server.stop())
+        await asyncio.sleep(0)
+        second_stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second_stop
+
+        assert stop_waiter.cancelled() is False
+
+        third_stop = asyncio.create_task(server.stop())
+        await asyncio.sleep(0)
+        assert third_stop.done() is False
+
+        blocking.release_close.set()
+        await first_stop
+        await third_stop
+    finally:
+        blocking.release_close.set()
+        if not first_stop.done():
+            first_stop.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first_stop
+
+    assert blocking.close_attempts == 1
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
 async def test_server_lifecycle_events_preserve_start_stop_order(recording_event_handler) -> None:
     port = _unused_tcp_port()
     server = AsyncioTcpServer(

@@ -32,8 +32,11 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
     LifecycleTransitionPublisher,
     emit_lifecycle_event,
 )
-from aionetx.implementations.asyncio_impl.runtime_utils import WarningRateLimiter
-from aionetx.implementations.asyncio_impl.runtime_utils import assert_running_on_owner_loop
+from aionetx.implementations.asyncio_impl.runtime_utils import (
+    WarningRateLimiter,
+    assert_running_on_owner_loop,
+    await_task_completion_preserving_cancellation,
+)
 
 SocketCleanup = Callable[[socket.socket], None]
 _recv_fallback_warning_limiter = WarningRateLimiter(interval_seconds=300.0)
@@ -410,12 +413,11 @@ class _AsyncioDatagramReceiverBase:
             if snapshot.task is not asyncio.current_task():
                 snapshot.task.cancel()
                 try:
-                    _ = await cast("asyncio.Task[object]", snapshot.task)
+                    await await_task_completion_preserving_cancellation(
+                        cast("asyncio.Task[object]", snapshot.task)
+                    )
                 except asyncio.CancelledError as error:
-                    current_task = asyncio.current_task()
-                    cancelling = getattr(current_task, "cancelling", None)
-                    if current_task is not None and callable(cancelling) and cancelling():
-                        task_error = error
+                    task_error = error
 
         if snapshot.sock is not None:
             if socket_cleanup is not None:

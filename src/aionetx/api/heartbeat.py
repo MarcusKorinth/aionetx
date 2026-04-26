@@ -33,18 +33,19 @@ class HeartbeatResult:
     Attributes:
         should_send (bool): When ``True``, ``payload`` is sent over the connection.
         payload (BytesLike): Raw heartbeat payload to send when ``should_send`` is true.
+            Ignored when ``should_send`` is false.
     """
 
     should_send: bool
     payload: BytesLike = b""
 
     def __post_init__(self) -> None:
-        # Validate the provider boundary here so the sender never has to rely
-        # on truthiness or partially-valid heartbeat results.
+        # Validate the provider decision at the boundary so the sender never
+        # relies on truthiness. Payload type matters only when it will be sent.
         require_bool(
             field_name="HeartbeatResult.should_send", value=self.should_send, error_type=TypeError
         )
-        if not isinstance(self.payload, (bytes, bytearray, memoryview)):
+        if self.should_send and not isinstance(self.payload, (bytes, bytearray, memoryview)):
             raise TypeError("HeartbeatResult.payload must be bytes-like.")
 
 

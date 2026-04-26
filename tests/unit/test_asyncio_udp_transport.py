@@ -289,6 +289,66 @@ async def test_udp_receiver_stop_cancellation_still_detaches_receive_task_and_so
 
 
 @pytest.mark.asyncio
+async def test_udp_receiver_stop_cancellation_waits_for_receive_task_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_cancel_seen = asyncio.Event()
+    release_task = asyncio.Event()
+
+    async def blocking_receive_datagrams(self, receive_buffer_size: int) -> None:
+        del self, receive_buffer_size
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            task_cancel_seen.set()
+            await release_task.wait()
+            raise
+
+    monkeypatch.setattr(
+        datagram_base_module._AsyncioDatagramReceiverBase,
+        "_receive_datagrams",
+        blocking_receive_datagrams,
+    )
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=NoopHandler(),
+    )
+
+    await receiver.start()
+    original_task = receiver._task  # type: ignore[attr-defined]
+    assert original_task is not None
+
+    stop_task = asyncio.create_task(receiver.stop())
+    try:
+        await asyncio.wait_for(task_cancel_seen.wait(), timeout=1.0)
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+
+        release_task.set()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+    finally:
+        release_task.set()
+        if not stop_task.done():
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert original_task.done()
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_udp_receiver_inline_handler_can_stop_from_bytes_received_without_self_await() -> (
     None
 ):

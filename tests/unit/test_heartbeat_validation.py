@@ -29,9 +29,10 @@ def test_heartbeat_result_requires_bytes_like_payload(payload: object) -> None:
         HeartbeatResult(should_send=True, payload=payload)  # type: ignore[arg-type]
 
 
-def test_heartbeat_result_requires_bytes_like_payload_even_when_not_sending() -> None:
-    with pytest.raises(TypeError, match="HeartbeatResult.payload"):
-        HeartbeatResult(should_send=False, payload=None)  # type: ignore[arg-type]
+def test_heartbeat_result_ignores_payload_type_when_not_sending() -> None:
+    result = HeartbeatResult(should_send=False, payload=None)  # type: ignore[arg-type]
+
+    assert result.payload is None
 
 
 def test_heartbeat_validation_requires_provider_when_enabled() -> None:

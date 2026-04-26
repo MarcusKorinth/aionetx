@@ -61,8 +61,8 @@ the semantic test suite:
 
 - Once `stop()` returns with state `STOPPED`, no further user callback is
   invoked from the component's internal tasks.
-- Startup cancellation must roll back partial resources and publish the same
-  terminal `STOPPED` state as other startup failures.
+- Startup cancellation must roll back partial resources and leave the component
+  in the same terminal `STOPPED` state as other startup failures.
 - `STOPPING` is a terminal-in-progress state, not a re-entrant steady state:
   repeated or overlapping stop requests converge on the same shutdown path
   instead of creating new transition branches.

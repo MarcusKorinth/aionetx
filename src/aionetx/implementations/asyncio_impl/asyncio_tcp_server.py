@@ -236,7 +236,7 @@ class AsyncioTcpServer(TcpServerProtocol):
             if stop_waiter is not None:
                 if self._event_dispatcher.current_task_is_worker():
                     return
-                _ = await cast(Awaitable[object], stop_waiter)
+                await asyncio.shield(stop_waiter)
             return
         inline_delivery_context = (
             self._event_dispatcher.inline_delivery_context()
