@@ -366,6 +366,40 @@ async def test_server_broadcast_without_broadcast_timeout_still_observes_connect
 
 
 @pytest.mark.asyncio
+async def test_server_broadcast_without_broadcast_timeout_closes_real_stalled_connection(
+    recording_event_handler,
+) -> None:
+    connection, writer, dispatcher = await _accept_connection_with_blocking_writer(
+        recording_event_handler=recording_event_handler,
+        connection_send_timeout_seconds=0.01,
+    )
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12345,
+            max_connections=64,
+            broadcast_send_timeout_seconds=None,
+            connection_send_timeout_seconds=0.01,
+        ),
+        event_handler=recording_event_handler,
+    )
+    server._connections = {connection.connection_id: connection}  # type: ignore[attr-defined]
+
+    try:
+        await asyncio.wait_for(server.broadcast(b"fanout"), timeout=1.0)
+
+        assert writer.writes == [b"fanout"]
+        assert writer.drain_started.is_set()
+        assert connection.state == ConnectionState.CLOSED
+        assert recording_event_handler.error_events
+        assert _is_timeout_error(recording_event_handler.error_events[-1].error)
+    finally:
+        writer.release_drain.set()
+        await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
 async def test_server_start_raises_when_heartbeat_enabled_without_provider(
     recording_event_handler,
 ) -> None:
