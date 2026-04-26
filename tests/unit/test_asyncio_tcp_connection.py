@@ -251,6 +251,182 @@ async def test_tcp_connection_send_surfaces_writer_drain_failure(recording_event
     await dispatcher.stop()
 
 
+@pytest.mark.asyncio
+async def test_tcp_connection_send_times_out_when_writer_drain_stalls(
+    recording_event_handler,
+) -> None:
+    drain_started = asyncio.Event()
+
+    class BlockingDrainWriter:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def get_extra_info(self, key: str):
+            if key == "sockname":
+                return ("127.0.0.1", 10001)
+            if key == "peername":
+                return ("127.0.0.1", 10002)
+            return None
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+        async def drain(self) -> None:
+            drain_started.set()
+            await asyncio.Event().wait()
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    writer = BlockingDrainWriter()
+    connection = AsyncioTcpConnection(
+        "client:send-timeout",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        1024,
+        send_timeout_seconds=0.01,
+    )
+    await connection.start()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await connection.send(b"payload")
+
+    assert writer.writes == [b"payload"]
+    assert drain_started.is_set()
+    await connection.close()
+    await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_send_timeout_none_waits_for_drain_completion(
+    recording_event_handler,
+) -> None:
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    class BlockingDrainWriter:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def get_extra_info(self, key: str):
+            if key == "sockname":
+                return ("127.0.0.1", 10001)
+            if key == "peername":
+                return ("127.0.0.1", 10002)
+            return None
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+        async def drain(self) -> None:
+            drain_started.set()
+            await release_drain.wait()
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    writer = BlockingDrainWriter()
+    connection = AsyncioTcpConnection(
+        "client:send-timeout-disabled",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        1024,
+        send_timeout_seconds=None,
+    )
+    await connection.start()
+    send_task = asyncio.create_task(connection.send(b"payload"))
+
+    try:
+        await asyncio.wait_for(drain_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert send_task.done() is False
+
+        release_drain.set()
+        assert await asyncio.wait_for(send_task, timeout=1.0) is None
+        assert writer.writes == [b"payload"]
+    finally:
+        release_drain.set()
+        if not send_task.done():
+            send_task.cancel()
+        await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.parametrize(
+    "send_timeout_seconds",
+    [
+        0,
+        -1,
+        float("nan"),
+        float("inf"),
+        True,
+        "1.0",
+        pytest.param(object(), id="object"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tcp_connection_rejects_invalid_send_timeout(
+    recording_event_handler,
+    send_timeout_seconds: object,
+) -> None:
+    with pytest.raises(ValueError, match="send_timeout_seconds"):
+        AsyncioTcpConnection(
+            "client:invalid-send-timeout",
+            ConnectionRole.CLIENT,
+            asyncio.StreamReader(),
+            _FakeWriter(),  # type: ignore[arg-type]
+            make_dispatcher(recording_event_handler),
+            1024,
+            send_timeout_seconds=send_timeout_seconds,
+        )
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_keeps_positional_on_closed_callback_compatibility(
+    recording_event_handler,
+) -> None:
+    callback_called = asyncio.Event()
+
+    async def on_closed(_connection: AsyncioTcpConnection) -> None:
+        callback_called.set()
+
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    connection = AsyncioTcpConnection(
+        "client:positional-close-callback",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        _FakeWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        1024,
+        None,
+        on_closed,
+    )
+
+    try:
+        await connection.start()
+        await connection.close()
+        await asyncio.wait_for(callback_called.wait(), timeout=1.0)
+    finally:
+        await connection.close()
+        await dispatcher.stop()
+
+
 # Metadata parsing and read-loop failure handling.
 def test_tcp_connection_metadata_parsing_tolerates_non_integer_port_values(
     recording_event_handler,

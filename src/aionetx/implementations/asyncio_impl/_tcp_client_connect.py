@@ -73,6 +73,7 @@ async def connect_once(
         event_dispatcher=event_dispatcher,
         receive_buffer_size=settings.receive_buffer_size,
         on_closed_callback=on_closed_callback,
+        send_timeout_seconds=settings.connection_send_timeout_seconds,
     )
     try:
         await connection.start()

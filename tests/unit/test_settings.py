@@ -133,6 +133,22 @@ def test_tcp_client_settings_validate_failure_for_negative_connect_timeout() -> 
         TcpClientSettings(host="127.0.0.1", port=1234, connect_timeout_seconds=-1.0)
 
 
+def test_tcp_client_settings_default_connection_send_timeout() -> None:
+    settings = TcpClientSettings(host="127.0.0.1", port=1234)
+
+    assert settings.connection_send_timeout_seconds == 30.0
+
+
+def test_tcp_client_settings_allow_disabled_connection_send_timeout() -> None:
+    settings = TcpClientSettings(
+        host="127.0.0.1",
+        port=1234,
+        connection_send_timeout_seconds=None,
+    )
+
+    assert settings.connection_send_timeout_seconds is None
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -144,6 +160,12 @@ def test_tcp_client_settings_validate_failure_for_negative_connect_timeout() -> 
         {"connect_timeout_seconds": float("nan")},
         {"connect_timeout_seconds": float("inf")},
         {"connect_timeout_seconds": "1"},
+        {"connection_send_timeout_seconds": 0},
+        {"connection_send_timeout_seconds": -1},
+        {"connection_send_timeout_seconds": float("nan")},
+        {"connection_send_timeout_seconds": float("inf")},
+        {"connection_send_timeout_seconds": True},
+        {"connection_send_timeout_seconds": "1"},
         {"error_policy": "retry"},
     ],
 )
@@ -211,6 +233,23 @@ def test_tcp_server_settings_validate_failure_for_non_positive_broadcast_send_ti
         )
 
 
+def test_tcp_server_settings_default_connection_send_timeout() -> None:
+    settings = TcpServerSettings(host="127.0.0.1", port=1, max_connections=64)
+
+    assert settings.connection_send_timeout_seconds == 30.0
+
+
+def test_tcp_server_settings_allow_disabled_connection_send_timeout() -> None:
+    settings = TcpServerSettings(
+        host="127.0.0.1",
+        port=1,
+        max_connections=64,
+        connection_send_timeout_seconds=None,
+    )
+
+    assert settings.connection_send_timeout_seconds is None
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -221,6 +260,12 @@ def test_tcp_server_settings_validate_failure_for_non_positive_broadcast_send_ti
         {"connection_idle_timeout_seconds": float("inf")},
         {"broadcast_concurrency_limit": True},
         {"broadcast_send_timeout_seconds": float("nan")},
+        {"connection_send_timeout_seconds": 0},
+        {"connection_send_timeout_seconds": -1},
+        {"connection_send_timeout_seconds": float("nan")},
+        {"connection_send_timeout_seconds": float("inf")},
+        {"connection_send_timeout_seconds": True},
+        {"connection_send_timeout_seconds": "1"},
         {"receive_buffer_size": 4096.0},
         {"backlog": "100"},
     ],

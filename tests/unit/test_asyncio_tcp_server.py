@@ -96,6 +96,13 @@ class _FailingTrackedConnection(_FailingConnection):
         await super().close()
 
 
+class _TimeoutConnection(_FailingTrackedConnection):
+    """Failing sender that models an inner connection-level send timeout."""
+
+    async def send(self, _data: bytes) -> None:
+        raise TimeoutError("connection-send-timeout")
+
+
 class _FakeWriter:
     """StreamWriter-shaped test double for accepted-connection helper tests."""
 
@@ -114,6 +121,27 @@ class _FakeWriter:
 
     async def wait_closed(self) -> None:
         self.closed = True
+
+
+class _BlockingDrainWriter(_FakeWriter):
+    """StreamWriter-shaped double whose drain can stall or be released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[bytes] = []
+        self.drain_started = asyncio.Event()
+        self.release_drain = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await self.release_drain.wait()
+
+    def close(self) -> None:
+        super().close()
+        self.release_drain.set()
 
 
 class _BlockingConnection(_GoodConnection):
@@ -309,6 +337,65 @@ async def test_server_broadcast_timeout_closes_stalled_connection_and_emits_erro
     assert stalled.close_calls == 1
     assert recording_event_handler.error_events
     assert _is_timeout_error(recording_event_handler.error_events[-1].error)
+
+
+@pytest.mark.asyncio
+async def test_server_broadcast_without_broadcast_timeout_still_observes_connection_timeout(
+    recording_event_handler,
+) -> None:
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12345,
+            max_connections=64,
+            broadcast_send_timeout_seconds=None,
+            connection_send_timeout_seconds=0.01,
+        ),
+        event_handler=recording_event_handler,
+    )
+    timed_out = _TimeoutConnection(connection_id="server:timeout:1")
+    server._connections = {timed_out.connection_id: timed_out}  # type: ignore[attr-defined,dict-item]
+
+    await server.broadcast(b"fanout")
+
+    assert timed_out.state == ConnectionState.CLOSED
+    assert timed_out.close_calls == 1
+    assert recording_event_handler.error_events
+    assert _is_timeout_error(recording_event_handler.error_events[-1].error)
+
+
+@pytest.mark.asyncio
+async def test_server_broadcast_without_broadcast_timeout_closes_real_stalled_connection(
+    recording_event_handler,
+) -> None:
+    connection, writer, dispatcher = await _accept_connection_with_blocking_writer(
+        recording_event_handler=recording_event_handler,
+        connection_send_timeout_seconds=0.01,
+    )
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12345,
+            max_connections=64,
+            broadcast_send_timeout_seconds=None,
+            connection_send_timeout_seconds=0.01,
+        ),
+        event_handler=recording_event_handler,
+    )
+    server._connections = {connection.connection_id: connection}  # type: ignore[attr-defined]
+
+    try:
+        await asyncio.wait_for(server.broadcast(b"fanout"), timeout=1.0)
+
+        assert writer.writes == [b"fanout"]
+        assert writer.drain_started.is_set()
+        assert connection.state == ConnectionState.CLOSED
+        assert recording_event_handler.error_events
+        assert _is_timeout_error(recording_event_handler.error_events[-1].error)
+    finally:
+        writer.release_drain.set()
+        await connection.close()
+        await dispatcher.stop()
 
 
 @pytest.mark.asyncio
@@ -978,6 +1065,7 @@ async def test_accepted_connection_start_cancelled_error_cleans_registered_conne
             max_connections=64,
             receive_buffer_size=4096,
             idle_timeout_seconds=None,
+            connection_send_timeout_seconds=None,
             on_closed_callback=on_closed,
             heartbeat_settings=TcpHeartbeatSettings(enabled=False),
             heartbeat_provider=None,
@@ -988,6 +1076,92 @@ async def test_accepted_connection_start_cancelled_error_cleans_registered_conne
 
     assert connections == {}
     assert writer.closed is True
+
+
+async def _accept_connection_with_blocking_writer(
+    *,
+    recording_event_handler,
+    connection_send_timeout_seconds: float | None,
+) -> tuple[AsyncioTcpConnection, _BlockingDrainWriter, AsyncioEventDispatcher]:
+    connections: dict[str, AsyncioTcpConnection] = {}
+    writer = _BlockingDrainWriter()
+    dispatcher = AsyncioEventDispatcher(
+        recording_event_handler,
+        EventDeliverySettings(),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+
+    def on_closed(connection: AsyncioTcpConnection) -> None:
+        connections.pop(connection.connection_id, None)
+
+    await handle_accepted_client(
+        reader=asyncio.StreamReader(),
+        writer=writer,  # type: ignore[arg-type]
+        state_lock=asyncio.Lock(),
+        get_lifecycle_state=lambda: ComponentLifecycleState.RUNNING,
+        get_connection_id=lambda: "server:accepted:send-timeout",
+        connections=connections,
+        event_dispatcher=dispatcher,
+        max_connections=64,
+        receive_buffer_size=4096,
+        idle_timeout_seconds=None,
+        connection_send_timeout_seconds=connection_send_timeout_seconds,
+        on_closed_callback=on_closed,
+        heartbeat_settings=TcpHeartbeatSettings(enabled=False),
+        heartbeat_provider=None,
+        heartbeat_senders={},
+        component_id="tcp/server/127.0.0.1/12345",
+        logger=logging.getLogger("test"),
+    )
+    return connections["server:accepted:send-timeout"], writer, dispatcher
+
+
+@pytest.mark.asyncio
+async def test_accepted_connection_applies_connection_send_timeout(
+    recording_event_handler,
+) -> None:
+    connection, writer, dispatcher = await _accept_connection_with_blocking_writer(
+        recording_event_handler=recording_event_handler,
+        connection_send_timeout_seconds=0.01,
+    )
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await connection.send(b"payload")
+
+        assert writer.writes == [b"payload"]
+        assert writer.drain_started.is_set()
+    finally:
+        await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_accepted_connection_disabled_send_timeout_waits_for_drain_completion(
+    recording_event_handler,
+) -> None:
+    connection, writer, dispatcher = await _accept_connection_with_blocking_writer(
+        recording_event_handler=recording_event_handler,
+        connection_send_timeout_seconds=None,
+    )
+    send_task = asyncio.create_task(connection.send(b"payload"))
+
+    try:
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert send_task.done() is False
+
+        writer.release_drain.set()
+        assert await asyncio.wait_for(send_task, timeout=1.0) is None
+        assert writer.writes == [b"payload"]
+    finally:
+        writer.release_drain.set()
+        if not send_task.done():
+            send_task.cancel()
+        await connection.close()
+        await dispatcher.stop()
 
 
 @pytest.mark.asyncio
@@ -1025,6 +1199,7 @@ async def test_accepted_connection_error_event_failure_still_closes_connection(
         max_connections=64,
         receive_buffer_size=4096,
         idle_timeout_seconds=None,
+        connection_send_timeout_seconds=None,
         on_closed_callback=on_closed,
         heartbeat_settings=TcpHeartbeatSettings(enabled=False),
         heartbeat_provider=None,

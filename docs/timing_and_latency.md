@@ -36,6 +36,16 @@ of the system under test.
 
 ## Observed envelopes
 
+### TCP send flushes
+
+TCP `ConnectionProtocol.send()` completes after the underlying `asyncio.StreamWriter.drain()` completes. TCP client and server connections default to `connection_send_timeout_seconds=30.0`, so a slow or non-reading peer cannot stall a send forever unless that timeout is explicitly disabled.
+
+If the send timeout expires, direct `send()` raises `asyncio.TimeoutError`. Managed heartbeat sends emit a `NetworkErrorEvent` and stop the heartbeat sender; server broadcast emits a `NetworkErrorEvent` and closes the failed recipient connection.
+
+Setting `connection_send_timeout_seconds=None` disables this connection-level enforcement and allows `drain()` to wait indefinitely under OS/socket backpressure. For TCP servers, `broadcast_send_timeout_seconds` is a separate outer per-recipient broadcast wrapper; disabling it does not disable the accepted connection's own send timeout.
+
+The configured timeout is a best-effort asyncio deadline, not a hard real-time guarantee. Actual wake-up timing still depends on event-loop scheduling and system load.
+
 ### TCP reconnect backoff
 
 Source: `ReconnectBackoff` in

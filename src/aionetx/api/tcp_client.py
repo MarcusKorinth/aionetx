@@ -49,6 +49,10 @@ class TcpClientSettings:
         connect_timeout_seconds: Optional per-attempt connect timeout. Must
             be ``> 0`` when set. ``None`` (default) waits for the OS-level
             connect to resolve.
+        connection_send_timeout_seconds: Optional timeout applied to
+            per-connection ``send()`` flushes, including direct connection
+            sends and heartbeat sends. Must be ``> 0`` when set. ``None``
+            disables send-timeout enforcement. Defaults to 30.0.
         event_delivery: Dispatch mode, buffering, and handler-failure policy
             controls for events emitted by this client.
     """
@@ -60,6 +64,7 @@ class TcpClientSettings:
     error_policy: ErrorPolicy | None = None
     receive_buffer_size: int = 4096
     connect_timeout_seconds: float | None = None
+    connection_send_timeout_seconds: float | None = 30.0
     event_delivery: EventDeliverySettings = field(default_factory=EventDeliverySettings)
 
     def __post_init__(self) -> None:
@@ -87,6 +92,10 @@ class TcpClientSettings:
         require_optional_positive_finite_number(
             field_name="TcpClientSettings.connect_timeout_seconds",
             value=self.connect_timeout_seconds,
+        )
+        require_optional_positive_finite_number(
+            field_name="TcpClientSettings.connection_send_timeout_seconds",
+            value=self.connection_send_timeout_seconds,
         )
         if self.error_policy is not None:
             require_enum_member(

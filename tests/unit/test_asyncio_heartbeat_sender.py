@@ -88,6 +88,12 @@ class FailingSendConnection(FakeConnection):
         raise RuntimeError("send-failed")
 
 
+class TimeoutSendConnection(FailingSendConnection):
+    async def send(self, data: bytes) -> None:
+        self.send_calls += 1
+        raise asyncio.TimeoutError("send-timeout")
+
+
 def make_dispatcher(handler) -> AsyncioEventDispatcher:
     return AsyncioEventDispatcher(handler, EventDeliverySettings(), logging.getLogger("test"))
 
@@ -318,10 +324,41 @@ async def test_heartbeat_sender_emits_error_and_stops_when_connection_send_fails
         AlwaysSendHeartbeatProvider(),
         dispatcher,
     )
-    await sender.start()
-    await wait_for_condition(lambda: sender.is_running is False, timeout_seconds=1.0)
-    await dispatcher.stop()
+
+    try:
+        await sender.start()
+        await wait_for_condition(lambda: sender.is_running is False, timeout_seconds=1.0)
+    finally:
+        await sender.stop()
+        await dispatcher.stop()
 
     assert connection.send_calls == 1
     assert recording_event_handler.error_events
     assert isinstance(recording_event_handler.error_events[-1].error, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sender_emits_timeout_error_and_stops_when_send_times_out(
+    recording_event_handler,
+) -> None:
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    connection = TimeoutSendConnection()
+    sender = AsyncioHeartbeatSender(
+        connection,
+        TcpHeartbeatSettings(enabled=True, interval_seconds=0.01),
+        AlwaysSendHeartbeatProvider(),
+        dispatcher,
+    )
+
+    try:
+        await sender.start()
+        await wait_for_condition(lambda: sender.is_running is False, timeout_seconds=1.0)
+    finally:
+        await sender.stop()
+        await dispatcher.stop()
+
+    assert connection.send_calls == 1
+    assert recording_event_handler.error_events
+    error = recording_event_handler.error_events[-1].error
+    assert isinstance(error, (TimeoutError, asyncio.TimeoutError))
