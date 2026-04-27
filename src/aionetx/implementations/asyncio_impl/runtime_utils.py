@@ -180,6 +180,32 @@ async def await_task_completion_preserving_cancellation(task: asyncio.Task[objec
         raise asyncio.CancelledError
 
 
+def is_task_being_cancelled(task: asyncio.Task[object] | None = None) -> bool:
+    """
+    Return whether the provided task currently has cancellation in progress.
+
+    The check supports ``Task.cancelling()`` where available and falls back to
+    CPython's private ``_must_cancel`` counter on runtimes that do not expose
+    the public method.
+    """
+    current_task = task if task is not None else asyncio.current_task()
+    if current_task is None:
+        return False
+
+    task_cancelling = getattr(current_task, "cancelling", None)
+    if callable(task_cancelling):
+        try:
+            return bool(task_cancelling())
+        except (TypeError, RuntimeError):
+            pass
+
+    pending_cancel_count = getattr(current_task, "_must_cancel", None)
+    if isinstance(pending_cancel_count, int):
+        return pending_cancel_count > 0
+
+    return False
+
+
 def validate_async_event_handler(event_handler: NetworkEventHandlerProtocol) -> None:
     """
     Validate the runtime contract for ``NetworkEventHandlerProtocol``.

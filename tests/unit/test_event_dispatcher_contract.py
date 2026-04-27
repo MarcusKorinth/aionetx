@@ -1731,3 +1731,31 @@ async def test_handler_cancelled_error_is_treated_as_handler_failure() -> None:
         "ConnectionOpenedEvent",
         "ConnectionOpenedEvent",
     ]
+
+
+@pytest.mark.asyncio
+async def test_inline_dispatcher_caller_cancellation_propagates() -> None:
+    start_blocked = asyncio.Event()
+    handler_reached = asyncio.Event()
+
+    class BlockingInlineHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            handler_reached.set()
+            start_blocked.set()
+            await asyncio.Event().wait()
+
+    dispatcher = AsyncioEventDispatcher(
+        BlockingInlineHandler(),
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.INLINE,
+            handler_failure_policy=EventHandlerFailurePolicy.LOG_ONLY,
+        ),
+        logging.getLogger("test"),
+    )
+    emit_task = asyncio.create_task(dispatcher.emit(_opened(1)))
+    await asyncio.wait_for(start_blocked.wait(), timeout=1.0)
+    assert handler_reached.is_set()
+
+    emit_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await emit_task

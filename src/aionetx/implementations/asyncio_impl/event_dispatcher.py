@@ -28,6 +28,7 @@ from aionetx.api.network_event import NetworkEvent
 from aionetx.api.network_event_handler_protocol import NetworkEventHandlerProtocol
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     WarningRateLimiter,
+    is_task_being_cancelled,
     validate_async_event_handler,
 )
 
@@ -430,9 +431,7 @@ class AsyncioEventDispatcher:
         try:
             await self._event_handler.on_event(event)
         except asyncio.CancelledError as error:
-            current_task = asyncio.current_task()
-            task_cancelling = getattr(current_task, "cancelling", None)
-            if task_cancelling is not None and task_cancelling():
+            if is_task_being_cancelled():
                 raise
             wrapped_error = _HandlerCancelledError(
                 "Network event handler raised asyncio.CancelledError without "
