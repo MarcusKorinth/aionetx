@@ -192,8 +192,9 @@ async def test_udp_receiver_opened_handler_failure_rolls_back_runtime_resources(
 
 
 @pytest.mark.asyncio
-async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_before_task_creation(
-) -> None:
+async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_before_task_creation() -> (
+    None
+):
     handler = HoldingOpenEventLockHandler()
     receiver = AsyncioUdpReceiver(
         settings=UdpReceiverSettings(
@@ -217,8 +218,9 @@ async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_b
 
 
 @pytest.mark.asyncio
-async def test_udp_receiver_background_startup_cancellation_after_opened_event_rolls_back_before_task_creation(
-) -> None:
+async def test_udp_receiver_background_startup_cancellation_after_opened_event_rolls_back_before_task_creation() -> (
+    None
+):
     opened_emit_seen = asyncio.Event()
     allow_opened_emit_to_return = asyncio.Event()
 
