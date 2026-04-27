@@ -274,6 +274,8 @@ class AsyncioEventDispatcher:
         - before worker start: deliver inline in the caller task;
         - steady-state (worker running): enqueue for worker delivery;
         - after stop begins: ignore new emits.
+        - ``emit()`` in BACKGROUND does not await handler completion; it may
+          return while handler work is still in flight on the worker task.
 
         Arguments:
             event (NetworkEvent): Event instance to deliver according to the

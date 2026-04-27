@@ -356,9 +356,14 @@ async def test_background_mode_emit_returns_before_handler_completes() -> None:
     )
     await dispatcher.start()
 
+    # In BACKGROUND mode, queueing and handler execution are intentionally decoupled:
+    # if emit() were to await handler completion here, shutdown timing and
+    # cancellation behavior become caller-coupled and no longer match the contract.
     emit_task = asyncio.create_task(dispatcher.emit(_opened(1)))
     await asyncio.wait_for(handler_started.wait(), timeout=1.0)
     await asyncio.sleep(0)
+    # Once queueing succeeds, emit() should be done even though the handler
+    # has not finished its work path yet.
     assert emit_task.done()
     assert not handler_done.is_set()
 
