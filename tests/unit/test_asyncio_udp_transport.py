@@ -217,6 +217,45 @@ async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_b
 
 
 @pytest.mark.asyncio
+async def test_udp_receiver_background_startup_cancellation_after_opened_event_rolls_back_before_task_creation(
+) -> None:
+    opened_emit_seen = asyncio.Event()
+    allow_opened_emit_to_return = asyncio.Event()
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.BACKGROUND,
+            ),
+        ),
+        event_handler=NoopHandler(),
+    )
+
+    original_emit = receiver._event_dispatcher.emit  # type: ignore[attr-defined]
+
+    async def _emit_blocking_opened_event(event) -> None:
+        if isinstance(event, ConnectionOpenedEvent):
+            opened_emit_seen.set()
+            await allow_opened_emit_to_return.wait()
+        await original_emit(event)
+
+    receiver._event_dispatcher.emit = _emit_blocking_opened_event  # type: ignore[method-assign]
+
+    start_task = asyncio.create_task(receiver.start())
+    await asyncio.wait_for(opened_emit_seen.wait(), timeout=1.0)
+
+    start_task.cancel()
+    await assert_awaitable_cancelled(start_task)
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_udp_receiver_starting_lifecycle_failure_rolls_back_dispatcher() -> None:
     receiver = AsyncioUdpReceiver(
         settings=UdpReceiverSettings(
