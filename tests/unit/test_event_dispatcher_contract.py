@@ -333,6 +333,42 @@ async def test_background_mode_with_started_worker_dispatches_on_worker_task() -
 
 
 @pytest.mark.asyncio
+async def test_background_mode_emit_returns_before_handler_completes() -> None:
+    """
+    BACKGROUND-mode emit must return after queueing, even while handler
+    execution is still running.
+    """
+    handler_started = asyncio.Event()
+    handler_release = asyncio.Event()
+    handler_done = asyncio.Event()
+
+    class SlowBlockingHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                handler_started.set()
+                await handler_release.wait()
+                handler_done.set()
+
+    dispatcher = AsyncioEventDispatcher(
+        SlowBlockingHandler(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+
+    emit_task = asyncio.create_task(dispatcher.emit(_opened(1)))
+    await asyncio.wait_for(handler_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    assert emit_task.done()
+    assert not handler_done.is_set()
+
+    handler_release.set()
+    await asyncio.wait_for(emit_task, timeout=1.0)
+    await asyncio.wait_for(handler_done.wait(), timeout=1.0)
+    await dispatcher.stop()
+
+
+@pytest.mark.asyncio
 async def test_background_mode_handler_spawned_task_does_not_inherit_inline_delivery() -> None:
     handled_tasks: list[asyncio.Task[None] | None] = []
     spawned_emit_finished = asyncio.Event()
