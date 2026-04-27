@@ -94,6 +94,25 @@ class StopAgainOnStoppingHandler:
             self.reentered_stop.set()
 
 
+class HoldingOpenEventLockHandler:
+    def __init__(self) -> None:
+        self.receiver: AsyncioUdpReceiver | None = None
+        self.opened_and_locked = asyncio.Event()
+
+    async def on_event(self, event) -> None:
+        if self.receiver is None or not isinstance(event, ConnectionOpenedEvent):
+            return
+        acquired = False
+        try:
+            await self.receiver._state_lock.acquire()  # type: ignore[attr-defined]
+            acquired = True
+            self.opened_and_locked.set()
+            await asyncio.Event().wait()
+        finally:
+            if acquired:
+                self.receiver._state_lock.release()  # type: ignore[attr-defined]
+
+
 def _get_unused_udp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -170,6 +189,31 @@ async def test_udp_receiver_opened_handler_failure_rolls_back_runtime_resources(
     assert receiver._socket is None  # type: ignore[attr-defined]
     assert receiver._task is None  # type: ignore[attr-defined]
     assert not receiver._event_dispatcher.is_running  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_before_task_creation(
+) -> None:
+    handler = HoldingOpenEventLockHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+
+    start_task = asyncio.create_task(receiver.start())
+    await asyncio.wait_for(handler.opened_and_locked.wait(), timeout=1.0)
+    start_task.cancel()
+    await assert_awaitable_cancelled(start_task)
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
