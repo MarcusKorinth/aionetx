@@ -34,6 +34,7 @@ from aionetx.implementations.asyncio_impl.event_dispatcher import (
     AsyncioEventDispatcher,
     DispatcherStopPolicy,
 )
+from tests.helpers import assert_awaitable_cancelled
 
 pytestmark = pytest.mark.behavior_critical
 
@@ -1770,5 +1771,4 @@ async def test_inline_dispatcher_caller_cancellation_propagates() -> None:
     assert handler_reached.is_set()
 
     emit_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await emit_task
+    await assert_awaitable_cancelled(emit_task)
