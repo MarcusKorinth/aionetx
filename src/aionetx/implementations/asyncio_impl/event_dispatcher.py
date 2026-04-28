@@ -435,15 +435,10 @@ class AsyncioEventDispatcher:
         event callback.
 
         Caller cancellation propagation versus handler-raised
-        ``CancelledError``: on Python 3.11+ the distinction is decided
-        reliably via ``Task.cancelling()``.  On Python 3.10 ``Task.cancelling``
-        is unavailable and ``Task._must_cancel`` is reset before the
-        ``except`` block runs, so caller cancellation that arrives while the
-        handler is awaiting cannot be told apart from a handler-raised
-        ``CancelledError``; in that case the dispatcher conservatively treats
-        the cancellation as a handler failure.  The two regression tests that
-        exercise inline caller-cancellation propagation are skipped on 3.10
-        for the same reason.
+        ``CancelledError`` is decided via ``Task.cancelling()`` on the
+        dispatching task.  That keeps true caller cancellation observable
+        while still routing handler-originated ``CancelledError`` through the
+        configured handler-failure policy.
         """
         self._handler_dispatch_attempts_total += 1
         try:
