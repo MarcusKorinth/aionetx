@@ -37,8 +37,7 @@ async def await_read_task_shutdown(
         await asyncio.wait_for(read_task, timeout=timeout_seconds)
     except asyncio.CancelledError:
         current_task = asyncio.current_task()
-        cancelling = getattr(current_task, "cancelling", None)
-        if current_task is not None and callable(cancelling) and cancelling():
+        if current_task is not None and current_task.cancelling():
             raise
     except TimeoutError:
         if warning_limiter.should_log(f"tcp-connection-read-task-timeout:{connection_id}"):

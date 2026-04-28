@@ -4,16 +4,13 @@ import asyncio
 
 import pytest
 
-from aionetx.implementations.asyncio_impl import runtime_utils as runtime_utils_module
 from tests.helpers import assert_awaitable_cancelled
 from tests.helpers import drain_awaitable_ignoring_cancelled
 from tests.internal_asyncio_impl_refs import await_task_completion_preserving_cancellation
 
 
 @pytest.mark.asyncio
-async def test_task_await_helper_preserves_caller_cancellation_without_task_cancelling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_task_await_helper_preserves_caller_cancellation_until_child_settles() -> None:
     child_cancel_seen = asyncio.Event()
     release_child = asyncio.Event()
 
@@ -35,14 +32,6 @@ async def test_task_await_helper_preserves_caller_cancellation_without_task_canc
     try:
         await asyncio.wait_for(child_cancel_seen.wait(), timeout=1.0)
 
-        class _CurrentTaskWithoutCancelling:
-            pass
-
-        monkeypatch.setattr(
-            runtime_utils_module.asyncio,
-            "current_task",
-            lambda: _CurrentTaskWithoutCancelling(),
-        )
         awaiter_task.cancel()
         await asyncio.sleep(0)
 
