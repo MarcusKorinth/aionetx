@@ -426,7 +426,25 @@ class AsyncioEventDispatcher:
                 self._worker_task = None
 
     async def _emit_now(self, event: NetworkEvent) -> None:
-        """Deliver one event to the handler and route failures through policy handling."""
+        """Deliver one event to the handler and route failures through policy handling.
+
+        The handler runs directly on the dispatching task so methods that
+        identify the dispatch path via ``asyncio.current_task()`` (notably the
+        UDP/TCP self-stop guards and ``current_task_is_worker`` checks)
+        continue to work when handlers re-enter ``stop()`` from inside an
+        event callback.
+
+        Caller cancellation propagation versus handler-raised
+        ``CancelledError``: on Python 3.11+ the distinction is decided
+        reliably via ``Task.cancelling()``.  On Python 3.10 ``Task.cancelling``
+        is unavailable and ``Task._must_cancel`` is reset before the
+        ``except`` block runs, so caller cancellation that arrives while the
+        handler is awaiting cannot be told apart from a handler-raised
+        ``CancelledError``; in that case the dispatcher conservatively treats
+        the cancellation as a handler failure.  The two regression tests that
+        exercise inline caller-cancellation propagation are skipped on 3.10
+        for the same reason.
+        """
         self._handler_dispatch_attempts_total += 1
         try:
             await self._event_handler.on_event(event)
@@ -438,7 +456,10 @@ class AsyncioEventDispatcher:
                 "cancelling the dispatcher task."
             )
             wrapped_error.__cause__ = error
-            await self._record_handler_failure(error=wrapped_error, triggering_event=event)
+            await self._record_handler_failure(
+                error=wrapped_error, triggering_event=event
+            )
+            return
         except Exception as error:
             await self._record_handler_failure(error=error, triggering_event=event)
 

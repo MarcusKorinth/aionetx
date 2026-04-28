@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 import pytest
 
@@ -1733,6 +1734,18 @@ async def test_handler_cancelled_error_is_treated_as_handler_failure() -> None:
     ]
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason=(
+        "Python 3.10 lacks Task.cancelling() and resets Task._must_cancel "
+        "before the dispatcher's except block observes the CancelledError, "
+        "so caller cancellation that arrives while the inline handler is "
+        "awaiting cannot be reliably distinguished from a handler-raised "
+        "CancelledError without changing handler task identity, which the "
+        "transport self-stop guards rely on.  The dispatcher conservatively "
+        "treats this CancelledError as a handler failure on 3.10."
+    ),
+)
 @pytest.mark.asyncio
 async def test_inline_dispatcher_caller_cancellation_propagates() -> None:
     start_blocked = asyncio.Event()
