@@ -456,9 +456,7 @@ class AsyncioEventDispatcher:
                 "cancelling the dispatcher task."
             )
             wrapped_error.__cause__ = error
-            await self._record_handler_failure(
-                error=wrapped_error, triggering_event=event
-            )
+            await self._record_handler_failure(error=wrapped_error, triggering_event=event)
             return
         except Exception as error:
             await self._record_handler_failure(error=error, triggering_event=event)
