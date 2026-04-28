@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import socket
+import sys
 
 import pytest
 
@@ -94,6 +95,25 @@ class StopAgainOnStoppingHandler:
             self.reentered_stop.set()
 
 
+class HoldingOpenEventLockHandler:
+    def __init__(self) -> None:
+        self.receiver: AsyncioUdpReceiver | None = None
+        self.opened_and_locked = asyncio.Event()
+
+    async def on_event(self, event) -> None:
+        if self.receiver is None or not isinstance(event, ConnectionOpenedEvent):
+            return
+        acquired = False
+        try:
+            await self.receiver._state_lock.acquire()  # type: ignore[attr-defined]
+            acquired = True
+            self.opened_and_locked.set()
+            await asyncio.Event().wait()
+        finally:
+            if acquired:
+                self.receiver._state_lock.release()  # type: ignore[attr-defined]
+
+
 def _get_unused_udp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -170,6 +190,84 @@ async def test_udp_receiver_opened_handler_failure_rolls_back_runtime_resources(
     assert receiver._socket is None  # type: ignore[attr-defined]
     assert receiver._task is None  # type: ignore[attr-defined]
     assert not receiver._event_dispatcher.is_running  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason=(
+        "Python 3.10 lacks Task.cancelling() and resets Task._must_cancel "
+        "before the dispatcher's except block observes the CancelledError, "
+        "so start_task.cancel() during inline ConnectionOpenedEvent "
+        "publication cannot be reliably distinguished from a handler-raised "
+        "CancelledError without changing handler task identity, which the "
+        "receiver self-stop guards rely on.  The BACKGROUND-mode variant of "
+        "this regression is covered below and remains active on 3.10."
+    ),
+)
+@pytest.mark.asyncio
+async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_before_task_creation() -> (
+    None
+):
+    handler = HoldingOpenEventLockHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+
+    start_task = asyncio.create_task(receiver.start())
+    await asyncio.wait_for(handler.opened_and_locked.wait(), timeout=1.0)
+    start_task.cancel()
+    await assert_awaitable_cancelled(start_task)
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_background_startup_cancellation_after_opened_event_rolls_back_before_task_creation() -> (
+    None
+):
+    opened_emit_seen = asyncio.Event()
+    allow_opened_emit_to_return = asyncio.Event()
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.BACKGROUND,
+            ),
+        ),
+        event_handler=NoopHandler(),
+    )
+
+    original_emit = receiver._event_dispatcher.emit  # type: ignore[attr-defined]
+
+    async def _emit_blocking_opened_event(event) -> None:
+        if isinstance(event, ConnectionOpenedEvent):
+            opened_emit_seen.set()
+            await allow_opened_emit_to_return.wait()
+        await original_emit(event)
+
+    receiver._event_dispatcher.emit = _emit_blocking_opened_event  # type: ignore[method-assign]
+
+    start_task = asyncio.create_task(receiver.start())
+    await asyncio.wait_for(opened_emit_seen.wait(), timeout=1.0)
+
+    start_task.cancel()
+    await assert_awaitable_cancelled(start_task)
+
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

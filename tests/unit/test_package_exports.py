@@ -11,39 +11,38 @@ from __future__ import annotations
 import importlib
 from types import ModuleType
 
-import aionetx
 import pytest
 
-from aionetx import (
-    AsyncioNetworkFactory,
-    BaseNetworkEventHandler,
-    NetworkEvent,
-    TcpClientSettings,
-    TcpServerSettings,
-)
-from aionetx.api import (
-    ByteSenderProtocol,
-    BytesLike,
-    ManagedTransportProtocol,
-    MulticastReceiverProtocol,
-    NetworkConfigurationError,
-    NetworkLayerError,
-    NetworkRuntimeError,
-    TcpClientProtocol,
-    TcpServerProtocol,
-    TypedEventRouter,
+from aionetx.api.base_network_event_handler import BaseNetworkEventHandler
+from aionetx.api.byte_sender_protocol import ByteSenderProtocol
+from aionetx.api.bytes_like import BytesLike
+from aionetx.api.errors import NetworkConfigurationError, NetworkLayerError, NetworkRuntimeError
+from aionetx.api.managed_transport_protocol import ManagedTransportProtocol
+from aionetx.api.multicast_receiver_protocol import MulticastReceiverProtocol
+from aionetx.api.network_event import NetworkEvent
+from aionetx.api.tcp_client import TcpClientProtocol, TcpClientSettings
+from aionetx.api.tcp_server import TcpServerProtocol, TcpServerSettings
+from aionetx.api.typed_event_router import TypedEventRouter
+from aionetx.api.udp import (
     UdpInvalidTargetError,
     UdpReceiverProtocol,
     UdpSenderProtocol,
     UdpSenderStoppedError,
 )
+from aionetx.factories import AsyncioNetworkFactory
 
 
 def _api_module() -> ModuleType:
     return importlib.import_module("aionetx.api")
 
 
+def _root_module() -> ModuleType:
+    return importlib.import_module("aionetx")
+
+
 def test_package_root_exports_recommended_entry_points() -> None:
+    aionetx = _root_module()
+
     assert aionetx.AsyncioNetworkFactory is AsyncioNetworkFactory
     assert aionetx.TcpClientSettings is TcpClientSettings
     assert aionetx.TcpServerSettings is TcpServerSettings
@@ -86,6 +85,8 @@ def test_aionetx_api_exports_exception_bases_and_typed_router() -> None:
 
 
 def test_recording_event_handler_is_available_only_from_testing_namespace() -> None:
+    aionetx = _root_module()
+
     from aionetx.testing import RecordingEventHandler
 
     assert RecordingEventHandler.__name__ == "RecordingEventHandler"

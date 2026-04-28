@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 import pytest
 
@@ -33,6 +34,7 @@ from aionetx.implementations.asyncio_impl.event_dispatcher import (
     AsyncioEventDispatcher,
     DispatcherStopPolicy,
 )
+from tests.helpers import assert_awaitable_cancelled
 
 pytestmark = pytest.mark.behavior_critical
 
@@ -330,6 +332,47 @@ async def test_background_mode_with_started_worker_dispatches_on_worker_task() -
     assert len(seen_tasks) == 1
     assert seen_tasks[0] is not None
     assert seen_tasks[0] is not caller_task
+
+
+@pytest.mark.asyncio
+async def test_background_mode_emit_returns_before_handler_completes() -> None:
+    """
+    BACKGROUND-mode emit must return after queueing, even while handler
+    execution is still running.
+    """
+    handler_started = asyncio.Event()
+    handler_release = asyncio.Event()
+    handler_done = asyncio.Event()
+
+    class SlowBlockingHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                handler_started.set()
+                await handler_release.wait()
+                handler_done.set()
+
+    dispatcher = AsyncioEventDispatcher(
+        SlowBlockingHandler(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+
+    # In BACKGROUND mode, queueing and handler execution are intentionally decoupled:
+    # if emit() were to await handler completion here, shutdown timing and
+    # cancellation behavior become caller-coupled and no longer match the contract.
+    emit_task = asyncio.create_task(dispatcher.emit(_opened(1)))
+    await asyncio.wait_for(handler_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    # Once queueing succeeds, emit() should be done even though the handler
+    # has not finished its work path yet.
+    assert emit_task.done()
+    assert not handler_done.is_set()
+
+    handler_release.set()
+    await asyncio.wait_for(emit_task, timeout=1.0)
+    await asyncio.wait_for(handler_done.wait(), timeout=1.0)
+    await dispatcher.stop()
 
 
 @pytest.mark.asyncio
@@ -1690,3 +1733,42 @@ async def test_handler_cancelled_error_is_treated_as_handler_failure() -> None:
         "ConnectionOpenedEvent",
         "ConnectionOpenedEvent",
     ]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason=(
+        "Python 3.10 lacks Task.cancelling() and resets Task._must_cancel "
+        "before the dispatcher's except block observes the CancelledError, "
+        "so caller cancellation that arrives while the inline handler is "
+        "awaiting cannot be reliably distinguished from a handler-raised "
+        "CancelledError without changing handler task identity, which the "
+        "transport self-stop guards rely on.  The dispatcher conservatively "
+        "treats this CancelledError as a handler failure on 3.10."
+    ),
+)
+@pytest.mark.asyncio
+async def test_inline_dispatcher_caller_cancellation_propagates() -> None:
+    start_blocked = asyncio.Event()
+    handler_reached = asyncio.Event()
+
+    class BlockingInlineHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            handler_reached.set()
+            start_blocked.set()
+            await asyncio.Event().wait()
+
+    dispatcher = AsyncioEventDispatcher(
+        BlockingInlineHandler(),
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.INLINE,
+            handler_failure_policy=EventHandlerFailurePolicy.LOG_ONLY,
+        ),
+        logging.getLogger("test"),
+    )
+    emit_task = asyncio.create_task(dispatcher.emit(_opened(1)))
+    await asyncio.wait_for(start_blocked.wait(), timeout=1.0)
+    assert handler_reached.is_set()
+
+    emit_task.cancel()
+    await assert_awaitable_cancelled(emit_task)

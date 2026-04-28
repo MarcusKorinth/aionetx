@@ -28,6 +28,7 @@ from aionetx.api.network_event import NetworkEvent
 from aionetx.api.network_event_handler_protocol import NetworkEventHandlerProtocol
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     WarningRateLimiter,
+    is_task_being_cancelled,
     validate_async_event_handler,
 )
 
@@ -274,6 +275,8 @@ class AsyncioEventDispatcher:
         - before worker start: deliver inline in the caller task;
         - steady-state (worker running): enqueue for worker delivery;
         - after stop begins: ignore new emits.
+        - ``emit()`` in BACKGROUND does not await handler completion; it may
+          return while handler work is still in flight on the worker task.
 
         Arguments:
             event (NetworkEvent): Event instance to deliver according to the
@@ -423,14 +426,30 @@ class AsyncioEventDispatcher:
                 self._worker_task = None
 
     async def _emit_now(self, event: NetworkEvent) -> None:
-        """Deliver one event to the handler and route failures through policy handling."""
+        """Deliver one event to the handler and route failures through policy handling.
+
+        The handler runs directly on the dispatching task so methods that
+        identify the dispatch path via ``asyncio.current_task()`` (notably the
+        UDP/TCP self-stop guards and ``current_task_is_worker`` checks)
+        continue to work when handlers re-enter ``stop()`` from inside an
+        event callback.
+
+        Caller cancellation propagation versus handler-raised
+        ``CancelledError``: on Python 3.11+ the distinction is decided
+        reliably via ``Task.cancelling()``.  On Python 3.10 ``Task.cancelling``
+        is unavailable and ``Task._must_cancel`` is reset before the
+        ``except`` block runs, so caller cancellation that arrives while the
+        handler is awaiting cannot be told apart from a handler-raised
+        ``CancelledError``; in that case the dispatcher conservatively treats
+        the cancellation as a handler failure.  The two regression tests that
+        exercise inline caller-cancellation propagation are skipped on 3.10
+        for the same reason.
+        """
         self._handler_dispatch_attempts_total += 1
         try:
             await self._event_handler.on_event(event)
         except asyncio.CancelledError as error:
-            current_task = asyncio.current_task()
-            task_cancelling = getattr(current_task, "cancelling", None)
-            if task_cancelling is not None and task_cancelling():
+            if is_task_being_cancelled():
                 raise
             wrapped_error = _HandlerCancelledError(
                 "Network event handler raised asyncio.CancelledError without "
@@ -438,6 +457,7 @@ class AsyncioEventDispatcher:
             )
             wrapped_error.__cause__ = error
             await self._record_handler_failure(error=wrapped_error, triggering_event=event)
+            return
         except Exception as error:
             await self._record_handler_failure(error=error, triggering_event=event)
 

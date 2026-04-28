@@ -524,20 +524,21 @@ class _AsyncioDatagramReceiverBase:
             await self._event_dispatcher.emit(
                 ConnectionOpenedEvent(resource_id=metadata.connection_id, metadata=metadata)
             )
+            async with self._state_lock:
+                if (
+                    self._socket is not sock
+                    or not self._running
+                    or self._lifecycle_state != ComponentLifecycleState.RUNNING
+                ):
+                    return
+                self._task = asyncio.create_task(
+                    self._receive_datagrams(receive_buffer_size),
+                    name=f"{self._connection_id}-receiver",
+                )
         except (Exception, asyncio.CancelledError):
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await self._stop_datagram_receiver(socket_cleanup=self._cleanup_socket)
             raise
-        async with self._state_lock:
-            if (
-                self._socket is not sock
-                or not self._running
-                or self._lifecycle_state != ComponentLifecycleState.RUNNING
-            ):
-                return
-            self._task = asyncio.create_task(
-                self._receive_datagrams(receive_buffer_size), name=f"{self._connection_id}-receiver"
-            )
 
     async def _fail_startup(self) -> None:
         """Roll startup back to a clean stopped state and quiesce the dispatcher."""
