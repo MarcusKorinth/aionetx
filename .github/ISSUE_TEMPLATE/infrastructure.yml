@@ -1,0 +1,76 @@
+name: Infrastructure / maintenance
+description: Propose a change to CI, build tooling, linting, packaging, developer workflow, project configuration, or general housekeeping.
+title: "[infra] "
+labels: ["infrastructure", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template is for improvements to developer infrastructure, project tooling, and general maintenance: CI pipelines, linters, formatters, Makefiles, packaging metadata, test configuration, documentation builds, dependency updates, repository housekeeping, and similar concerns.
+
+        If your proposal changes **transport runtime behavior** (lifecycle, events, backpressure, reconnect, multicast), please use the [Feature request](https://github.com/MarcusKorinth/aionetx/issues/new?template=feature_request.yml) template instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What friction, gap, or risk does this address? Describe the current pain point.
+      placeholder: e.g. "There is no way to run the full lint + type-check + test suite in one command without remembering three separate invocations."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What specifically should change? Include tool names, configuration snippets, or CI job definitions where helpful.
+      render: yaml
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project does this touch?
+      multiple: true
+      options:
+        - CI / GitHub Actions
+        - Linting / formatting
+        - Type checking
+        - Test configuration / fixtures
+        - Packaging / pyproject.toml
+        - Dependency management
+        - Makefile / task runner
+        - Documentation build
+        - Developer environment setup
+        - Repository housekeeping (dead code, typos, license headers, etc.)
+        - Other (please specify below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Considered alternatives
+      description: Other approaches you weighed and why you prefer the proposal above.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to relevant tool documentation, related issues, or examples from other projects.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: I have searched existing issues and confirmed this is not already proposed.
+          required: true
+        - label: This proposal concerns project infrastructure, tooling, or maintenance, not transport runtime behavior.
+          required: true
