@@ -14,3 +14,7 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - bounded TCP send flushes with configurable per-connection send timeouts
 - optional TCP client reconnect and heartbeat support
 - tests, examples, typing metadata, and CI/release verification gates
+
+### Changed
+
+- require Python 3.11 or newer for the initial public alpha release

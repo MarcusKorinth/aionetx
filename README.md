@@ -1,7 +1,7 @@
 # aionetx
 
 [![CI](https://img.shields.io/github/actions/workflow/status/MarcusKorinth/aionetx/ci.yml?branch=main&label=ci)](https://github.com/MarcusKorinth/aionetx/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/MarcusKorinth/aionetx/blob/main/pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/MarcusKorinth/aionetx/blob/main/pyproject.toml)
 [![Coverage gate](https://img.shields.io/badge/coverage%20gate-%E2%89%A585%25-brightgreen)](https://github.com/MarcusKorinth/aionetx/blob/main/.github/workflows/ci.yml)
 [![Typing](https://img.shields.io/badge/typing-py.typed-blueviolet)](https://github.com/MarcusKorinth/aionetx/blob/main/src/aionetx/py.typed)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)

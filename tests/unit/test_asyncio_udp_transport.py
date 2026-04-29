@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import logging
 import socket
-import sys
 
 import pytest
 
@@ -192,18 +191,6 @@ async def test_udp_receiver_opened_handler_failure_rolls_back_runtime_resources(
     assert not receiver._event_dispatcher.is_running  # type: ignore[attr-defined]
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 11),
-    reason=(
-        "Python 3.10 lacks Task.cancelling() and resets Task._must_cancel "
-        "before the dispatcher's except block observes the CancelledError, "
-        "so start_task.cancel() during inline ConnectionOpenedEvent "
-        "publication cannot be reliably distinguished from a handler-raised "
-        "CancelledError without changing handler task identity, which the "
-        "receiver self-stop guards rely on.  The BACKGROUND-mode variant of "
-        "this regression is covered below and remains active on 3.10."
-    ),
-)
 @pytest.mark.asyncio
 async def test_udp_receiver_startup_cancellation_after_opened_event_rolls_back_before_task_creation() -> (
     None

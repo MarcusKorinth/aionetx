@@ -3,26 +3,13 @@ from __future__ import annotations
 import os
 import pathlib
 import re
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        tomllib = None
+import tomllib
 
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[a-zA-Z0-9.\-+]+)?$")
 
 
 def read_pyproject_version(pyproject_path: pathlib.Path = pathlib.Path("pyproject.toml")) -> str:
-    if tomllib is None:
-        raise RuntimeError(
-            "validate_release_provenance.py requires the stdlib tomllib module or the "
-            "'tomli' backport to parse pyproject.toml. Use Python 3.11+ or install "
-            "'tomli' when running on Python 3.10."
-        )
     with pyproject_path.open("rb") as fh:
         data = tomllib.load(fh)
     try:

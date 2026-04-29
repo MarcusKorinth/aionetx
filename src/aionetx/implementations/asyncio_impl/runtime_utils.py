@@ -161,15 +161,10 @@ async def await_task_completion_preserving_cancellation(task: asyncio.Task[objec
             break
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
-            cancelling = getattr(current_task, "cancelling", None)
-            if (
-                current_task is not None and callable(cancelling) and cancelling()
-            ) or not task.done():
+            if current_task is not None and current_task.cancelling():
                 caller_cancelled = True
                 # Keep awaiting the shielded child task so repeated caller
-                # cancellations cannot detach the internal cleanup task.  The
-                # ``not task.done()`` fallback preserves this contract on
-                # Python 3.10, where Task.cancelling() is unavailable.
+                # cancellations cannot detach the internal cleanup task.
                 if task.done():
                     break
                 continue
@@ -181,29 +176,11 @@ async def await_task_completion_preserving_cancellation(task: asyncio.Task[objec
 
 
 def is_task_being_cancelled(task: asyncio.Task[object] | None = None) -> bool:
-    """
-    Return whether the provided task currently has cancellation in progress.
-
-    The check supports ``Task.cancelling()`` where available and falls back to
-    CPython's private ``_must_cancel`` counter on runtimes that do not expose
-    the public method.
-    """
+    """Return whether the provided task currently has cancellation in progress."""
     current_task = task if task is not None else asyncio.current_task()
     if current_task is None:
         return False
-
-    task_cancelling = getattr(current_task, "cancelling", None)
-    if callable(task_cancelling):
-        try:
-            return bool(task_cancelling())
-        except (TypeError, RuntimeError):
-            pass
-
-    pending_cancel_count = getattr(current_task, "_must_cancel", None)
-    if isinstance(pending_cancel_count, int):
-        return pending_cancel_count > 0
-
-    return False
+    return bool(current_task.cancelling())
 
 
 def validate_async_event_handler(event_handler: NetworkEventHandlerProtocol) -> None:

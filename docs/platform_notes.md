@@ -49,8 +49,8 @@ aionetx's UDP receive and send paths prefer the event loop's
 `sock_recvfrom()` / `sock_sendto()` awaitables, which deliver non-blocking
 socket I/O integrated with the selector. These APIs are available on
 `asyncio.SelectorEventLoop` (the default on Linux and macOS). On Windows,
-Python 3.8+ defaults to `asyncio.ProactorEventLoop`, which does **not**
-expose `sock_recvfrom()` / `sock_sendto()`.
+supported Python versions default to `asyncio.ProactorEventLoop`, which
+does **not** expose `sock_recvfrom()` / `sock_sendto()`.
 
 ### Fallback behaviour
 

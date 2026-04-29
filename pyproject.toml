@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Reusable raw-byte network layer for TCP, UDP sender/receiver, and multicast"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Marcus Korinth"},
 ]
@@ -20,7 +20,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -46,7 +45,6 @@ dev = [
     "coverage>=7.0",
     "ruff>=0.5",
     "mypy>=1.10",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 dev-hypothesis = [
     "aionetx[dev]",
@@ -85,10 +83,10 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 packages = ["aionetx"]
 mypy_path = "src"

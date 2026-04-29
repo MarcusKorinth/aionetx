@@ -69,7 +69,6 @@ body:
       label: Python version
       description: If the bug is specific to a version, note it here; otherwise pick the one you reproduced with.
       options:
-        - "3.10"
         - "3.11"
         - "3.12"
         - "3.13"
