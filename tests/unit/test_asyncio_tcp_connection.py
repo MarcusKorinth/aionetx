@@ -363,6 +363,62 @@ async def test_tcp_connection_opened_barrier_is_not_dropped_by_background_backpr
 
 
 @pytest.mark.asyncio
+async def test_tcp_connection_close_during_ready_callback_does_not_emit_late_opened() -> None:
+    ready_started = asyncio.Event()
+    allow_ready_to_finish = asyncio.Event()
+
+    class RecordingHandler:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                self.events.append("opened")
+            elif isinstance(event, ConnectionClosedEvent):
+                self.events.append("closed")
+
+    async def on_ready(_connection: AsyncioTcpConnection) -> None:
+        ready_started.set()
+        await allow_ready_to_finish.wait()
+
+    handler = RecordingHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:close-during-ready",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+        on_ready_callback=on_ready,
+    )
+
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    try:
+        await asyncio.wait_for(ready_started.wait(), timeout=1.0)
+        await connection.close()
+        allow_ready_to_finish.set()
+        await asyncio.wait_for(start_task, timeout=1.0)
+    finally:
+        allow_ready_to_finish.set()
+        if not start_task.done():
+            start_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(start_task, timeout=1.0)
+        await dispatcher.stop()
+
+    assert handler.events == ["closed"]
+    assert connection.state == ConnectionState.CLOSED
+    assert writer.closed
+
+
+@pytest.mark.asyncio
 async def test_tcp_connection_send_on_closed_connection_raises(recording_event_handler) -> None:
     server = await asyncio.start_server(_no_op_server_handler, "127.0.0.1", 0)
     async with server:
