@@ -16,6 +16,7 @@ import socket
 
 import pytest
 
+from aionetx.api.bytes_received_event import BytesReceivedEvent
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
 from aionetx.api.connection_events import ConnectionClosedEvent
@@ -39,6 +40,7 @@ from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import AsyncioUdp
 from aionetx.implementations.asyncio_impl.asyncio_udp_sender import AsyncioUdpSender
 from tests.helpers import assert_awaitable_cancelled
 from tests.helpers import drain_awaitable_ignoring_cancelled
+from tests.helpers import wait_for_condition
 
 
 class NoopHandler:
@@ -92,6 +94,52 @@ class StopAgainOnStoppingHandler:
         ):
             await self.receiver.stop()
             self.reentered_stop.set()
+
+
+class SpawnStopOnOpenedHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.receiver: AsyncioUdpReceiver | None = None
+        self.opened_seen = asyncio.Event()
+        self.opened_finished = asyncio.Event()
+        self.closed_seen = asyncio.Event()
+        self.stop_returned = asyncio.Event()
+        self.release_opened = asyncio.Event()
+        self.stop_task: asyncio.Task[None] | None = None
+        self.error: BaseException | None = None
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if isinstance(event, ConnectionClosedEvent):
+            if not self.opened_finished.is_set():
+                self.error = AssertionError("closed event re-entered opened handler")
+                self.release_opened.set()
+                return
+            self.closed_seen.set()
+            return
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            and not self.opened_finished.is_set()
+        ):
+            self.error = AssertionError("lifecycle event re-entered opened handler")
+            self.release_opened.set()
+            return
+        if self.receiver is None or not isinstance(event, ConnectionOpenedEvent):
+            return
+        self.opened_seen.set()
+        try:
+            self.stop_task = asyncio.create_task(self.receiver.stop())
+            await self.stop_task
+            self.stop_returned.set()
+            if self.closed_seen.is_set():
+                raise AssertionError("closed event was published before opened handler returned")
+            await self.release_opened.wait()
+        except BaseException as error:
+            self.error = error
+            self.release_opened.set()
+        finally:
+            self.opened_finished.set()
 
 
 class HoldingOpenEventLockHandler:
@@ -235,15 +283,17 @@ async def test_udp_receiver_background_startup_cancellation_after_opened_event_r
         event_handler=NoopHandler(),
     )
 
-    original_emit = receiver._event_dispatcher.emit  # type: ignore[attr-defined]
+    original_emit_and_wait = receiver._event_dispatcher.emit_and_wait  # type: ignore[attr-defined]
 
-    async def _emit_blocking_opened_event(event) -> None:
+    async def _emit_and_wait_blocking_opened_event(
+        event, *, drop_on_backpressure: bool = True
+    ) -> None:
         if isinstance(event, ConnectionOpenedEvent):
             opened_emit_seen.set()
             await allow_opened_emit_to_return.wait()
-        await original_emit(event)
+        await original_emit_and_wait(event, drop_on_backpressure=drop_on_backpressure)
 
-    receiver._event_dispatcher.emit = _emit_blocking_opened_event  # type: ignore[method-assign]
+    receiver._event_dispatcher.emit_and_wait = _emit_and_wait_blocking_opened_event  # type: ignore[method-assign]
 
     start_task = asyncio.create_task(receiver.start())
     await asyncio.wait_for(opened_emit_seen.wait(), timeout=1.0)
@@ -254,6 +304,73 @@ async def test_udp_receiver_background_startup_cancellation_after_opened_event_r
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._socket is None  # type: ignore[attr-defined]
     assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_cancelled_external_stop_during_opened_barrier_publishes_terminal_events() -> (
+    None
+):
+    class BlockingOpenedHandler:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+            self.opened_seen = asyncio.Event()
+            self.release_opened = asyncio.Event()
+
+        async def on_event(self, event) -> None:
+            self.events.append(event)
+            if isinstance(event, ConnectionOpenedEvent):
+                self.opened_seen.set()
+                await self.release_opened.wait()
+
+    handler = BlockingOpenedHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    start_task: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    joiner_stop_task: asyncio.Task[None] | None = None
+    try:
+        start_task = asyncio.create_task(receiver.start())
+        await asyncio.wait_for(handler.opened_seen.wait(), timeout=1.0)
+
+        stop_task = asyncio.create_task(receiver.stop())
+        await wait_for_condition(
+            lambda: receiver.lifecycle_state == ComponentLifecycleState.STOPPING,
+            timeout_seconds=1.0,
+        )
+        stop_task.cancel()
+        await assert_awaitable_cancelled(stop_task)
+
+        joiner_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        assert not joiner_stop_task.done()
+
+        handler.release_opened.set()
+        await asyncio.wait_for(joiner_stop_task, timeout=1.0)
+        await asyncio.wait_for(start_task, timeout=1.0)
+    finally:
+        handler.release_opened.set()
+        for task in (stop_task, joiner_stop_task, start_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await drain_awaitable_ignoring_cancelled(task)
+        await receiver.stop()
+
+    lifecycle_states = [
+        event.current
+        for event in handler.events
+        if isinstance(event, ComponentLifecycleChangedEvent)
+    ]
+    assert ComponentLifecycleState.STOPPING in lifecycle_states
+    assert ComponentLifecycleState.STOPPED in lifecycle_states
+    assert any(isinstance(event, ConnectionClosedEvent) for event in handler.events)
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
@@ -955,6 +1072,482 @@ async def test_udp_receiver_inline_stop_reentry_does_not_self_await() -> None:
         ComponentLifecycleState.STOPPED,
     ]
     assert len(closed_events) == 1
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_spawned_stop_from_opened_handler_delivers_terminal_events() -> None:
+    handler = SpawnStopOnOpenedHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+    start_task: asyncio.Task[None] | None = None
+
+    try:
+        start_task = asyncio.create_task(receiver.start())
+        await asyncio.wait_for(handler.opened_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.stop_returned.wait(), timeout=1.0)
+        assert not handler.closed_seen.is_set()
+        assert not start_task.done()
+        assert not any(
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            for event in handler.events
+        )
+
+        handler.release_opened.set()
+        assert handler.stop_task is not None
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(start_task, timeout=1.0)
+    finally:
+        handler.release_opened.set()
+        if start_task is not None and not start_task.done():
+            start_task.cancel()
+            await drain_awaitable_ignoring_cancelled(start_task)
+        if handler.stop_task is not None and not handler.stop_task.done():
+            handler.stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(handler.stop_task)
+        await receiver.stop()
+
+    assert handler.error is None
+    stop_relevant_events = [
+        event
+        for event in handler.events
+        if isinstance(event, ConnectionClosedEvent)
+        or (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+        )
+    ]
+    assert [type(event).__name__ for event in stop_relevant_events] == [
+        "ComponentLifecycleChangedEvent",
+        "ConnectionClosedEvent",
+        "ComponentLifecycleChangedEvent",
+    ]
+    assert isinstance(stop_relevant_events[0], ComponentLifecycleChangedEvent)
+    assert stop_relevant_events[0].current == ComponentLifecycleState.STOPPING
+    assert isinstance(stop_relevant_events[1], ConnectionClosedEvent)
+    assert isinstance(stop_relevant_events[2], ComponentLifecycleChangedEvent)
+    assert stop_relevant_events[2].current == ComponentLifecycleState.STOPPED
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_spawned_stop_from_bytes_handler_defers_close_until_handler_returns() -> (
+    None
+):
+    class SpawnStopFromBytesHandler:
+        def __init__(self) -> None:
+            self.receiver: AsyncioUdpReceiver | None = None
+            self.bytes_seen = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.stop_returned = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.stop_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("closed event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_seen.set()
+                return
+            if (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current
+                in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+                and not self.bytes_finished.is_set()
+            ):
+                self.error = AssertionError("lifecycle event re-entered bytes handler")
+                self.release_bytes.set()
+                return
+            if self.receiver is None or not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_seen.set()
+            try:
+                self.stop_task = asyncio.create_task(self.receiver.stop())
+                await self.stop_task
+                self.stop_returned.set()
+                if self.closed_seen.is_set():
+                    raise AssertionError("closed event was published before bytes handler returned")
+                await self.release_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_bytes.set()
+            finally:
+                self.bytes_finished.set()
+
+    port = _get_unused_udp_port()
+    handler = SpawnStopFromBytesHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=port)
+    )
+    try:
+        await receiver.start()
+        await sender.send(b"stop-from-bytes-handler")
+        await asyncio.wait_for(handler.bytes_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.stop_returned.wait(), timeout=1.0)
+        assert not handler.closed_seen.is_set()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        if handler.stop_task is not None and not handler.stop_task.done():
+            handler.stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(handler.stop_task)
+        await sender.stop()
+        await receiver.stop()
+
+    assert handler.error is None
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_inherited_handler_stop_does_not_wait_for_owner() -> None:
+    class AwaitChildStopFromBytesHandler:
+        def __init__(self) -> None:
+            self.receiver: AsyncioUdpReceiver | None = None
+            self.bytes_seen = asyncio.Event()
+            self.child_stop_returned = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.child_stop_task: asyncio.Task[None] | None = None
+            self.second_child_stop_returned = asyncio.Event()
+            self.second_child_stop_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("closed event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_seen.set()
+                return
+            if self.receiver is None or not isinstance(event, BytesReceivedEvent):
+                return
+
+            async def child_stop(returned: asyncio.Event) -> None:
+                await self.receiver.stop()
+                returned.set()
+
+            self.bytes_seen.set()
+            try:
+                self.child_stop_task = asyncio.create_task(child_stop(self.child_stop_returned))
+                await self.child_stop_task
+                self.second_child_stop_task = asyncio.create_task(
+                    child_stop(self.second_child_stop_returned)
+                )
+                await self.second_child_stop_task
+                await self.release_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_bytes.set()
+            finally:
+                self.bytes_finished.set()
+
+    port = _get_unused_udp_port()
+    handler = AwaitChildStopFromBytesHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=port)
+    )
+    try:
+        await receiver.start()
+        await sender.send(b"child-stop-from-handler")
+        await asyncio.wait_for(handler.bytes_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.child_stop_returned.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.second_child_stop_returned.wait(), timeout=1.0)
+        assert not handler.closed_seen.is_set()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        if handler.child_stop_task is not None and not handler.child_stop_task.done():
+            handler.child_stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(handler.child_stop_task)
+        if handler.second_child_stop_task is not None and not handler.second_child_stop_task.done():
+            handler.second_child_stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(handler.second_child_stop_task)
+        await sender.stop()
+        await receiver.stop()
+
+    assert handler.error is None
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_handler_origin_stop_drops_queued_background_bytes_before_terminal_events() -> (
+    None
+):
+    class StopFromFirstBytesHandler:
+        def __init__(self) -> None:
+            self.receiver: AsyncioUdpReceiver | None = None
+            self.first_bytes_seen = asyncio.Event()
+            self.first_bytes_finished = asyncio.Event()
+            self.allow_stop_to_start = asyncio.Event()
+            self.allow_first_bytes_to_finish = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.stop_returned = asyncio.Event()
+            self.events: list[object] = []
+            self.stop_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            self.events.append(event)
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.first_bytes_finished.is_set():
+                    self.error = AssertionError("closed event re-entered bytes handler")
+                    self.allow_first_bytes_to_finish.set()
+                self.closed_seen.set()
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            if event.data == b"second":
+                self.error = AssertionError("queued bytes event was delivered after receiver stop")
+                self.allow_first_bytes_to_finish.set()
+                return
+            self.first_bytes_seen.set()
+            try:
+                await self.allow_stop_to_start.wait()
+                if self.receiver is None:
+                    raise AssertionError("receiver reference was not attached")
+                self.stop_task = asyncio.create_task(self.receiver.stop())
+                await self.stop_task
+                self.stop_returned.set()
+                await self.allow_first_bytes_to_finish.wait()
+            except BaseException as error:
+                self.error = error
+                self.allow_first_bytes_to_finish.set()
+            finally:
+                self.first_bytes_finished.set()
+
+    port = _get_unused_udp_port()
+    handler = StopFromFirstBytesHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=port)
+    )
+    try:
+        await receiver.start()
+        await sender.send(b"first")
+        await asyncio.wait_for(handler.first_bytes_seen.wait(), timeout=1.0)
+        await sender.send(b"second")
+        await wait_for_condition(
+            lambda: receiver._event_dispatcher.runtime_stats.queue_depth == 1,  # type: ignore[attr-defined]
+            timeout_seconds=1.0,
+        )
+
+        handler.allow_stop_to_start.set()
+        await asyncio.wait_for(handler.stop_returned.wait(), timeout=1.0)
+        handler.allow_first_bytes_to_finish.set()
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+    finally:
+        handler.allow_stop_to_start.set()
+        handler.allow_first_bytes_to_finish.set()
+        if handler.stop_task is not None and not handler.stop_task.done():
+            handler.stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(handler.stop_task)
+        await sender.stop()
+        await receiver.stop()
+
+    assert handler.error is None
+    assert [event.data for event in handler.events if isinstance(event, BytesReceivedEvent)] == [
+        b"first"
+    ]
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_external_inline_stop_waits_for_active_bytes_handler() -> None:
+    class BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.terminal_event_seen = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.events: list[object] = []
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            self.events.append(event)
+            if isinstance(event, BytesReceivedEvent):
+                self.bytes_started.set()
+                try:
+                    await self.release_bytes.wait()
+                finally:
+                    self.bytes_finished.set()
+                return
+            if isinstance(event, ConnectionClosedEvent) or (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current
+                in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            ):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("terminal event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.terminal_event_seen.set()
+
+    port = _get_unused_udp_port()
+    handler = BlockingBytesHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=port)
+    )
+    stop_task: asyncio.Task[None] | None = None
+    try:
+        await receiver.start()
+        await sender.send(b"external-inline-stop")
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+
+        stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not handler.terminal_event_seen.is_set()
+        assert not handler.bytes_finished.is_set()
+        assert not stop_task.done()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(stop_task, timeout=1.0)
+        await asyncio.wait_for(handler.terminal_event_seen.wait(), timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(stop_task)
+        await sender.stop()
+        await receiver.stop()
+
+    assert handler.error is None
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_cancelled_external_inline_stop_keeps_shared_waiter() -> None:
+    class BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.terminal_event_seen = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, BytesReceivedEvent):
+                self.bytes_started.set()
+                try:
+                    await self.release_bytes.wait()
+                finally:
+                    self.bytes_finished.set()
+                return
+            if isinstance(event, ConnectionClosedEvent) or (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current
+                in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+            ):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("terminal event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.terminal_event_seen.set()
+
+    port = _get_unused_udp_port()
+    handler = BlockingBytesHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    sender = AsyncioUdpSender(
+        settings=UdpSenderSettings(default_host="127.0.0.1", default_port=port)
+    )
+    stop_task: asyncio.Task[None] | None = None
+    joiner_stop_task: asyncio.Task[None] | None = None
+    try:
+        await receiver.start()
+        await sender.send(b"cancel-external-inline-stop")
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+
+        stop_task = asyncio.create_task(receiver.stop())
+        await wait_for_condition(
+            lambda: receiver.lifecycle_state == ComponentLifecycleState.STOPPING,
+            timeout_seconds=1.0,
+        )
+        assert not handler.terminal_event_seen.is_set()
+
+        stop_task.cancel()
+        await assert_awaitable_cancelled(stop_task)
+
+        joiner_stop_task = asyncio.create_task(receiver.stop())
+        await asyncio.sleep(0)
+        assert not joiner_stop_task.done()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(joiner_stop_task, timeout=1.0)
+        await asyncio.wait_for(handler.terminal_event_seen.wait(), timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(stop_task)
+        if joiner_stop_task is not None and not joiner_stop_task.done():
+            joiner_stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(joiner_stop_task)
+        await sender.stop()
+        await receiver.stop()
+
+    assert handler.error is None
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 

@@ -198,7 +198,13 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         should_stop_dispatcher = False
         await_supervisor_completion_only = False
         skip_await_supervisor = False
+        stop_called_from_supervisor = False
+        cancel_supervisor_after_local_cleanup = False
         stop_waiter: asyncio.Future[None] | None = None
+        deferred_close_waiters: tuple[asyncio.Future[None], ...] = ()
+        stop_waiter_completion_deferred = False
+        active_inline_handler_stop = False
+        defer_stop_events = False
         owns_stop = False
         current_task = asyncio.current_task()
         async with self._state_lock:
@@ -234,7 +240,9 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     self._supervisor_task = None
                     supervisor_task = None
                 else:
-                    await_supervisor_completion_only = supervisor_task is not None
+                    await_supervisor_completion_only = (
+                        supervisor_task is not None and supervisor_task is not current_task
+                    )
                 should_stop_dispatcher = self._event_dispatcher.is_running
             elif owns_stop and self._lifecycle_state == ComponentLifecycleState.STOPPED:
                 supervisor_task = self._supervisor_task
@@ -242,80 +250,156 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     self._supervisor_task = None
                     supervisor_task = None
                 else:
-                    await_supervisor_completion_only = supervisor_task is not None
+                    await_supervisor_completion_only = (
+                        supervisor_task is not None and supervisor_task is not current_task
+                    )
                 should_stop_dispatcher = self._event_dispatcher.is_running
             elif owns_stop:
                 stopping_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPING)
                 supervisor_task = self._supervisor_task
                 self._supervisor_task = None
+                connection = self._connection
+                connection_startup_in_progress = self._starting_connection is not None or (
+                    connection is not None and connection._opening_event_task is not None
+                )
+                stop_called_from_supervisor = (
+                    supervisor_task is not None and current_task is supervisor_task
+                )
+                handler_originated_stop = (
+                    self._event_dispatcher.current_task_is_dispatching_handler()
+                    or self._event_dispatcher.current_task_has_handler_origin_context()
+                    or self._event_dispatcher.current_task_inherits_handler_origin_context()
+                )
+                active_inline_handler_stop = (
+                    not handler_originated_stop
+                    and self._event_dispatcher.has_active_handler_context()
+                    and self._event_dispatcher.current_task_would_deliver_inline()
+                )
+                defer_stop_events = handler_originated_stop or active_inline_handler_stop
                 should_stop_dispatcher = True
-                skip_await_supervisor = (
-                    current_task is not None
-                    and self._event_dispatcher.current_task_is_worker()
-                    and supervisor_task is not None
+                skip_await_supervisor = supervisor_task is not None and (
+                    stop_called_from_supervisor
+                    or (
+                        current_task is not None and self._event_dispatcher.current_task_is_worker()
+                    )
+                    or (current_task is not None and handler_originated_stop)
+                )
+                cancel_supervisor_after_local_cleanup = (
+                    supervisor_task is not None
+                    and skip_await_supervisor
+                    and not stop_called_from_supervisor
+                    and not connection_startup_in_progress
                 )
         if not owns_stop:
-            if stop_waiter is not None and not self._event_dispatcher.current_task_is_worker():
+            if stop_waiter is not None and not (
+                self._event_dispatcher.current_task_is_dispatching_handler()
+                or self._event_dispatcher.current_task_has_handler_origin_context()
+                or self._event_dispatcher.current_task_inherits_handler_origin_context()
+            ):
                 await asyncio.shield(stop_waiter)
             return
-        inline_delivery_context = (
-            self._event_dispatcher.inline_delivery_context()
-            if self._event_dispatcher.current_task_is_worker()
-            else contextlib.nullcontext()
+        handler_originated_stop = (
+            self._event_dispatcher.current_task_is_dispatching_handler()
+            or self._event_dispatcher.current_task_has_handler_origin_context()
+            or self._event_dispatcher.current_task_inherits_handler_origin_context()
         )
+        active_inline_handler_stop = (
+            not handler_originated_stop
+            and self._event_dispatcher.has_active_handler_context()
+            and self._event_dispatcher.current_task_would_deliver_inline()
+        )
+        defer_stop_events = handler_originated_stop or active_inline_handler_stop
         try:
-            with inline_delivery_context:
-                first_error: BaseException | None = None
+            first_error: BaseException | None = None
+            if not defer_stop_events:
                 try:
                     await self._emit_lifecycle_event(stopping_event)
                 except (Exception, asyncio.CancelledError) as error:
                     first_error = error
-                try:
-                    if supervisor_task is not None and not skip_await_supervisor:
+            try:
+                if supervisor_task is not None and not skip_await_supervisor:
+                    try:
+                        if not await_supervisor_completion_only:
+                            supervisor_task.cancel()
+                        await await_task_completion_preserving_cancellation(
+                            cast(asyncio.Task[object], supervisor_task)
+                        )
+                    finally:
+                        if self._supervisor_task is supervisor_task:
+                            self._supervisor_task = None
+            except (Exception, asyncio.CancelledError) as error:
+                if first_error is None:
+                    first_error = error
+            try:
+                # A cancelled supervisor wait must not skip local resource cleanup.
+                # Preserve the first error, finish teardown, then re-raise below.
+                await self._stop_heartbeat_sender()
+                deferred_close_waiters = await self._close_current_connection()
+                if cancel_supervisor_after_local_cleanup and supervisor_task is not None:
+                    supervisor_task.cancel()
+            except (Exception, asyncio.CancelledError) as error:
+                if first_error is None:
+                    first_error = error
+            if should_stop_dispatcher:
+                async with self._state_lock:
+                    if self._lifecycle_state == ComponentLifecycleState.STOPPING:
+                        stopped_event = self._apply_lifecycle_state(ComponentLifecycleState.STOPPED)
+                if defer_stop_events:
+                    if first_error is None:
                         try:
-                            if not await_supervisor_completion_only:
-                                supervisor_task.cancel()
-                            await await_task_completion_preserving_cancellation(
+                            await self._event_dispatcher.stop_from_handler_origin()
+                        except (Exception, asyncio.CancelledError) as error:
+                            first_error = error
+                    if first_error is None:
+                        self._complete_stop_waiter_after_deferred_stop_events(
+                            stop_waiter=stop_waiter,
+                            stopping_event=stopping_event,
+                            stopped_event=stopped_event,
+                            deferred_close_waiters=deferred_close_waiters,
+                            supervisor_task=(
                                 cast(asyncio.Task[object], supervisor_task)
-                            )
-                        finally:
-                            if self._supervisor_task is supervisor_task:
-                                self._supervisor_task = None
-                except (Exception, asyncio.CancelledError) as error:
-                    if first_error is None:
-                        first_error = error
-                try:
-                    # A cancelled supervisor wait must not skip local resource cleanup.
-                    # Preserve the first error, finish teardown, then re-raise below.
-                    await self._stop_heartbeat_sender()
-                    await self._close_current_connection()
-                    if (
-                        supervisor_task is not None
-                        and skip_await_supervisor
-                        and not await_supervisor_completion_only
-                    ):
-                        supervisor_task.cancel()
-                except (Exception, asyncio.CancelledError) as error:
-                    if first_error is None:
-                        first_error = error
-                if should_stop_dispatcher:
-                    async with self._state_lock:
-                        if self._lifecycle_state == ComponentLifecycleState.STOPPING:
-                            stopped_event = self._apply_lifecycle_state(
-                                ComponentLifecycleState.STOPPED
-                            )
+                                if supervisor_task is not None
+                                and supervisor_task is not current_task
+                                else None
+                            ),
+                            stop_dispatcher=True,
+                        )
+                        stop_waiter_completion_deferred = True
+                else:
                     if first_error is None:
                         try:
                             await self._emit_lifecycle_event(stopped_event)
                         except (Exception, asyncio.CancelledError) as error:
                             first_error = error
+                if not defer_stop_events:
                     try:
                         await self._event_dispatcher.stop()
                     except (Exception, asyncio.CancelledError) as error:
                         if first_error is None:
                             first_error = error
-                if first_error is not None:
-                    raise first_error
+            elif defer_stop_events and first_error is None:
+                self._complete_stop_waiter_after_deferred_stop_events(
+                    stop_waiter=stop_waiter,
+                    stopping_event=stopping_event,
+                    stopped_event=None,
+                    deferred_close_waiters=deferred_close_waiters,
+                    supervisor_task=(
+                        cast(asyncio.Task[object], supervisor_task)
+                        if supervisor_task is not None and supervisor_task is not current_task
+                        else None
+                    ),
+                    stop_dispatcher=False,
+                )
+                stop_waiter_completion_deferred = True
+            if (
+                active_inline_handler_stop
+                and first_error is None
+                and stop_waiter is not None
+                and not stop_waiter.done()
+            ):
+                await asyncio.shield(stop_waiter)
+            if first_error is not None:
+                raise first_error
         except (Exception, asyncio.CancelledError) as error:
             if stop_waiter is not None and not stop_waiter.done():
                 stop_waiter.set_exception(error)
@@ -324,12 +408,21 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
             raise
         else:
             if stop_waiter is not None and not stop_waiter.done():
-                stop_waiter.set_result(None)
+                if stop_waiter_completion_deferred:
+                    pass
+                elif defer_stop_events and deferred_close_waiters:
+                    self._complete_stop_waiter_after_deferred_closes(
+                        stop_waiter, deferred_close_waiters
+                    )
+                    stop_waiter_completion_deferred = True
+                else:
+                    stop_waiter.set_result(None)
         finally:
-            async with self._state_lock:
-                if self._stop_waiter is stop_waiter:
-                    self._stop_waiter = None
-                    self._stop_owner_task = None
+            if not stop_waiter_completion_deferred:
+                async with self._state_lock:
+                    if self._stop_waiter is stop_waiter:
+                        self._stop_waiter = None
+                        self._stop_owner_task = None
         self._logger.debug("TCP client stopped.")
 
     async def __aenter__(self) -> AsyncioTcpClient:
@@ -474,12 +567,13 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         self._heartbeat_sender = None
         await stop_heartbeat_sender(sender=sender, logger=self._logger)
 
-    async def _close_current_connection(self) -> None:
+    async def _close_current_connection(self) -> tuple[asyncio.Future[None], ...]:
         """Detach and close the current or startup-pending connection, if one is tracked."""
         connection = self._connection
         starting_connection = self._starting_connection
         self._starting_connection = None
         close_targets: list[AsyncioTcpConnection] = []
+        deferred_close_waiters: list[asyncio.Future[None]] = []
         for candidate in (starting_connection, connection):
             if (
                 candidate is not None
@@ -490,11 +584,94 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         try:
             for target in close_targets:
                 await target.close()
+                if waiter := target._pending_deferred_close_waiter():
+                    deferred_close_waiters.append(waiter)
+                elif (
+                    not target._closed_event_published
+                    and (
+                        self._event_dispatcher.has_active_handler_context(target.connection_id)
+                        or self._event_dispatcher.current_task_inherits_handler_origin_context(
+                            target.connection_id
+                        )
+                    )
+                    and (waiter := await target._ensure_deferred_close_publication_waiter())
+                ):
+                    deferred_close_waiters.append(waiter)
         finally:
             if self._connection is connection or self._connection is starting_connection:
                 self._connection = None
             self._connection_closed_event.set()
             self._notify_status_changed()
+        return tuple(deferred_close_waiters)
+
+    def _complete_stop_waiter_after_deferred_stop_events(
+        self,
+        *,
+        stop_waiter: asyncio.Future[None] | None,
+        stopping_event: ComponentLifecycleChangedEvent | None,
+        stopped_event: ComponentLifecycleChangedEvent | None,
+        deferred_close_waiters: tuple[asyncio.Future[None], ...],
+        supervisor_task: asyncio.Task[object] | None,
+        stop_dispatcher: bool,
+    ) -> None:
+        """Publish terminal stop events after a handler-originated stop unwinds."""
+
+        async def _complete() -> None:
+            try:
+                while self._event_dispatcher.has_active_handler_context():
+                    await asyncio.sleep(0)
+                with self._event_dispatcher.inline_delivery_context():
+                    await self._emit_lifecycle_event(stopping_event)
+                    if deferred_close_waiters:
+                        await asyncio.gather(
+                            *(asyncio.shield(waiter) for waiter in deferred_close_waiters)
+                        )
+                    if supervisor_task is not None:
+                        await await_task_completion_preserving_cancellation(supervisor_task)
+                    await self._emit_lifecycle_event(stopped_event)
+                if stop_dispatcher:
+                    await self._event_dispatcher.stop()
+            except BaseException as error:
+                if stop_waiter is not None and not stop_waiter.done():
+                    stop_waiter.set_exception(error)
+                    with contextlib.suppress(BaseException):
+                        stop_waiter.exception()
+            else:
+                if stop_waiter is not None and not stop_waiter.done():
+                    stop_waiter.set_result(None)
+            finally:
+                async with self._state_lock:
+                    if self._stop_waiter is stop_waiter:
+                        self._stop_waiter = None
+                        self._stop_owner_task = None
+
+        _ = asyncio.create_task(_complete())
+
+    def _complete_stop_waiter_after_deferred_closes(
+        self,
+        stop_waiter: asyncio.Future[None],
+        deferred_close_waiters: tuple[asyncio.Future[None], ...],
+    ) -> None:
+        """Release external stop waiters after handler-originated deferred close publication."""
+
+        async def _complete() -> None:
+            try:
+                await asyncio.gather(*(asyncio.shield(waiter) for waiter in deferred_close_waiters))
+            except BaseException as error:
+                if not stop_waiter.done():
+                    stop_waiter.set_exception(error)
+                    with contextlib.suppress(BaseException):
+                        stop_waiter.exception()
+            else:
+                if not stop_waiter.done():
+                    stop_waiter.set_result(None)
+            finally:
+                async with self._state_lock:
+                    if self._stop_waiter is stop_waiter:
+                        self._stop_waiter = None
+                        self._stop_owner_task = None
+
+        _ = asyncio.create_task(_complete())
 
     async def _on_connection_closed(self, connection: AsyncioTcpConnection) -> None:
         """Detach the closed connection, notify waiters, and stop heartbeats."""

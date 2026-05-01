@@ -61,6 +61,11 @@ the semantic test suite:
 
 - Once `stop()` returns with state `STOPPED`, no further user callback is
   invoked from the component's internal tasks.
+  Exception: when `stop()` is awaited from the currently running connection
+  event handler for the same connection event stream, the corresponding
+  deferred `ConnectionClosedEvent` is published immediately after that handler
+  unwinds. This avoids self-deadlock while preserving non-overlapping
+  per-connection event execution.
 - Startup cancellation must roll back partial resources and leave the component
   in the same terminal `STOPPED` state as other startup failures.
 - `STOPPING` is a terminal-in-progress state, not a re-entrant steady state:
@@ -96,6 +101,9 @@ async def on_event(self, event: NetworkEvent) -> None:
   `ConnectionClosedEvent` is emitted.
 - Re-entrant shutdown requests from callbacks/handlers must converge safely on
   the same close or stop operation.
+- Shutdown requested from inside a connection event handler defers
+  `ConnectionClosedEvent` until that handler has returned, so close publication
+  never re-enters the same connection event stream.
 - Handler failures remain observable: depending on the configured failure
   policy they either surface as `NetworkErrorEvent`, as
   `HandlerFailurePolicyStopEvent`, or as an inline exception in the caller.
