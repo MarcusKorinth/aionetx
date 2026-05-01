@@ -766,7 +766,7 @@ async def test_tcp_connection_inline_close_from_bytes_handler_defers_closed_even
                 if self.closed_started.is_set():
                     raise AssertionError("closed event was published before bytes handler returned")
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_bytes.set()
             finally:
@@ -852,7 +852,7 @@ async def test_tcp_connection_background_direct_close_from_bytes_handler_defers_
                 if self.closed_seen.is_set():
                     raise AssertionError("closed event was published before bytes handler returned")
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_bytes.set()
             finally:
@@ -1002,7 +1002,7 @@ async def test_tcp_connection_background_deferred_close_drops_queued_same_connec
                 await self.close_task
                 self.close_returned.set()
                 await self.release_first_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_first_bytes.set()
 
@@ -1173,7 +1173,7 @@ async def test_tcp_connection_inline_reentrant_close_returns_while_external_clos
                 await self.connection.close()
                 self.reentrant_close_returned.set()
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_bytes.set()
 
@@ -1257,7 +1257,7 @@ async def test_tcp_connection_external_close_joiner_waits_for_deferred_close_eve
                 await self.handler_close_task
                 self.handler_close_returned.set()
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_callback.set()
                 self.release_bytes.set()

@@ -393,10 +393,10 @@ class AsyncioTcpServer(TcpServerProtocol):
         async def _complete() -> None:
             try:
                 await asyncio.gather(*(asyncio.shield(waiter) for waiter in deferred_close_waiters))
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if not stop_waiter.done():
@@ -430,10 +430,10 @@ class AsyncioTcpServer(TcpServerProtocol):
                         )
                     await self._emit_lifecycle_event(stopped_event)
                 await self._event_dispatcher.stop()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if stop_waiter is not None and not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if stop_waiter is not None and not stop_waiter.done():

@@ -2117,13 +2117,13 @@ async def test_stop_component_callback_awaited_child_does_not_inherit_stop_autho
             stop_task = asyncio.create_task(dispatcher.stop())
             await asyncio.sleep(0)
             if stop_task.done():
-                await stop_task
+                stop_task.result()
                 child_stop_finished.set()
                 return
             child_stop_blocked.set()
             stop_task.cancel()
             with contextlib.suppress(Exception, asyncio.CancelledError):
-                await stop_task
+                await asyncio.wait_for(stop_task, timeout=1.0)
             child_stop_finished.set()
 
         await asyncio.create_task(child_stop())

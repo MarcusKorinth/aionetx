@@ -311,7 +311,7 @@ async def test_opened_handler_can_stop_client_without_overlapping_connection_eve
                 assert self.client.lifecycle_state == ComponentLifecycleState.STOPPED
                 assert self.client.connection is None
                 assert self.client._starting_connection is None
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.stop_error = error
             finally:
                 if is_connection_event:
@@ -390,7 +390,7 @@ async def test_client_opened_handler_can_observe_active_connection(
                 assert connection is not None
                 observed = await self.client.wait_until_connected(timeout_seconds=1.0)
                 assert observed is connection
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
             finally:
                 self.opened_checked.set()
@@ -463,7 +463,7 @@ async def test_external_client_stop_waits_for_handler_owned_deferred_close() -> 
                 await self.client.stop()
                 self.handler_stop_returned.set()
                 await self.allow_opened_to_finish.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
             finally:
                 if isinstance(event, ConnectionOpenedEvent):
@@ -568,7 +568,7 @@ async def test_opened_handler_spawned_client_stop_task_does_not_overlap_connecti
                 assert self.max_active_connection_handlers == 1
                 assert self.client.lifecycle_state == ComponentLifecycleState.STOPPED
                 assert self.client.connection is None
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.stop_error = error
             finally:
                 if is_connection_event:
@@ -655,7 +655,7 @@ async def test_opened_handler_can_stop_server_without_overlapping_connection_eve
                 assert self.max_active_connection_handlers == 1
                 assert self.server.lifecycle_state == ComponentLifecycleState.STOPPED
                 assert self.server.connections == ()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.stop_error = error
             finally:
                 if is_connection_event:
@@ -749,7 +749,7 @@ async def test_opened_handler_spawned_server_stop_task_does_not_overlap_connecti
                 assert self.max_active_connection_handlers == 1
                 assert self.server.lifecycle_state == ComponentLifecycleState.STOPPED
                 assert self.server.connections == ()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.stop_error = error
             finally:
                 if is_connection_event:
@@ -837,7 +837,7 @@ async def test_external_server_stop_waits_for_handler_owned_deferred_close() -> 
                 await self.server.stop()
                 self.handler_stop_returned.set()
                 await self.allow_opened_to_finish.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
             finally:
                 if isinstance(event, ConnectionOpenedEvent):
@@ -925,7 +925,7 @@ async def test_inline_attempt_started_handler_can_stop_client_before_socket_open
                 raise AssertionError("client reference was not attached")
             try:
                 await self.client.stop()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.stop_error = error
             finally:
                 self.stop_returned.set()
@@ -1230,7 +1230,7 @@ async def test_spawned_server_stop_preserves_close_events_for_two_real_clients()
                 if event.resource_id in self.closed_ids:
                     raise AssertionError("origin close event was published before handler returned")
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_bytes.set()
             finally:

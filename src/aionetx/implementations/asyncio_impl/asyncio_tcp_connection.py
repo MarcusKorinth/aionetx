@@ -600,7 +600,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
                 except asyncio.CancelledError:
                     caller_cancelled = True
                     if publish_task.done():
-                        result = publish_task.result()
+                        publish_task.result()
                         break
                     continue
         finally:

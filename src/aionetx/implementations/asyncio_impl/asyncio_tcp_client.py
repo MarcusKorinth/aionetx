@@ -270,12 +270,6 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     or self._event_dispatcher.current_task_has_handler_origin_context()
                     or self._event_dispatcher.current_task_inherits_handler_origin_context()
                 )
-                active_inline_handler_stop = (
-                    not handler_originated_stop
-                    and self._event_dispatcher.has_active_handler_context()
-                    and self._event_dispatcher.current_task_would_deliver_inline()
-                )
-                defer_stop_events = handler_originated_stop or active_inline_handler_stop
                 should_stop_dispatcher = True
                 skip_await_supervisor = supervisor_task is not None and (
                     stop_called_from_supervisor
@@ -631,10 +625,10 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     await self._emit_lifecycle_event(stopped_event)
                 if stop_dispatcher:
                     await self._event_dispatcher.stop()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if stop_waiter is not None and not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if stop_waiter is not None and not stop_waiter.done():
@@ -657,10 +651,10 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         async def _complete() -> None:
             try:
                 await asyncio.gather(*(asyncio.shield(waiter) for waiter in deferred_close_waiters))
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if not stop_waiter.done():

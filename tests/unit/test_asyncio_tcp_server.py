@@ -512,7 +512,7 @@ async def test_server_handler_origin_stop_drops_queued_background_bytes() -> Non
                 await self.server.stop()
                 self.stop_returned.set()
                 await self.allow_first_to_finish.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.allow_first_to_finish.set()
 
@@ -597,7 +597,7 @@ async def test_server_spawned_handler_stop_preserves_close_events_for_all_connec
                 self.stop_task = asyncio.create_task(child_stop())
                 await self.stop_task
                 await self.allow_first_to_finish.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.allow_first_to_finish.set()
             finally:

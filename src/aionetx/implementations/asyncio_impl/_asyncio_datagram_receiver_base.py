@@ -479,10 +479,10 @@ class _AsyncioDatagramReceiverBase:
         async def _complete() -> None:
             try:
                 await asyncio.shield(deferred_close_waiter)
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if not stop_waiter.done():
@@ -506,7 +506,7 @@ class _AsyncioDatagramReceiverBase:
             try:
                 try:
                     await asyncio.shield(deferred_close_waiter)
-                except BaseException as error:
+                except (Exception, asyncio.CancelledError) as error:
                     first_error = error
                 try:
                     await self._publish_stopped_transition_if_needed(
@@ -523,10 +523,10 @@ class _AsyncioDatagramReceiverBase:
                             first_error = error
                 if first_error is not None:
                     raise first_error
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if stop_waiter is not None and not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if stop_waiter is not None and not stop_waiter.done():
@@ -577,10 +577,10 @@ class _AsyncioDatagramReceiverBase:
                             first_error = error
                 if first_error is not None:
                     raise first_error
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 if stop_waiter is not None and not stop_waiter.done():
                     stop_waiter.set_exception(error)
-                    with contextlib.suppress(BaseException):
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         stop_waiter.exception()
             else:
                 if stop_waiter is not None and not stop_waiter.done():
@@ -745,7 +745,7 @@ class _AsyncioDatagramReceiverBase:
                 except asyncio.CancelledError:
                     caller_cancelled = True
                     if publish_task.done():
-                        result = publish_task.result()
+                        publish_task.result()
                         break
                     continue
         finally:

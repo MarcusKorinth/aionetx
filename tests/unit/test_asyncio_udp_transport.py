@@ -135,7 +135,7 @@ class SpawnStopOnOpenedHandler:
             if self.closed_seen.is_set():
                 raise AssertionError("closed event was published before opened handler returned")
             await self.release_opened.wait()
-        except BaseException as error:
+        except (Exception, asyncio.CancelledError) as error:
             self.error = error
             self.release_opened.set()
         finally:
@@ -1181,7 +1181,7 @@ async def test_udp_receiver_spawned_stop_from_bytes_handler_defers_close_until_h
                 if self.closed_seen.is_set():
                     raise AssertionError("closed event was published before bytes handler returned")
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_bytes.set()
             finally:
@@ -1261,7 +1261,7 @@ async def test_udp_receiver_inherited_handler_stop_does_not_wait_for_owner() -> 
                 )
                 await self.second_child_stop_task
                 await self.release_bytes.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.release_bytes.set()
             finally:
@@ -1346,7 +1346,7 @@ async def test_udp_receiver_handler_origin_stop_drops_queued_background_bytes_be
                 await self.stop_task
                 self.stop_returned.set()
                 await self.allow_first_bytes_to_finish.wait()
-            except BaseException as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.error = error
                 self.allow_first_bytes_to_finish.set()
             finally:
