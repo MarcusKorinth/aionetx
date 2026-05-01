@@ -41,6 +41,8 @@ async def connect_once(
     on_closed_callback: Callable[["AsyncioTcpConnection"], Awaitable[None] | None],
     logger: logging.Logger | logging.LoggerAdapter[logging.Logger],
     component_id: str,
+    on_connection_created: Callable[["AsyncioTcpConnection"], None] | None = None,
+    on_connection_ready: Callable[["AsyncioTcpConnection"], Awaitable[None] | None] | None = None,
 ) -> "AsyncioTcpConnection":
     """
     Open one TCP session and return an initialized connection object.
@@ -74,7 +76,10 @@ async def connect_once(
         receive_buffer_size=settings.receive_buffer_size,
         on_closed_callback=on_closed_callback,
         send_timeout_seconds=settings.connection_send_timeout_seconds,
+        on_ready_callback=on_connection_ready,
     )
+    if on_connection_created is not None:
+        on_connection_created(connection)
     try:
         await connection.start()
     except (Exception, asyncio.CancelledError):

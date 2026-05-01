@@ -18,7 +18,8 @@ import pytest
 
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
-from aionetx.api.connection_events import ConnectionRejectedEvent
+from aionetx.api.bytes_received_event import BytesReceivedEvent
+from aionetx.api.connection_events import ConnectionClosedEvent, ConnectionRejectedEvent
 from aionetx.api.heartbeat import TcpHeartbeatSettings
 from aionetx.api.errors import HeartbeatConfigurationError
 from aionetx.api.heartbeat import HeartbeatRequest
@@ -480,6 +481,195 @@ async def test_server_concurrent_stop_waits_for_active_teardown(
     await asyncio.gather(first_stop, second_stop)
 
     assert blocking.close_attempts == 1
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_server_handler_origin_stop_drops_queued_background_bytes() -> None:
+    class StopServerFromFirstBytes:
+        def __init__(self) -> None:
+            self.server: AsyncioTcpServer | None = None
+            self.first_seen = asyncio.Event()
+            self.allow_stop_to_start = asyncio.Event()
+            self.stop_returned = asyncio.Event()
+            self.allow_first_to_finish = asyncio.Event()
+            self.events: list[object] = []
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            self.events.append(event)
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            if event.data == b"second":
+                self.error = AssertionError("queued bytes event was delivered after server stop")
+                self.allow_first_to_finish.set()
+                return
+            self.first_seen.set()
+            try:
+                await self.allow_stop_to_start.wait()
+                if self.server is None:
+                    raise AssertionError("server reference was not attached")
+                await self.server.stop()
+                self.stop_returned.set()
+                await self.allow_first_to_finish.wait()
+            except (Exception, asyncio.CancelledError) as error:
+                self.error = error
+                self.allow_first_to_finish.set()
+
+    handler = StopServerFromFirstBytes()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12348,
+            max_connections=64,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.server = server
+    server._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    await server._event_dispatcher.start()  # type: ignore[attr-defined]
+    try:
+        await server._event_dispatcher.emit(  # type: ignore[attr-defined]
+            BytesReceivedEvent(resource_id="server:queued-stop:1", data=b"first")
+        )
+        await asyncio.wait_for(handler.first_seen.wait(), timeout=1.0)
+        await server._event_dispatcher.emit(  # type: ignore[attr-defined]
+            BytesReceivedEvent(resource_id="server:queued-stop:1", data=b"second")
+        )
+        await wait_for_condition(
+            lambda: server._event_dispatcher.runtime_stats.queue_depth == 1,  # type: ignore[attr-defined]
+            timeout_seconds=1.0,
+        )
+
+        handler.allow_stop_to_start.set()
+        await asyncio.wait_for(handler.stop_returned.wait(), timeout=1.0)
+        assert server._event_dispatcher.runtime_stats.queue_depth == 0  # type: ignore[attr-defined]
+    finally:
+        handler.allow_stop_to_start.set()
+        handler.allow_first_to_finish.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(server.stop(), timeout=1.0)
+
+    assert handler.error is None
+    assert [event.data for event in handler.events if isinstance(event, BytesReceivedEvent)] == [
+        b"first"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_spawned_handler_stop_preserves_close_events_for_all_connections() -> None:
+    class SpawnStopFromFirstBytes:
+        def __init__(self) -> None:
+            self.server: AsyncioTcpServer | None = None
+            self.first_seen = asyncio.Event()
+            self.allow_stop_to_start = asyncio.Event()
+            self.stop_returned = asyncio.Event()
+            self.allow_first_to_finish = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.closed_ids: list[str] = []
+            self.origin_connection_id: str | None = None
+            self.stop_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if (
+                    event.resource_id == self.origin_connection_id
+                    and not self.bytes_finished.is_set()
+                ):
+                    self.error = AssertionError("origin close event re-entered bytes handler")
+                    self.allow_first_to_finish.set()
+                self.closed_ids.append(event.resource_id)
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+
+            async def child_stop() -> None:
+                if self.server is None:
+                    raise AssertionError("server reference was not attached")
+                await self.server.stop()
+                self.stop_returned.set()
+
+            self.first_seen.set()
+            try:
+                await self.allow_stop_to_start.wait()
+                self.stop_task = asyncio.create_task(child_stop())
+                await self.stop_task
+                await self.allow_first_to_finish.wait()
+            except (Exception, asyncio.CancelledError) as error:
+                self.error = error
+                self.allow_first_to_finish.set()
+            finally:
+                self.bytes_finished.set()
+
+    handler = SpawnStopFromFirstBytes()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12348,
+            max_connections=64,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.server = server
+    origin_connection = AsyncioTcpConnection(
+        "server:spawned-stop:origin",
+        ConnectionRole.SERVER,
+        asyncio.StreamReader(),
+        _FakeWriter(),  # type: ignore[arg-type]
+        server._event_dispatcher,  # type: ignore[attr-defined]
+        receive_buffer_size=4096,
+    )
+    sibling_connection = AsyncioTcpConnection(
+        "server:spawned-stop:sibling",
+        ConnectionRole.SERVER,
+        asyncio.StreamReader(),
+        _FakeWriter(),  # type: ignore[arg-type]
+        server._event_dispatcher,  # type: ignore[attr-defined]
+        receive_buffer_size=4096,
+    )
+    handler.origin_connection_id = origin_connection.connection_id
+    origin_connection._state = ConnectionState.CONNECTED  # type: ignore[attr-defined]
+    sibling_connection._state = ConnectionState.CONNECTED  # type: ignore[attr-defined]
+    server._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    server._connections = {  # type: ignore[attr-defined]
+        origin_connection.connection_id: origin_connection,
+        sibling_connection.connection_id: sibling_connection,
+    }
+    await server._event_dispatcher.start()  # type: ignore[attr-defined]
+    try:
+        await server._event_dispatcher.emit(  # type: ignore[attr-defined]
+            BytesReceivedEvent(resource_id=origin_connection.connection_id, data=b"first")
+        )
+        await asyncio.wait_for(handler.first_seen.wait(), timeout=1.0)
+
+        handler.allow_stop_to_start.set()
+        await asyncio.wait_for(handler.stop_returned.wait(), timeout=1.0)
+        assert origin_connection.connection_id not in handler.closed_ids
+        handler.allow_first_to_finish.set()
+        await wait_for_condition(
+            lambda: (
+                set(handler.closed_ids)
+                == {origin_connection.connection_id, sibling_connection.connection_id}
+            ),
+            timeout_seconds=1.0,
+        )
+    finally:
+        handler.allow_stop_to_start.set()
+        handler.allow_first_to_finish.set()
+        if handler.stop_task is not None and not handler.stop_task.done():
+            handler.stop_task.cancel()
+            await drain_awaitable_ignoring_cancelled(handler.stop_task)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(server.stop(), timeout=1.0)
+
+    assert handler.error is None
+    assert set(handler.closed_ids) == {
+        origin_connection.connection_id,
+        sibling_connection.connection_id,
+    }
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
 
 

@@ -205,6 +205,11 @@ class AsyncioTcpServer(TcpServerProtocol):
         stopped_event: ComponentLifecycleChangedEvent | None = None
         should_transition_to_stopped = False
         stop_waiter: asyncio.Future[None] | None = None
+        deferred_close_waiters: tuple[asyncio.Future[None], ...] = ()
+        stop_waiter_completion_deferred = False
+        dispatcher_stopped_from_handler_origin = False
+        active_inline_handler_stop = False
+        defer_stop_events = False
         owns_stop = False
         heartbeat_senders: tuple[AsyncioHeartbeatSender, ...] = ()
         connections: tuple[AsyncioTcpConnection, ...] = ()
@@ -234,69 +239,127 @@ class AsyncioTcpServer(TcpServerProtocol):
                 self._connections.clear()
         if not owns_stop:
             if stop_waiter is not None:
-                if self._event_dispatcher.current_task_is_worker():
+                if (
+                    self._event_dispatcher.current_task_is_dispatching_handler()
+                    or self._event_dispatcher.current_task_has_handler_origin_context()
+                    or self._event_dispatcher.current_task_inherits_handler_origin_context()
+                ):
                     return
                 await asyncio.shield(stop_waiter)
             return
-        inline_delivery_context = (
-            self._event_dispatcher.inline_delivery_context()
-            if self._event_dispatcher.current_task_is_worker()
-            else contextlib.nullcontext()
+        handler_originated_stop = (
+            self._event_dispatcher.current_task_is_dispatching_handler()
+            or self._event_dispatcher.current_task_has_handler_origin_context()
+            or self._event_dispatcher.current_task_inherits_handler_origin_context()
         )
+        active_inline_handler_stop = (
+            not handler_originated_stop
+            and self._event_dispatcher.has_active_handler_context()
+            and self._event_dispatcher.current_task_would_deliver_inline()
+        )
+        defer_stop_events = handler_originated_stop or active_inline_handler_stop
         try:
-            with inline_delivery_context:
-                first_error: BaseException | None = None
+            first_error: BaseException | None = None
+            if not defer_stop_events:
                 try:
                     await self._emit_lifecycle_event(stopping_event)
                 except (Exception, asyncio.CancelledError) as error:
                     first_error = error
+            else:
                 try:
-                    if server is not None:
-                        server.close()
-                    await stop_server_heartbeat_senders(
-                        senders=heartbeat_senders,
-                        event_dispatcher=self._event_dispatcher,
-                        logger=self._logger,
-                        component_id=self._component_id,
+                    await self._event_dispatcher.stop_from_handler_origin()
+                    dispatcher_stopped_from_handler_origin = True
+                except (Exception, asyncio.CancelledError) as error:
+                    first_error = error
+            try:
+                if server is not None:
+                    server.close()
+                await stop_server_heartbeat_senders(
+                    senders=heartbeat_senders,
+                    event_dispatcher=self._event_dispatcher,
+                    logger=self._logger,
+                    component_id=self._component_id,
+                )
+                if connections:
+                    close_context = (
+                        self._event_dispatcher.inline_delivery_context()
+                        if defer_stop_events
+                        else contextlib.nullcontext()
                     )
-                    if connections:
+                    with close_context:
                         close_results = await asyncio.gather(
                             *(connection.close() for connection in connections),
                             return_exceptions=True,
                         )
-                        await report_teardown_errors(
-                            event_dispatcher=self._event_dispatcher,
-                            logger=self._logger,
-                            component_id=self._component_id,
-                            operation="TCP connection close",
-                            targets=(connection.connection_id for connection in connections),
-                            results=close_results,
-                        )
-                    if server is not None:
-                        await server.wait_closed()
-                except (Exception, asyncio.CancelledError) as error:
+                    deferred_close_waiters = await self._pending_deferred_close_waiters(connections)
+                    await report_teardown_errors(
+                        event_dispatcher=self._event_dispatcher,
+                        logger=self._logger,
+                        component_id=self._component_id,
+                        operation="TCP connection close",
+                        targets=(connection.connection_id for connection in connections),
+                        results=close_results,
+                    )
+                if server is not None:
+                    await server.wait_closed()
+            except (Exception, asyncio.CancelledError) as error:
+                if first_error is None:
+                    first_error = error
+            if should_transition_to_stopped:
+                async with self._state_lock:
+                    stopped_event = apply_stopped_transition_if_stopping(
+                        get_state=lambda: self._lifecycle_state,
+                        apply_transition=self._apply_lifecycle_state,
+                    )
+                if defer_stop_events:
                     if first_error is None:
-                        first_error = error
-                if should_transition_to_stopped:
-                    async with self._state_lock:
-                        stopped_event = apply_stopped_transition_if_stopping(
-                            get_state=lambda: self._lifecycle_state,
-                            apply_transition=self._apply_lifecycle_state,
+                        self._complete_stop_waiter_after_deferred_stop_events(
+                            stop_waiter=stop_waiter,
+                            stopping_event=stopping_event,
+                            stopped_event=stopped_event,
+                            deferred_close_waiters=deferred_close_waiters,
                         )
+                        stop_waiter_completion_deferred = True
+                else:
                     if first_error is None:
                         try:
                             await self._emit_lifecycle_event(stopped_event)
                         except (Exception, asyncio.CancelledError) as error:
                             first_error = error
+                if not defer_stop_events:
                     try:
                         await self._event_dispatcher.stop()
                     except (Exception, asyncio.CancelledError) as error:
                         if first_error is None:
                             first_error = error
-                self._notify_status_changed()
-                self._logger.debug("TCP server stopped.")
-                if first_error is not None:
-                    raise first_error
+            elif (
+                defer_stop_events
+                and first_error is None
+                and not dispatcher_stopped_from_handler_origin
+            ):
+                try:
+                    await self._event_dispatcher.stop_from_handler_origin()
+                except (Exception, asyncio.CancelledError) as error:
+                    first_error = error
+            if not should_transition_to_stopped and defer_stop_events and first_error is None:
+                self._complete_stop_waiter_after_deferred_stop_events(
+                    stop_waiter=stop_waiter,
+                    stopping_event=stopping_event,
+                    stopped_event=None,
+                    deferred_close_waiters=deferred_close_waiters,
+                )
+                stop_waiter_completion_deferred = True
+            if (
+                active_inline_handler_stop
+                and first_error is None
+                and stop_waiter is not None
+                and not stop_waiter.done()
+            ):
+                await asyncio.shield(stop_waiter)
+            self._notify_status_changed()
+            self._logger.debug("TCP server stopped.")
+            if first_error is not None:
+                raise first_error
         except (Exception, asyncio.CancelledError) as error:
             if stop_waiter is not None and not stop_waiter.done():
                 stop_waiter.set_exception(error)
@@ -305,11 +368,107 @@ class AsyncioTcpServer(TcpServerProtocol):
             raise
         else:
             if stop_waiter is not None and not stop_waiter.done():
-                stop_waiter.set_result(None)
+                if stop_waiter_completion_deferred:
+                    pass
+                elif defer_stop_events and deferred_close_waiters:
+                    self._complete_stop_waiter_after_deferred_closes(
+                        stop_waiter, deferred_close_waiters
+                    )
+                    stop_waiter_completion_deferred = True
+                else:
+                    stop_waiter.set_result(None)
         finally:
-            async with self._state_lock:
-                if self._stop_waiter is stop_waiter:
-                    self._stop_waiter = None
+            if not stop_waiter_completion_deferred:
+                async with self._state_lock:
+                    if self._stop_waiter is stop_waiter:
+                        self._stop_waiter = None
+
+    def _complete_stop_waiter_after_deferred_closes(
+        self,
+        stop_waiter: asyncio.Future[None],
+        deferred_close_waiters: tuple[asyncio.Future[None], ...],
+    ) -> None:
+        """Release external stop waiters after handler-originated deferred close publication."""
+
+        async def _complete() -> None:
+            try:
+                await asyncio.gather(*(asyncio.shield(waiter) for waiter in deferred_close_waiters))
+            except (Exception, asyncio.CancelledError) as error:
+                if not stop_waiter.done():
+                    stop_waiter.set_exception(error)
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        stop_waiter.exception()
+            else:
+                if not stop_waiter.done():
+                    stop_waiter.set_result(None)
+            finally:
+                async with self._state_lock:
+                    if self._stop_waiter is stop_waiter:
+                        self._stop_waiter = None
+
+        _ = asyncio.create_task(_complete())
+
+    def _complete_stop_waiter_after_deferred_stop_events(
+        self,
+        *,
+        stop_waiter: asyncio.Future[None] | None,
+        stopping_event: ComponentLifecycleChangedEvent | None,
+        stopped_event: ComponentLifecycleChangedEvent | None,
+        deferred_close_waiters: tuple[asyncio.Future[None], ...],
+    ) -> None:
+        """Publish terminal stop events after a handler-originated stop unwinds."""
+
+        async def _complete() -> None:
+            try:
+                while self._event_dispatcher.has_active_handler_context():
+                    await asyncio.sleep(0)
+                with self._event_dispatcher.inline_delivery_context():
+                    await self._emit_lifecycle_event(stopping_event)
+                    if deferred_close_waiters:
+                        await asyncio.gather(
+                            *(asyncio.shield(waiter) for waiter in deferred_close_waiters)
+                        )
+                    await self._emit_lifecycle_event(stopped_event)
+                await self._event_dispatcher.stop()
+            except (Exception, asyncio.CancelledError) as error:
+                if stop_waiter is not None and not stop_waiter.done():
+                    stop_waiter.set_exception(error)
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        stop_waiter.exception()
+            else:
+                if stop_waiter is not None and not stop_waiter.done():
+                    stop_waiter.set_result(None)
+            finally:
+                async with self._state_lock:
+                    if self._stop_waiter is stop_waiter:
+                        self._stop_waiter = None
+
+        _ = asyncio.create_task(_complete())
+
+    async def _pending_deferred_close_waiters(
+        self, connections: tuple[AsyncioTcpConnection, ...]
+    ) -> tuple[asyncio.Future[None], ...]:
+        """Collect or create deferred close waiters from managed TCP connections."""
+        waiters: list[asyncio.Future[None]] = []
+        for connection in connections:
+            get_waiter = getattr(connection, "_pending_deferred_close_waiter", None)
+            if get_waiter is None:
+                continue
+            if waiter := get_waiter():
+                waiters.append(waiter)
+                continue
+            if (
+                not connection._closed_event_published
+                and (
+                    self._event_dispatcher.has_active_handler_context(connection.connection_id)
+                    or self._event_dispatcher.current_task_inherits_handler_origin_context(
+                        connection.connection_id
+                    )
+                )
+                and (waiter := await connection._ensure_deferred_close_publication_waiter())
+            ):
+                waiters.append(waiter)
+        return tuple(waiters)
 
     async def __aenter__(self) -> AsyncioTcpServer:
         """Start the server and return ``self``."""

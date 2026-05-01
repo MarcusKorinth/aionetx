@@ -26,6 +26,7 @@ from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDi
 from aionetx.implementations.asyncio_impl.runtime_utils import WarningRateLimiter
 
 ConnectionClosedCallback = Callable[["AsyncioTcpConnection"], Awaitable[None] | None]
+ConnectionReadyCallback = Callable[["AsyncioTcpConnection"], Awaitable[None] | None]
 
 logger = logging.getLogger(__name__)
 _warning_limiter = WarningRateLimiter(interval_seconds=30.0)
@@ -52,6 +53,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         on_closed_callback: ConnectionClosedCallback | None = None,
         *,
         send_timeout_seconds: float | None = 30.0,
+        on_ready_callback: ConnectionReadyCallback | None = None,
     ) -> None:
         if not connection_id:
             raise ValueError("connection_id must not be empty.")
@@ -73,6 +75,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         self._idle_timeout_seconds = idle_timeout_seconds
         self._send_timeout_seconds = send_timeout_seconds
         self._on_closed_callback = on_closed_callback
+        self._on_ready_callback = on_ready_callback
         self._state = ConnectionState.CREATED
         self._metadata = self._build_metadata()
         self._read_task: asyncio.Task[None] | None = None
@@ -84,6 +87,10 @@ class AsyncioTcpConnection(ConnectionProtocol):
         self._close_event_previous_state: ConnectionState | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._close_event_task: asyncio.Task[None] | None = None
+        self._opening_event_task: asyncio.Task[object] | None = None
+        self._close_event_deferred_until_opened_event_completes = False
+        self._deferred_close_event_waiter: asyncio.Future[None] | None = None
+        self._deferred_close_publish_task: asyncio.Task[None] | None = None
 
     @property
     def connection_id(self) -> str:
@@ -124,13 +131,45 @@ class AsyncioTcpConnection(ConnectionProtocol):
                 f"Connection '{self._connection_id}' cannot be started from state '{self._state.value}'."
             )
         self._state = ConnectionState.CONNECTING
-        self._read_task = asyncio.create_task(
-            self._read_loop(), name=f"{self._connection_id}-read-loop"
-        )
         self._state = ConnectionState.CONNECTED
-        await self._event_dispatcher.emit(
-            ConnectionOpenedEvent(resource_id=self._metadata.connection_id, metadata=self._metadata)
-        )
+        try:
+            await self._notify_ready_callback()
+        except (Exception, asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self.close()
+            raise
+        if self._state != ConnectionState.CONNECTED:
+            return
+        opening_task = asyncio.current_task()
+        self._opening_event_task = cast(asyncio.Task[object] | None, opening_task)
+        try:
+            await self._event_dispatcher.emit_and_wait(
+                ConnectionOpenedEvent(
+                    resource_id=self._metadata.connection_id, metadata=self._metadata
+                ),
+                drop_on_backpressure=False,
+            )
+        except (Exception, asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self._publish_deferred_close_after_opened_event_preserving_cancellation()
+            if self._opening_event_task is opening_task:
+                self._opening_event_task = None
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self.close()
+            raise
+        if self._opening_event_task is opening_task:
+            self._opening_event_task = None
+        try:
+            if await self._publish_deferred_close_after_opened_event_preserving_cancellation():
+                return
+        except (Exception, asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self.close()
+            raise
+        if self._state == ConnectionState.CONNECTED:
+            self._read_task = asyncio.create_task(
+                self._read_loop(), name=f"{self._connection_id}-read-loop"
+            )
 
     async def send(self, data: BytesLike) -> None:
         """
@@ -186,6 +225,13 @@ class AsyncioTcpConnection(ConnectionProtocol):
         """
         close_task: asyncio.Task[None]
         async with self._close_lock:
+            current_task = asyncio.current_task()
+            if (
+                self._state == ConnectionState.CLOSED
+                and self._close_event_deferred_until_opened_event_completes
+                and self._opening_event_task is current_task
+            ):
+                return
             if self._state == ConnectionState.CLOSED and self._closed_event_published:
                 return
             if self._close_task is None or self._close_task.done():
@@ -202,10 +248,16 @@ class AsyncioTcpConnection(ConnectionProtocol):
                     )
                     self._state = ConnectionState.CLOSING
                 callback = self._on_closed_callback
-                close_caller_task = asyncio.current_task()
+                close_caller_task = current_task
+                close_caller_uses_inline_delivery = (
+                    self._event_dispatcher.current_task_is_worker()
+                    or self._event_dispatcher.current_task_is_dispatching_handler()
+                    or self._event_dispatcher.current_task_has_handler_origin_context()
+                    or self._event_dispatcher.current_task_has_inline_delivery_context()
+                )
                 inline_delivery_context = (
                     self._event_dispatcher.inline_delivery_context()
-                    if self._event_dispatcher.current_task_is_worker()
+                    if close_caller_uses_inline_delivery
                     else contextlib.nullcontext()
                 )
                 with inline_delivery_context:
@@ -215,6 +267,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
                             read_task=read_task,
                             callback=callback,
                             close_caller_task=close_caller_task,
+                            close_caller_uses_inline_delivery=close_caller_uses_inline_delivery,
                         )
                     )
             close_task = self._close_task
@@ -223,10 +276,29 @@ class AsyncioTcpConnection(ConnectionProtocol):
             return
         if self._close_event_task is asyncio.current_task():
             return
+        if self._close_event_deferred_until_opened_event_completes and (
+            self._event_dispatcher.current_task_is_dispatching_handler(self._connection_id)
+            or self._event_dispatcher.current_task_inherits_handler_origin_context(
+                self._connection_id
+            )
+        ):
+            return
 
+        handler_origin_caller = self._event_dispatcher.current_task_is_dispatching_handler(
+            self._connection_id
+        ) or self._event_dispatcher.current_task_inherits_handler_origin_context(
+            self._connection_id
+        )
         cancellation_requested = False
         try:
             await asyncio.shield(close_task)
+            deferred_waiter = self._pending_deferred_close_waiter()
+            if (
+                deferred_waiter is not None
+                and not handler_origin_caller
+                and self._event_dispatcher.has_active_handler_context(self._connection_id)
+            ):
+                await asyncio.shield(deferred_waiter)
         except asyncio.CancelledError:
             if close_task.done() and close_task.cancelled():
                 raise
@@ -242,6 +314,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         read_task: asyncio.Task[None] | None,
         callback: ConnectionClosedCallback | None,
         close_caller_task: asyncio.Task[None] | None,
+        close_caller_uses_inline_delivery: bool,
     ) -> None:
         """
         Execute the shared teardown portion of ``close()`` exactly once.
@@ -251,16 +324,27 @@ class AsyncioTcpConnection(ConnectionProtocol):
             read_task: Detached read-loop task to cancel and await.
             callback: Optional close callback invoked before terminal publication.
             close_caller_task: Task that created the shared close lifecycle task.
+            close_caller_uses_inline_delivery: Whether close() was initiated by a handler
+                path that must not queue terminal events behind the current handler.
         """
         cancellation_requested = False
         try:
             if needs_teardown:
                 try:
                     current_task = asyncio.current_task()
+                    preserve_active_inline_read_task = (
+                        self._event_dispatcher.has_active_handler_context(self._connection_id)
+                        and self._event_dispatcher.current_task_would_deliver_inline()
+                    )
+                    if self._event_dispatcher.has_active_handler_context(self._connection_id):
+                        await self._event_dispatcher.drop_queued_events_for_resource(
+                            self._connection_id
+                        )
                     if (
                         read_task is not None
                         and read_task is not current_task
                         and read_task is not close_caller_task
+                        and not preserve_active_inline_read_task
                     ):
                         read_task.cancel()
                         await self._await_read_task_shutdown(read_task)
@@ -281,7 +365,17 @@ class AsyncioTcpConnection(ConnectionProtocol):
                             await self._safe_emit_error(error)
                 except asyncio.CancelledError:
                     cancellation_requested = True
-            await self._finalize_close()
+            deferred, deferred_waiter = await self._defer_close_event_until_opened_event_completes(
+                close_caller_task,
+                close_caller_uses_inline_delivery=close_caller_uses_inline_delivery,
+            )
+            if deferred:
+                await self._event_dispatcher.drop_queued_events_for_resource(self._connection_id)
+            if deferred_waiter is not None:
+                await asyncio.shield(deferred_waiter)
+            if not deferred:
+                await self._event_dispatcher.drop_queued_events_for_resource(self._connection_id)
+                await self._finalize_close()
         finally:
             async with self._close_lock:
                 current_task = asyncio.current_task()
@@ -309,6 +403,21 @@ class AsyncioTcpConnection(ConnectionProtocol):
             warning_limiter=_warning_limiter,
             timeout_seconds=_SHUTDOWN_AWAIT_TIMEOUT_SECONDS,
         )
+
+    async def _notify_ready_callback(self) -> None:
+        """Run the internal post-connect hook before ConnectionOpenedEvent publication."""
+        if self._state != ConnectionState.CONNECTED or self._on_ready_callback is None:
+            return
+        result = self._on_ready_callback(self)
+        if asyncio.iscoroutine(result):
+            _ = await result
+
+    def _pending_deferred_close_waiter(self) -> asyncio.Future[None] | None:
+        """Return the in-flight deferred close publication waiter, if any."""
+        waiter = self._deferred_close_event_waiter
+        if waiter is None or waiter.done():
+            return None
+        return waiter
 
     async def _finalize_close(self) -> None:
         """
@@ -358,6 +467,171 @@ class AsyncioTcpConnection(ConnectionProtocol):
             _ = await cast(Awaitable[object], publication_task)
         if cancelled_during_emit:
             raise asyncio.CancelledError
+
+    async def _defer_close_event_until_opened_event_completes(
+        self,
+        close_caller_task: asyncio.Task[None] | None,
+        *,
+        close_caller_uses_inline_delivery: bool,
+    ) -> tuple[bool, asyncio.Future[None] | None]:
+        """Defer close publication while a connection handler is in flight."""
+        async with self._close_lock:
+            opening_event_task = self._opening_event_task
+            inherited_handler_origin = (
+                self._event_dispatcher.current_task_inherits_handler_origin_context(
+                    self._connection_id
+                )
+            )
+            handler_origin_in_flight = (
+                close_caller_task is opening_event_task
+                or self._event_dispatcher.current_task_is_dispatching_handler(self._connection_id)
+                or self._event_dispatcher.current_task_has_handler_origin_context(
+                    self._connection_id
+                )
+            )
+            active_inline_handler_in_flight = (
+                self._event_dispatcher.has_active_handler_context(self._connection_id)
+                and self._event_dispatcher.current_task_would_deliver_inline()
+            )
+            if (
+                opening_event_task is None
+                and not handler_origin_in_flight
+                and not close_caller_uses_inline_delivery
+                and not inherited_handler_origin
+                and not active_inline_handler_in_flight
+                and not self._close_event_deferred_until_opened_event_completes
+            ):
+                return False, None
+            self._state = ConnectionState.CLOSED
+            self._close_event_deferred_until_opened_event_completes = True
+            if (
+                self._deferred_close_event_waiter is None
+                or self._deferred_close_event_waiter.done()
+            ):
+                current_task = asyncio.current_task()
+                loop = (
+                    current_task.get_loop()
+                    if current_task is not None
+                    else asyncio.get_running_loop()
+                )
+                self._deferred_close_event_waiter = loop.create_future()
+            if opening_event_task is None and (
+                handler_origin_in_flight
+                or close_caller_uses_inline_delivery
+                or inherited_handler_origin
+                or active_inline_handler_in_flight
+            ):
+                publish_task = self._deferred_close_publish_task
+                if publish_task is None or publish_task.done():
+                    self._deferred_close_publish_task = asyncio.create_task(
+                        self._publish_deferred_close_after_handler_context_expires(),
+                        name=f"{self._connection_id}-deferred-close-publisher",
+                    )
+            # Handler-originated close paths cannot await this waiter: the
+            # active handler must return before the deferred close event may run.
+            # External close callers do get the waiter so their close() call
+            # still observes terminal publication.
+            if (
+                handler_origin_in_flight
+                or close_caller_uses_inline_delivery
+                or inherited_handler_origin
+                or self._event_dispatcher.current_task_has_handler_origin_context(
+                    self._connection_id
+                )
+            ):
+                return True, None
+            return True, self._deferred_close_event_waiter
+
+    async def _ensure_deferred_close_publication_waiter(self) -> asyncio.Future[None] | None:
+        """Ensure unpublished terminal close has a deferred publication waiter."""
+        async with self._close_lock:
+            if self._closed_event_published:
+                return None
+            self._close_event_deferred_until_opened_event_completes = True
+            if (
+                self._deferred_close_event_waiter is None
+                or self._deferred_close_event_waiter.done()
+            ):
+                current_task = asyncio.current_task()
+                loop = (
+                    current_task.get_loop()
+                    if current_task is not None
+                    else asyncio.get_running_loop()
+                )
+                self._deferred_close_event_waiter = loop.create_future()
+            publish_task = self._deferred_close_publish_task
+            if publish_task is None or publish_task.done():
+                self._deferred_close_publish_task = asyncio.create_task(
+                    self._publish_deferred_close_after_handler_context_expires(),
+                    name=f"{self._connection_id}-deferred-close-publisher",
+                )
+            return self._deferred_close_event_waiter
+
+    async def _publish_deferred_close_after_handler_context_expires(self) -> None:
+        """Publish a deferred close once active connection handlers have unwound."""
+        current_task = asyncio.current_task()
+        try:
+            while self._event_dispatcher.has_active_handler_context(self._connection_id):
+                await asyncio.sleep(0)
+            await self._publish_deferred_close_after_opened_event()
+        except (Exception, asyncio.CancelledError) as error:
+            async with self._close_lock:
+                deferred_waiter = self._deferred_close_event_waiter
+            if deferred_waiter is not None and not deferred_waiter.done():
+                deferred_waiter.set_exception(error)
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    deferred_waiter.exception()
+            if not isinstance(error, asyncio.CancelledError):
+                self._logger.warning("Deferred close publication failed: %s", error)
+        finally:
+            async with self._close_lock:
+                if self._deferred_close_publish_task is current_task:
+                    self._deferred_close_publish_task = None
+
+    async def _publish_deferred_close_after_opened_event_preserving_cancellation(self) -> bool:
+        """Publish deferred close even if the opening task is cancelled at the barrier."""
+        publish_task = asyncio.create_task(self._publish_deferred_close_after_opened_event())
+        caller_cancelled = False
+        try:
+            while True:
+                try:
+                    result = await asyncio.shield(publish_task)
+                    break
+                except asyncio.CancelledError:
+                    caller_cancelled = True
+                    if publish_task.done():
+                        publish_task.result()
+                        break
+                    continue
+        finally:
+            if caller_cancelled and not publish_task.done():
+                _ = await asyncio.shield(publish_task)
+        if caller_cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _publish_deferred_close_after_opened_event(self) -> bool:
+        """Publish a close event deferred until ConnectionOpenedEvent handling completed."""
+        async with self._close_lock:
+            if not self._close_event_deferred_until_opened_event_completes:
+                return False
+            self._close_event_deferred_until_opened_event_completes = False
+            deferred_waiter = self._deferred_close_event_waiter
+        try:
+            with self._event_dispatcher.inline_delivery_context():
+                await self._finalize_close()
+        except (Exception, asyncio.CancelledError) as error:
+            if deferred_waiter is not None and not deferred_waiter.done():
+                deferred_waiter.set_exception(error)
+            raise
+        else:
+            if deferred_waiter is not None and not deferred_waiter.done():
+                deferred_waiter.set_result(None)
+        finally:
+            async with self._close_lock:
+                if self._deferred_close_event_waiter is deferred_waiter:
+                    self._deferred_close_event_waiter = None
+        return True
 
     async def _run_close_event_publication(self, previous_state: ConnectionState) -> None:
         """Emit the terminal close event and mark publication success atomically."""
