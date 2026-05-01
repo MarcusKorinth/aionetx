@@ -26,6 +26,7 @@ from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDi
 from aionetx.implementations.asyncio_impl.runtime_utils import WarningRateLimiter
 
 ConnectionClosedCallback = Callable[["AsyncioTcpConnection"], Awaitable[None] | None]
+ConnectionReadyCallback = Callable[["AsyncioTcpConnection"], Awaitable[None] | None]
 
 logger = logging.getLogger(__name__)
 _warning_limiter = WarningRateLimiter(interval_seconds=30.0)
@@ -52,6 +53,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         on_closed_callback: ConnectionClosedCallback | None = None,
         *,
         send_timeout_seconds: float | None = 30.0,
+        on_ready_callback: ConnectionReadyCallback | None = None,
     ) -> None:
         if not connection_id:
             raise ValueError("connection_id must not be empty.")
@@ -73,6 +75,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         self._idle_timeout_seconds = idle_timeout_seconds
         self._send_timeout_seconds = send_timeout_seconds
         self._on_closed_callback = on_closed_callback
+        self._on_ready_callback = on_ready_callback
         self._state = ConnectionState.CREATED
         self._metadata = self._build_metadata()
         self._read_task: asyncio.Task[None] | None = None
@@ -125,6 +128,14 @@ class AsyncioTcpConnection(ConnectionProtocol):
             )
         self._state = ConnectionState.CONNECTING
         self._state = ConnectionState.CONNECTED
+        try:
+            await self._notify_ready_callback()
+        except (Exception, asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self.close()
+            raise
+        if self._state != ConnectionState.CONNECTED:
+            return
         try:
             await self._event_dispatcher.emit_and_wait(
                 ConnectionOpenedEvent(
@@ -318,6 +329,14 @@ class AsyncioTcpConnection(ConnectionProtocol):
             warning_limiter=_warning_limiter,
             timeout_seconds=_SHUTDOWN_AWAIT_TIMEOUT_SECONDS,
         )
+
+    async def _notify_ready_callback(self) -> None:
+        """Run the internal post-connect hook before ConnectionOpenedEvent publication."""
+        if self._state != ConnectionState.CONNECTED or self._on_ready_callback is None:
+            return
+        result = self._on_ready_callback(self)
+        if asyncio.iscoroutine(result):
+            _ = await result
 
     async def _finalize_close(self) -> None:
         """

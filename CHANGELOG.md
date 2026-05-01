@@ -18,3 +18,8 @@ Planned contents for the initial public alpha release (`0.1.0`).
 ### Changed
 
 - require Python 3.11 or newer for the initial public alpha release
+
+### Fixed
+
+- TCP connections now wait for opened-event handlers before starting reads,
+  preserving per-connection event ordering across dispatch modes.

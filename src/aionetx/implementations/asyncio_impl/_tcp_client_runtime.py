@@ -25,6 +25,7 @@ class _ClientRuntimeState:
     running: bool = False
     has_started: bool = False
     connection: AsyncioTcpConnection | None = None
+    starting_connection: AsyncioTcpConnection | None = None
     heartbeat_sender: AsyncioHeartbeatSender | None = None
     connection_closed_event: asyncio.Event = field(default_factory=asyncio.Event)
     last_connect_error: Exception | None = None
@@ -72,6 +73,14 @@ class _ClientRuntimeAccessors:
     @_connection.setter
     def _connection(self: _HasClientRuntime, value: AsyncioTcpConnection | None) -> None:
         self._runtime.connection = value
+
+    @property
+    def _starting_connection(self: _HasClientRuntime) -> AsyncioTcpConnection | None:
+        return self._runtime.starting_connection
+
+    @_starting_connection.setter
+    def _starting_connection(self: _HasClientRuntime, value: AsyncioTcpConnection | None) -> None:
+        self._runtime.starting_connection = value
 
     @property
     def _heartbeat_sender(self: _HasClientRuntime) -> AsyncioHeartbeatSender | None:

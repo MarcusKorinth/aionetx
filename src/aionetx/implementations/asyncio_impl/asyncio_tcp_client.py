@@ -410,11 +410,53 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
             on_closed_callback=self._on_connection_closed,
             logger=self._logger,
             component_id=self._component_id,
+            on_connection_created=self._track_starting_connection,
+            on_connection_ready=self._attach_starting_connection,
         )
+        if self._starting_connection is connection:
+            self._starting_connection = None
+        if self._connection is connection:
+            if (
+                self._lifecycle_state == ComponentLifecycleState.RUNNING
+                and connection.state == ConnectionState.CONNECTED
+            ):
+                await self._start_heartbeat_sender(connection)
+            return
+        if (
+            self._lifecycle_state != ComponentLifecycleState.RUNNING
+            or connection.state == ConnectionState.CLOSED
+        ):
+            if self._connection is connection:
+                self._connection = None
+            if connection.state != ConnectionState.CLOSED:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await connection.close()
+            self._connection_closed_event.set()
+            self._notify_status_changed()
+            return
         self._connection = connection
         self._connection_closed_event.clear()
         self._notify_status_changed()
         await self._start_heartbeat_sender(connection)
+
+    def _track_starting_connection(self, connection: AsyncioTcpConnection) -> None:
+        """Retain a just-created connection so stop() can close it during opened publication."""
+        self._starting_connection = connection
+
+    async def _attach_starting_connection(self, connection: AsyncioTcpConnection) -> None:
+        """Attach a connected socket before opened-event publication."""
+        if (
+            self._lifecycle_state != ComponentLifecycleState.RUNNING
+            or connection.state != ConnectionState.CONNECTED
+        ):
+            if self._starting_connection is connection:
+                self._starting_connection = None
+            return
+        self._connection = connection
+        if self._starting_connection is connection:
+            self._starting_connection = None
+        self._connection_closed_event.clear()
+        self._notify_status_changed()
 
     async def _start_heartbeat_sender(self, connection: AsyncioTcpConnection) -> None:
         """Create and retain the optional heartbeat sender bound to ``connection``."""
@@ -433,20 +475,26 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         await stop_heartbeat_sender(sender=sender, logger=self._logger)
 
     async def _close_current_connection(self) -> None:
-        """Detach and close the current connection, if one is tracked."""
+        """Detach and close the current or startup-pending connection, if one is tracked."""
         connection = self._connection
-        if connection is not None and connection.state != ConnectionState.CLOSED:
-            try:
-                await connection.close()
-            finally:
-                if self._connection is connection:
-                    self._connection = None
-                self._connection_closed_event.set()
-                self._notify_status_changed()
-            return
-        self._connection = None
-        self._connection_closed_event.set()
-        self._notify_status_changed()
+        starting_connection = self._starting_connection
+        self._starting_connection = None
+        close_targets: list[AsyncioTcpConnection] = []
+        for candidate in (starting_connection, connection):
+            if (
+                candidate is not None
+                and candidate.state != ConnectionState.CLOSED
+                and candidate not in close_targets
+            ):
+                close_targets.append(candidate)
+        try:
+            for target in close_targets:
+                await target.close()
+        finally:
+            if self._connection is connection or self._connection is starting_connection:
+                self._connection = None
+            self._connection_closed_event.set()
+            self._notify_status_changed()
 
     async def _on_connection_closed(self, connection: AsyncioTcpConnection) -> None:
         """Detach the closed connection, notify waiters, and stop heartbeats."""
