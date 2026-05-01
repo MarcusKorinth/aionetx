@@ -15,6 +15,7 @@ import logging
 
 import pytest
 
+from aionetx.api.bytes_received_event import BytesReceivedEvent
 from aionetx.api.event_delivery_settings import (
     EventBackpressurePolicy,
     EventDeliverySettings,
@@ -24,8 +25,8 @@ from aionetx.api.event_delivery_settings import (
 from aionetx.api.error_policy import ErrorPolicy
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
-from aionetx.api.connection_events import ConnectionOpenedEvent
-from aionetx.api.connection_lifecycle import ConnectionRole
+from aionetx.api.connection_events import ConnectionClosedEvent, ConnectionOpenedEvent
+from aionetx.api.connection_lifecycle import ConnectionRole, ConnectionState
 from aionetx.api.connection_metadata import ConnectionMetadata
 from aionetx.api.reconnect_events import ReconnectScheduledEvent
 from aionetx.api.tcp_reconnect_settings import TcpReconnectSettings
@@ -1246,6 +1247,83 @@ async def test_client_open_event_failure_closes_partially_started_connection_wit
         assert leaked_read_loops == []
 
         release_server_connection.set()
+
+
+@pytest.mark.asyncio
+async def test_client_stop_during_opened_publication_closes_startup_connection() -> None:
+    server_connection_opened = asyncio.Event()
+    server_payload_sent = asyncio.Event()
+    server_saw_eof = asyncio.Event()
+    opened_started = asyncio.Event()
+    opened_cancelled = asyncio.Event()
+    release_opened = asyncio.Event()
+    bytes_seen = asyncio.Event()
+    closed_seen = asyncio.Event()
+
+    async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        server_connection_opened.set()
+        writer.write(b"payload-before-opened-completes")
+        await writer.drain()
+        server_payload_sent.set()
+        try:
+            if await reader.read() == b"":
+                server_saw_eof.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    class _BlockOpenedHandler:
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                opened_started.set()
+                try:
+                    await release_opened.wait()
+                except asyncio.CancelledError:
+                    opened_cancelled.set()
+                    raise
+            elif isinstance(event, BytesReceivedEvent):
+                bytes_seen.set()
+            elif isinstance(event, ConnectionClosedEvent):
+                closed_seen.set()
+
+    server = await asyncio.start_server(_handle_client, "127.0.0.1", 0)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        await asyncio.wait_for(server.start_serving(), timeout=1.0)
+        client = AsyncioTcpClient(
+            settings=TcpClientSettings(
+                host="127.0.0.1",
+                port=port,
+                reconnect=TcpReconnectSettings(enabled=False),
+                event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+            ),
+            event_handler=_BlockOpenedHandler(),
+        )
+
+        await client.start()
+        try:
+            await asyncio.wait_for(server_connection_opened.wait(), timeout=1.0)
+            await asyncio.wait_for(server_payload_sent.wait(), timeout=1.0)
+            await asyncio.wait_for(opened_started.wait(), timeout=1.0)
+
+            tracked_connection = client._connection or client._starting_connection  # type: ignore[attr-defined]
+            assert tracked_connection is not None
+            assert tracked_connection.state == ConnectionState.CONNECTED
+            assert bytes_seen.is_set() is False
+
+            await asyncio.wait_for(client.stop(), timeout=1.0)
+            await asyncio.wait_for(server_saw_eof.wait(), timeout=1.0)
+
+            assert opened_cancelled.is_set()
+            assert closed_seen.is_set()
+            assert bytes_seen.is_set() is False
+            assert client.connection is None
+            assert client._connection is None  # type: ignore[attr-defined]
+            assert client._starting_connection is None  # type: ignore[attr-defined]
+            assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+        finally:
+            release_opened.set()
+            await client.stop()
 
 
 @pytest.mark.asyncio
