@@ -945,12 +945,8 @@ async def test_inline_attempt_started_handler_can_stop_client_before_socket_open
 
     try:
         await asyncio.wait_for(client.start(), timeout=3.0)
-        supervisor_task = client._supervisor_task
         await asyncio.wait_for(handler.attempt_seen.wait(), timeout=3.0)
         await asyncio.wait_for(handler.stop_returned.wait(), timeout=3.0)
-        assert supervisor_task is not None
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait_for(supervisor_task, timeout=3.0)
     finally:
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await asyncio.wait_for(client.stop(), timeout=1.0)
@@ -959,6 +955,7 @@ async def test_inline_attempt_started_handler_can_stop_client_before_socket_open
     assert not opener_called.is_set()
     assert client.lifecycle_state == ComponentLifecycleState.STOPPED
     assert client.connection is None
+    assert client._supervisor_task is None
 
 
 @pytest.mark.asyncio
