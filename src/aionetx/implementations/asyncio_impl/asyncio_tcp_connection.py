@@ -124,13 +124,22 @@ class AsyncioTcpConnection(ConnectionProtocol):
                 f"Connection '{self._connection_id}' cannot be started from state '{self._state.value}'."
             )
         self._state = ConnectionState.CONNECTING
-        self._read_task = asyncio.create_task(
-            self._read_loop(), name=f"{self._connection_id}-read-loop"
-        )
         self._state = ConnectionState.CONNECTED
-        await self._event_dispatcher.emit(
-            ConnectionOpenedEvent(resource_id=self._metadata.connection_id, metadata=self._metadata)
-        )
+        try:
+            await self._event_dispatcher.emit_and_wait(
+                ConnectionOpenedEvent(
+                    resource_id=self._metadata.connection_id, metadata=self._metadata
+                ),
+                drop_on_backpressure=False,
+            )
+        except (Exception, asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self.close()
+            raise
+        if self._state == ConnectionState.CONNECTED:
+            self._read_task = asyncio.create_task(
+                self._read_loop(), name=f"{self._connection_id}-read-loop"
+            )
 
     async def send(self, data: BytesLike) -> None:
         """
