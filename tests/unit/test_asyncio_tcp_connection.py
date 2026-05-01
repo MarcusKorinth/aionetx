@@ -158,7 +158,7 @@ async def test_tcp_connection_dispatch_waits_for_opened_before_reading(
     dispatch_mode: EventDispatchMode,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class BlockingOpenedHandler:
+    class BlockingInlineHandler:
         def __init__(self) -> None:
             self.opened_started = asyncio.Event()
             self.opened_finished = asyncio.Event()
@@ -182,7 +182,7 @@ async def test_tcp_connection_dispatch_waits_for_opened_before_reading(
                 if is_opened_event:
                     self.opened_finished.set()
 
-    handler = BlockingOpenedHandler()
+    handler = BlockingInlineHandler()
     read_task_created = asyncio.Event()
     original_create_task = asyncio.create_task
 
@@ -282,6 +282,62 @@ async def test_tcp_connection_starts_read_loop_after_opened_event_publication(
 
 
 @pytest.mark.asyncio
+async def test_tcp_connection_close_during_ready_callback_does_not_emit_late_opened() -> None:
+    ready_started = asyncio.Event()
+    allow_ready_to_finish = asyncio.Event()
+
+    class RecordingHandler:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                self.events.append("opened")
+            elif isinstance(event, ConnectionClosedEvent):
+                self.events.append("closed")
+
+    async def on_ready(_connection: AsyncioTcpConnection) -> None:
+        ready_started.set()
+        await allow_ready_to_finish.wait()
+
+    handler = RecordingHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:close-during-ready",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+        on_ready_callback=on_ready,
+    )
+
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    try:
+        await asyncio.wait_for(ready_started.wait(), timeout=1.0)
+        await connection.close()
+        allow_ready_to_finish.set()
+        await asyncio.wait_for(start_task, timeout=1.0)
+    finally:
+        allow_ready_to_finish.set()
+        if not start_task.done():
+            start_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(start_task, timeout=1.0)
+        await dispatcher.stop()
+
+    assert handler.events == ["closed"]
+    assert connection.state == ConnectionState.CLOSED
+    assert writer.closed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "policy",
     [EventBackpressurePolicy.DROP_NEWEST, EventBackpressurePolicy.DROP_OLDEST],
@@ -363,25 +419,360 @@ async def test_tcp_connection_opened_barrier_is_not_dropped_by_background_backpr
 
 
 @pytest.mark.asyncio
-async def test_tcp_connection_close_during_ready_callback_does_not_emit_late_opened() -> None:
-    ready_started = asyncio.Event()
-    allow_ready_to_finish = asyncio.Event()
+async def test_tcp_connection_start_closes_when_opened_handler_raises() -> None:
+    class FailingOpenedHandler:
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                raise RuntimeError("opened failed")
 
-    class RecordingHandler:
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=FailingOpenedHandler(),
+        delivery=EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.INLINE,
+            handler_failure_policy=EventHandlerFailurePolicy.RAISE_IN_INLINE_MODE,
+        ),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:opened-failure",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    try:
+        with pytest.raises(RuntimeError, match="opened failed"):
+            await connection.start()
+    finally:
+        await dispatcher.stop()
+
+    assert connection.state == ConnectionState.CLOSED
+    assert connection._read_task is None
+    assert writer.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch_mode",
+    [EventDispatchMode.INLINE, EventDispatchMode.BACKGROUND],
+)
+async def test_tcp_connection_start_closes_when_opened_publication_is_cancelled(
+    dispatch_mode: EventDispatchMode,
+) -> None:
+    class BlockingOpenedHandler:
         def __init__(self) -> None:
+            self.opened_started = asyncio.Event()
+            self.keep_opened_blocked = asyncio.Event()
+            self.closed_started = asyncio.Event()
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                self.opened_started.set()
+                await self.keep_opened_blocked.wait()
+            elif isinstance(event, ConnectionClosedEvent):
+                self.closed_started.set()
+
+    handler = BlockingOpenedHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=dispatch_mode),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:opened-cancelled",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    try:
+        await asyncio.wait_for(handler.opened_started.wait(), timeout=1.0)
+        start_task.cancel()
+        if dispatch_mode == EventDispatchMode.BACKGROUND:
+            await asyncio.sleep(0)
+            assert not start_task.done()
+            handler.keep_opened_blocked.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+
+        assert connection.state == ConnectionState.CLOSED
+        assert connection._read_task is None
+        assert writer.closed
+
+        handler.keep_opened_blocked.set()
+        await asyncio.wait_for(handler.closed_started.wait(), timeout=1.0)
+    finally:
+        handler.keep_opened_blocked.set()
+        if not start_task.done():
+            start_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(start_task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_cancelled_opened_publication_releases_external_close_waiter() -> None:
+    class BlockingOpenedHandler:
+        def __init__(self) -> None:
+            self.opened_started = asyncio.Event()
+            self.allow_opened_to_finish = asyncio.Event()
             self.events: list[str] = []
 
         async def on_event(self, event) -> None:
             if isinstance(event, ConnectionOpenedEvent):
                 self.events.append("opened")
+                self.opened_started.set()
+                await self.allow_opened_to_finish.wait()
             elif isinstance(event, ConnectionClosedEvent):
                 self.events.append("closed")
 
-    async def on_ready(_connection: AsyncioTcpConnection) -> None:
-        ready_started.set()
-        await allow_ready_to_finish.wait()
+    handler = BlockingOpenedHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:cancelled-opened-external-close",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
 
-    handler = RecordingHandler()
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    close_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(handler.opened_started.wait(), timeout=1.0)
+        close_task = asyncio.create_task(connection.close())
+        await wait_for_condition(lambda: writer.closed, timeout_seconds=1.0)
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        start_task.cancel()
+        handler.allow_opened_to_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+    finally:
+        handler.allow_opened_to_finish.set()
+        for task in (start_task, close_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.events == ["opened", "closed"]
+    assert connection.state == ConnectionState.CLOSED
+    assert connection._read_task is None
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_background_start_cancellation_waits_for_queued_opened_event() -> None:
+    class BlockingBackgroundHandler:
+        def __init__(self) -> None:
+            self.blocker_started = asyncio.Event()
+            self.allow_blocker_to_finish = asyncio.Event()
+            self.opened_seen = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.events: list[str] = []
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, BytesReceivedEvent) and event.resource_id == "blocker":
+                self.blocker_started.set()
+                await self.allow_blocker_to_finish.wait()
+            elif isinstance(event, ConnectionOpenedEvent):
+                self.events.append("opened")
+                self.opened_seen.set()
+            elif isinstance(event, ConnectionClosedEvent):
+                self.events.append("closed")
+                self.closed_seen.set()
+
+    handler = BlockingBackgroundHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:background-cancelled-queued-opened",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    try:
+        await dispatcher.emit(BytesReceivedEvent(resource_id="blocker", data=b"hold"))
+        await asyncio.wait_for(handler.blocker_started.wait(), timeout=1.0)
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        start_task.cancel()
+        await asyncio.sleep(0)
+        assert not start_task.done()
+
+        handler.allow_blocker_to_finish.set()
+        await asyncio.wait_for(handler.opened_seen.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+
+        assert handler.events == ["opened", "closed"]
+        assert connection.state == ConnectionState.CLOSED
+        assert connection._read_task is None
+        assert writer.closed
+    finally:
+        handler.allow_blocker_to_finish.set()
+        if not start_task.done():
+            start_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(start_task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch_mode",
+    [EventDispatchMode.INLINE, EventDispatchMode.BACKGROUND],
+)
+async def test_tcp_connection_external_close_waits_for_opened_handler_before_closed_event(
+    dispatch_mode: EventDispatchMode,
+) -> None:
+    class BlockingOpenedHandler:
+        def __init__(self) -> None:
+            self.opened_started = asyncio.Event()
+            self.allow_opened_to_finish = asyncio.Event()
+            self.closed_started = asyncio.Event()
+            self.active_connection_handlers = 0
+            self.max_active_connection_handlers = 0
+
+        async def on_event(self, event) -> None:
+            is_connection_event = isinstance(event, (ConnectionOpenedEvent, ConnectionClosedEvent))
+            if is_connection_event:
+                self.active_connection_handlers += 1
+                self.max_active_connection_handlers = max(
+                    self.max_active_connection_handlers,
+                    self.active_connection_handlers,
+                )
+            try:
+                if isinstance(event, ConnectionOpenedEvent):
+                    self.opened_started.set()
+                    await self.allow_opened_to_finish.wait()
+                elif isinstance(event, ConnectionClosedEvent):
+                    self.closed_started.set()
+            finally:
+                if is_connection_event:
+                    self.active_connection_handlers -= 1
+
+    handler = BlockingOpenedHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=dispatch_mode),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:external-close-during-opened",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    close_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(handler.opened_started.wait(), timeout=1.0)
+        close_task = asyncio.create_task(connection.close())
+        await asyncio.wait_for(writer.closed_event.wait(), timeout=1.0)
+
+        assert not handler.closed_started.is_set()
+        assert not close_task.done()
+        assert handler.max_active_connection_handlers == 1
+
+        handler.allow_opened_to_finish.set()
+        await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+        await asyncio.wait_for(handler.closed_started.wait(), timeout=1.0)
+        assert handler.max_active_connection_handlers == 1
+    finally:
+        handler.allow_opened_to_finish.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+        if close_task is not None:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(close_task, timeout=1.0)
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_inline_close_from_bytes_handler_defers_closed_event() -> None:
+    class CloseFromBytesHandler:
+        def __init__(self) -> None:
+            self.connection: AsyncioTcpConnection | None = None
+            self.bytes_started = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.close_returned = asyncio.Event()
+            self.closed_started = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.close_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("closed event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_started.set()
+                return
+            if self.connection is None or not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_started.set()
+            try:
+                self.close_task = asyncio.create_task(self.connection.close())
+                await self.close_task
+                self.close_returned.set()
+                if self.closed_started.is_set():
+                    raise AssertionError("closed event was published before bytes handler returned")
+                await self.release_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_bytes.set()
+            finally:
+                self.bytes_finished.set()
+
+    handler = CloseFromBytesHandler()
     dispatcher = AsyncioEventDispatcher(
         event_handler=handler,
         delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
@@ -389,33 +780,682 @@ async def test_tcp_connection_close_during_ready_callback_does_not_emit_late_ope
     )
     writer = _DummyWriter()
     connection = AsyncioTcpConnection(
-        "client:close-during-ready",
+        "client:close-from-bytes-handler",
         ConnectionRole.CLIENT,
         asyncio.StreamReader(),
         writer,  # type: ignore[arg-type]
         dispatcher,
         4096,
-        on_ready_callback=on_ready,
+    )
+    handler.connection = connection
+
+    emit_task: asyncio.Task[None] | None = None
+    await dispatcher.start()
+    try:
+        await connection.start()
+        emit_task = asyncio.create_task(
+            dispatcher.emit(BytesReceivedEvent(resource_id=connection.connection_id, data=b"close"))
+        )
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.close_returned.wait(), timeout=1.0)
+
+        assert not handler.closed_started.is_set()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.closed_started.wait(), timeout=1.0)
+        await asyncio.wait_for(emit_task, timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        if emit_task is not None and not emit_task.done():
+            emit_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_task, timeout=1.0)
+        if handler.close_task is not None and not handler.close_task.done():
+            handler.close_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(handler.close_task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.error is None
+    assert connection.state == ConnectionState.CLOSED
+    assert writer.closed
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_background_direct_close_from_bytes_handler_defers_closed_event() -> (
+    None
+):
+    class DirectCloseFromBytesHandler:
+        def __init__(self) -> None:
+            self.connection: AsyncioTcpConnection | None = None
+            self.bytes_started = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("closed event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_seen.set()
+                return
+            if self.connection is None or not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_started.set()
+            try:
+                await self.connection.close()
+                if self.closed_seen.is_set():
+                    raise AssertionError("closed event was published before bytes handler returned")
+                await self.release_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_bytes.set()
+            finally:
+                self.bytes_finished.set()
+
+    handler = DirectCloseFromBytesHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:background-direct-close",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+    handler.connection = connection
+
+    await dispatcher.start()
+    try:
+        await connection.start()
+        await dispatcher.emit(
+            BytesReceivedEvent(resource_id=connection.connection_id, data=b"close")
+        )
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+        assert not handler.closed_seen.is_set()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.error is None
+    assert connection.state == ConnectionState.CLOSED
+    assert writer.closed
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_inline_close_deferral_is_scoped_to_connection() -> None:
+    class BlockingFirstConnectionHandler:
+        def __init__(self) -> None:
+            self.first_bytes_started = asyncio.Event()
+            self.first_bytes_finished = asyncio.Event()
+            self.allow_first_bytes_to_finish = asyncio.Event()
+            self.second_closed_seen = asyncio.Event()
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, BytesReceivedEvent) and event.resource_id == "client:first":
+                self.first_bytes_started.set()
+                await self.allow_first_bytes_to_finish.wait()
+                self.first_bytes_finished.set()
+                return
+            if isinstance(event, ConnectionClosedEvent) and event.resource_id == "client:second":
+                self.second_closed_seen.set()
+
+    handler = BlockingFirstConnectionHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    first_connection = AsyncioTcpConnection(
+        "client:first",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+    second_writer = _DummyWriter()
+    second_connection = AsyncioTcpConnection(
+        "client:second",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        second_writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    emit_task: asyncio.Task[None] | None = None
+    await dispatcher.start()
+    try:
+        await first_connection.start()
+        await second_connection.start()
+        emit_task = asyncio.create_task(
+            dispatcher.emit(BytesReceivedEvent(resource_id="client:first", data=b"hold"))
+        )
+        await asyncio.wait_for(handler.first_bytes_started.wait(), timeout=1.0)
+
+        await asyncio.wait_for(second_connection.close(), timeout=1.0)
+
+        assert handler.second_closed_seen.is_set()
+        assert not handler.first_bytes_finished.is_set()
+    finally:
+        handler.allow_first_bytes_to_finish.set()
+        if emit_task is not None and not emit_task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_task, timeout=1.0)
+        for connection in (first_connection, second_connection):
+            if connection.state != ConnectionState.CLOSED:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await connection.close()
+        await dispatcher.stop()
+
+    assert second_writer.closed
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_background_deferred_close_drops_queued_same_connection_bytes() -> (
+    None
+):
+    class CloseOnFirstBytesHandler:
+        def __init__(self) -> None:
+            self.connection: AsyncioTcpConnection | None = None
+            self.first_bytes_seen = asyncio.Event()
+            self.close_returned = asyncio.Event()
+            self.release_first_bytes = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.events: list[object] = []
+            self.close_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            self.events.append(event)
+            if isinstance(event, ConnectionClosedEvent):
+                self.closed_seen.set()
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            if event.data == b"second":
+                self.error = AssertionError("queued bytes event was delivered after close")
+                self.release_first_bytes.set()
+                return
+            self.first_bytes_seen.set()
+            try:
+                if self.connection is None:
+                    raise AssertionError("connection reference was not attached")
+                self.close_task = asyncio.create_task(self.connection.close())
+                await self.close_task
+                self.close_returned.set()
+                await self.release_first_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_first_bytes.set()
+
+    handler = CloseOnFirstBytesHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logger=logging.getLogger("test"),
+    )
+    connection = AsyncioTcpConnection(
+        "client:background-close-drops-queued",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+    handler.connection = connection
+
+    await dispatcher.start()
+    first_emit_task: asyncio.Task[None] | None = None
+    try:
+        await connection.start()
+        first_emit_task = asyncio.create_task(
+            dispatcher.emit(BytesReceivedEvent(resource_id=connection.connection_id, data=b"first"))
+        )
+        await asyncio.wait_for(handler.first_bytes_seen.wait(), timeout=1.0)
+        await dispatcher.emit(
+            BytesReceivedEvent(resource_id=connection.connection_id, data=b"second")
+        )
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        await asyncio.wait_for(handler.close_returned.wait(), timeout=1.0)
+        handler.release_first_bytes.set()
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+        if first_emit_task is not None:
+            await asyncio.wait_for(first_emit_task, timeout=1.0)
+    finally:
+        handler.release_first_bytes.set()
+        if first_emit_task is not None and not first_emit_task.done():
+            first_emit_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(first_emit_task, timeout=1.0)
+        if handler.close_task is not None and not handler.close_task.done():
+            handler.close_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(handler.close_task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.error is None
+    assert [event.data for event in handler.events if isinstance(event, BytesReceivedEvent)] == [
+        b"first"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_background_external_close_drops_queued_bytes_before_closed() -> None:
+    class ScriptedReader:
+        def __init__(self) -> None:
+            self._reads = [b"first", b"second"]
+            self.release_read = asyncio.Event()
+
+        async def read(self, _size: int) -> bytes:
+            if self._reads:
+                return self._reads.pop(0)
+            await self.release_read.wait()
+            return b""
+
+    class BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.events: list[object] = []
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            self.events.append(event)
+            if isinstance(event, ConnectionClosedEvent):
+                self.closed_seen.set()
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            if event.data == b"second":
+                self.error = AssertionError("queued bytes event was delivered after close")
+                self.release_bytes.set()
+                return
+            self.bytes_started.set()
+            await self.release_bytes.wait()
+
+    handler = BlockingBytesHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logger=logging.getLogger("test"),
+    )
+    reader = ScriptedReader()
+    connection = AsyncioTcpConnection(
+        "client:background-external-close-drops-queued",
+        ConnectionRole.CLIENT,
+        reader,  # type: ignore[arg-type]
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+    await dispatcher.start()
+    close_task: asyncio.Task[None] | None = None
+    try:
+        await connection.start()
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        close_task = asyncio.create_task(connection.close())
+        await asyncio.wait_for(close_task, timeout=1.0)
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        reader.release_read.set()
+        for task in (close_task,):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.error is None
+    assert [event.data for event in handler.events if isinstance(event, BytesReceivedEvent)] == [
+        b"first"
+    ]
+    assert isinstance(handler.events[-1], ConnectionClosedEvent)
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_inline_reentrant_close_returns_while_external_close_waits() -> None:
+    class ReentrantCloseHandler:
+        def __init__(self) -> None:
+            self.connection: AsyncioTcpConnection | None = None
+            self.bytes_started = asyncio.Event()
+            self.reentrant_close_returned = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.reentrant_close_returned.is_set():
+                    self.error = AssertionError("closed event re-entered before close returned")
+                    self.release_bytes.set()
+                self.closed_seen.set()
+                return
+            if self.connection is None or not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_started.set()
+            try:
+                await self.connection.close()
+                self.reentrant_close_returned.set()
+                await self.release_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_bytes.set()
+
+    handler = ReentrantCloseHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    connection = AsyncioTcpConnection(
+        "client:inline-reentrant-close",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+    handler.connection = connection
+    await dispatcher.start()
+    emit_task: asyncio.Task[None] | None = None
+    external_close_task: asyncio.Task[None] | None = None
+    try:
+        await connection.start()
+        emit_task = asyncio.create_task(
+            dispatcher.emit(BytesReceivedEvent(resource_id=connection.connection_id, data=b"first"))
+        )
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+
+        external_close_task = asyncio.create_task(connection.close())
+        await asyncio.wait_for(handler.reentrant_close_returned.wait(), timeout=1.0)
+        assert external_close_task.done() is False
+        assert not handler.closed_seen.is_set()
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(external_close_task, timeout=1.0)
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+        if emit_task is not None:
+            await asyncio.wait_for(emit_task, timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        for task in (emit_task, external_close_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.error is None
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_external_close_joiner_waits_for_deferred_close_event() -> None:
+    class ReentrantCloseWithJoinerHandler:
+        def __init__(self) -> None:
+            self.connection: AsyncioTcpConnection | None = None
+            self.bytes_started = asyncio.Event()
+            self.handler_close_returned = asyncio.Event()
+            self.callback_started = asyncio.Event()
+            self.release_callback = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.closed_seen = asyncio.Event()
+            self.handler_close_task: asyncio.Task[None] | None = None
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.release_bytes.is_set():
+                    self.error = AssertionError("closed event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_seen.set()
+                return
+            if self.connection is None or not isinstance(event, BytesReceivedEvent):
+                return
+
+            self.bytes_started.set()
+            try:
+                self.handler_close_task = asyncio.create_task(self.connection.close())
+                await self.handler_close_task
+                self.handler_close_returned.set()
+                await self.release_bytes.wait()
+            except BaseException as error:
+                self.error = error
+                self.release_callback.set()
+                self.release_bytes.set()
+
+    handler = ReentrantCloseWithJoinerHandler()
+
+    async def on_closed(_connection: AsyncioTcpConnection) -> None:
+        handler.callback_started.set()
+        await handler.release_callback.wait()
+
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    connection = AsyncioTcpConnection(
+        "client:inline-close-joiner",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+        on_closed_callback=on_closed,
+    )
+    handler.connection = connection
+    await dispatcher.start()
+    emit_task: asyncio.Task[None] | None = None
+    external_close_task: asyncio.Task[None] | None = None
+    try:
+        await connection.start()
+        emit_task = asyncio.create_task(
+            dispatcher.emit(BytesReceivedEvent(resource_id=connection.connection_id, data=b"first"))
+        )
+        await asyncio.wait_for(handler.callback_started.wait(), timeout=1.0)
+
+        external_close_task = asyncio.create_task(connection.close())
+        await asyncio.sleep(0)
+        assert external_close_task.done() is False
+
+        handler.release_callback.set()
+        await asyncio.wait_for(handler.handler_close_returned.wait(), timeout=1.0)
+        assert external_close_task.done() is False
+        assert handler.closed_seen.is_set() is False
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(external_close_task, timeout=1.0)
+        await asyncio.wait_for(handler.closed_seen.wait(), timeout=1.0)
+        if emit_task is not None:
+            await asyncio.wait_for(emit_task, timeout=1.0)
+    finally:
+        handler.release_callback.set()
+        handler.release_bytes.set()
+        for task in (emit_task, handler.handler_close_task, external_close_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    assert handler.error is None
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_start_cancellation_completes_deferred_close_publication() -> None:
+    class BlockingOpenedHandler:
+        def __init__(self) -> None:
+            self.opened_started = asyncio.Event()
+            self.allow_opened_to_finish = asyncio.Event()
+            self.closed_started = asyncio.Event()
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                self.opened_started.set()
+                await self.allow_opened_to_finish.wait()
+            elif isinstance(event, ConnectionClosedEvent):
+                self.closed_started.set()
+
+    handler = BlockingOpenedHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:cancelled-deferred-close",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
     )
 
     await dispatcher.start()
     start_task = asyncio.create_task(connection.start())
+    close_task: asyncio.Task[None] | None = None
     try:
-        await asyncio.wait_for(ready_started.wait(), timeout=1.0)
-        await connection.close()
-        allow_ready_to_finish.set()
-        await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(handler.opened_started.wait(), timeout=1.0)
+        close_task = asyncio.create_task(connection.close())
+        await asyncio.wait_for(writer.closed_event.wait(), timeout=1.0)
+        assert not close_task.done()
+
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(asyncio.shield(close_task), timeout=1.0)
+        await asyncio.wait_for(handler.closed_started.wait(), timeout=1.0)
     finally:
-        allow_ready_to_finish.set()
+        handler.allow_opened_to_finish.set()
         if not start_task.done():
             start_task.cancel()
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await asyncio.wait_for(start_task, timeout=1.0)
+        if close_task is not None and not close_task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(close_task), timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
         await dispatcher.stop()
 
-    assert handler.events == ["closed"]
-    assert connection.state == ConnectionState.CLOSED
-    assert writer.closed
+
+@pytest.mark.asyncio
+async def test_tcp_connection_repeated_start_cancellation_preserves_deferred_close_publication() -> (
+    None
+):
+    class BlockingOpenedHandler:
+        def __init__(self) -> None:
+            self.opened_started = asyncio.Event()
+            self.allow_opened_to_finish = asyncio.Event()
+            self.closed_started = asyncio.Event()
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                self.opened_started.set()
+                await self.allow_opened_to_finish.wait()
+            elif isinstance(event, ConnectionClosedEvent):
+                self.closed_started.set()
+
+    handler = BlockingOpenedHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        logger=logging.getLogger("test"),
+    )
+    writer = _DummyWriter()
+    connection = AsyncioTcpConnection(
+        "client:repeat-cancelled-deferred-close",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    start_task = asyncio.create_task(connection.start())
+    close_task: asyncio.Task[None] | None = None
+    cancel_driver_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(handler.opened_started.wait(), timeout=1.0)
+        close_task = asyncio.create_task(connection.close())
+        await asyncio.wait_for(writer.closed_event.wait(), timeout=1.0)
+        assert not close_task.done()
+
+        async def cancel_start_repeatedly() -> None:
+            start_task.cancel()
+            await asyncio.sleep(0)
+            start_task.cancel()
+            await asyncio.sleep(0)
+            start_task.cancel()
+
+        cancel_driver_task = asyncio.create_task(cancel_start_repeatedly())
+        await asyncio.wait_for(cancel_driver_task, timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(asyncio.shield(close_task), timeout=1.0)
+        await asyncio.wait_for(handler.closed_started.wait(), timeout=1.0)
+    finally:
+        handler.allow_opened_to_finish.set()
+        if cancel_driver_task is not None and not cancel_driver_task.done():
+            cancel_driver_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(cancel_driver_task, timeout=1.0)
+        if not start_task.done():
+            start_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(start_task, timeout=1.0)
+        if close_task is not None and not close_task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(close_task), timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
 
 
 @pytest.mark.asyncio
