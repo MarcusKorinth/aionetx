@@ -47,6 +47,7 @@ class _TcpClientForSupervision(Protocol):
     _running: bool
     _settings: TcpClientSettings
     _state_lock: asyncio.Lock
+    _stop_waiter: asyncio.Future[None] | None
     _status_changed: asyncio.Event
     _status_version: int
 
@@ -59,7 +60,7 @@ class _TcpClientForSupervision(Protocol):
     ) -> ComponentLifecycleChangedEvent | None:
         raise NotImplementedError
 
-    async def _close_current_connection(self) -> None:
+    async def _close_current_connection(self) -> tuple[asyncio.Future[None], ...]:
         raise NotImplementedError
 
     async def _connect_once(self) -> None:
@@ -165,7 +166,8 @@ class TcpClientConnectionSupervisor:
 
     async def _run_connect_cycle(self) -> bool:
         """Run one connect-to-disconnect cycle and decide whether supervision continues."""
-        await self._start_connect_attempt()
+        if not await self._start_connect_attempt():
+            return False
         await self._await_connection_termination()
         return await self._schedule_reconnect_after_disconnect()
 
@@ -195,7 +197,7 @@ class TcpClientConnectionSupervisor:
         policy = self._capture_failure_state(error)
         return _FailureOutcome(policy=policy, reconnect=self._plan_reconnect())
 
-    async def _start_connect_attempt(self) -> None:
+    async def _start_connect_attempt(self) -> bool:
         """Advance attempt counters, publish start notification, and open one connection."""
         client = self._client
         client._last_connect_error = None
@@ -207,9 +209,14 @@ class TcpClientConnectionSupervisor:
                 attempt=client._attempt_counter,
             )
         )
+        if not client._running or client._lifecycle_state != ComponentLifecycleState.RUNNING:
+            return False
         await client._connect_once()
+        if not client._running:
+            return False
         client._backoff.reset()
         client._logger.debug("TCP client connected.")
+        return True
 
     async def _await_connection_termination(self) -> None:
         """Wait until the current connection disappears or reaches ``CLOSED``."""
@@ -340,7 +347,10 @@ class TcpClientConnectionSupervisor:
         """Leave the client in a fully stopped state after supervision exits."""
         try:
             await self._shutdown_active_resources()
-            await self._publish_terminal_lifecycle_transitions()
+            async with self._client._state_lock:
+                explicit_stop_in_progress = self._client._stop_waiter is not None
+            if not explicit_stop_in_progress:
+                await self._publish_terminal_lifecycle_transitions()
         finally:
             await self._stop_dispatcher()
 
@@ -360,6 +370,9 @@ class TcpClientConnectionSupervisor:
         # Supervision can reach a terminal state on its own, for example after a
         # non-retrying connect failure. The dispatcher is still stopped here so
         # background delivery never outlives the final STOPPED transition.
+        async with self._client._state_lock:
+            if self._client._stop_waiter is not None:
+                return
         await self._client._event_dispatcher.stop()
 
     async def _collect_terminal_lifecycle_events(self) -> list[ComponentLifecycleChangedEvent]:
