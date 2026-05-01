@@ -73,6 +73,13 @@ class DispatcherRuntimeStats:
     queue_peak: int
 
 
+@dataclass(slots=True)
+class _QueuedEvent:
+    event: NetworkEvent
+    handled: asyncio.Future[None] | None = None
+    drop_on_backpressure: bool = True
+
+
 @dataclass(frozen=True, slots=True)
 class DispatcherStopPolicy:
     """
@@ -167,7 +174,7 @@ class AsyncioEventDispatcher:
         self._stop_policy_enabled = stop_policy.enabled
         self._stop_component_callback = stop_policy.callback
         self._worker_task: asyncio.Task[None] | None = None
-        self._queue: deque[NetworkEvent] = deque()
+        self._queue: deque[_QueuedEvent] = deque()
         self._queue_not_empty = asyncio.Condition()
         self._queue_not_full = asyncio.Condition()
         self._stopping = False
@@ -262,9 +269,11 @@ class AsyncioEventDispatcher:
         # it must not await the worker it is currently unwinding.
         if current_task is worker_task:
             self._dropped_stop_phase_total += len(self._queue)
+            for queued_event in self._queue:
+                self._drop_queued_event(queued_event, reason="dropped because dispatcher stopped")
             self._queue.clear()
             return
-        _ = await cast(Awaitable[object], worker_task)
+        _ = await asyncio.shield(cast(Awaitable[object], worker_task))
 
     async def emit(self, event: NetworkEvent) -> None:
         """
@@ -301,22 +310,83 @@ class AsyncioEventDispatcher:
             self._inline_fallback_total += 1
             await self._emit_now(event)
             return
-        await self._enqueue(event)
+        await self._enqueue(_QueuedEvent(event=event))
 
-    async def _enqueue(self, event: NetworkEvent) -> None:
+    async def emit_and_wait(
+        self, event: NetworkEvent, *, drop_on_backpressure: bool = True
+    ) -> None:
+        """
+        Emit an event and wait until handler execution has completed.
+
+        This preserves normal ``emit()`` behavior for callers that only need
+        queue acceptance, while giving lifecycle-sensitive transports a narrow
+        internal hook for event-completion barriers.
+        """
+        self._emit_calls_total += 1
+        if self._delivery.dispatch_mode == EventDispatchMode.INLINE:
+            await self._emit_now(event)
+            return
+        if self._is_in_inline_dispatch_context():
+            self._inline_fallback_total += 1
+            await self._emit_now(event)
+            return
+        if not self._accepting_background_events():
+            self._record_stop_phase_drop(event)
+            raise RuntimeError("Queued event was dropped because dispatcher stopped.")
+        if self.current_task_is_worker():
+            self._inline_fallback_total += 1
+            await self._emit_now(event)
+            return
+        if not self._has_background_worker():
+            self._inline_fallback_total += 1
+            await self._emit_now(event)
+            return
+        current_task = asyncio.current_task()
+        worker_task = cast(asyncio.Task[None], self._worker_task)
+        loop = current_task.get_loop() if current_task is not None else worker_task.get_loop()
+        handled = loop.create_future()
+        await self._enqueue(
+            _QueuedEvent(
+                event=event,
+                handled=handled,
+                drop_on_backpressure=drop_on_backpressure,
+            )
+        )
+        caller_cancelled = False
+        while True:
+            try:
+                await asyncio.shield(handled)
+                break
+            except asyncio.CancelledError:
+                caller_cancelled = True
+                if handled.done():
+                    break
+                continue
+        if handled.cancelled():
+            raise asyncio.CancelledError
+        if error := handled.exception():
+            raise error
+        if caller_cancelled:
+            raise asyncio.CancelledError
+
+    async def _enqueue(self, queued_event: _QueuedEvent) -> None:
         """
         Queue one event for background delivery under backpressure rules.
 
         The method keeps shutdown predictable: once stop begins, blocked
         producers are released and no additional background work is accepted.
         """
+        event = queued_event.event
         while True:
             async with self._queue_not_full:
                 if not self._accepting_background_events():
                     self._record_stop_phase_drop(event)
+                    self._drop_queued_event(
+                        queued_event, reason="dropped because dispatcher stopped"
+                    )
                     return
                 if len(self._queue) < self._delivery.max_pending_events:
-                    self._queue.append(event)
+                    self._queue.append(queued_event)
                     self._enqueued_total += 1
                     self._queue_peak = max(self._queue_peak, len(self._queue))
                     break
@@ -325,15 +395,37 @@ class AsyncioEventDispatcher:
                     await self._queue_not_full.wait()
                     continue
                 if policy == EventBackpressurePolicy.DROP_OLDEST:
-                    self._queue.popleft()
-                    self._queue.append(event)
+                    droppable_index = next(
+                        (
+                            index
+                            for index, pending in enumerate(self._queue)
+                            if pending.drop_on_backpressure
+                        ),
+                        None,
+                    )
+                    if droppable_index is None:
+                        if not queued_event.drop_on_backpressure:
+                            await self._queue_not_full.wait()
+                            continue
+                        self._dropped_backpressure_newest_total += 1
+                        self._warn_backpressure_drop(policy=EventBackpressurePolicy.DROP_NEWEST)
+                        self._drop_queued_event(queued_event, reason="dropped by backpressure")
+                        return
+                    dropped_event = self._queue[droppable_index]
+                    del self._queue[droppable_index]
+                    self._drop_queued_event(dropped_event, reason="dropped by backpressure")
+                    self._queue.append(queued_event)
                     self._dropped_backpressure_oldest_total += 1
                     self._enqueued_total += 1
                     self._queue_peak = max(self._queue_peak, len(self._queue))
                     self._warn_backpressure_drop(policy=policy)
                     break
+                if not queued_event.drop_on_backpressure:
+                    await self._queue_not_full.wait()
+                    continue
                 self._dropped_backpressure_newest_total += 1
                 self._warn_backpressure_drop(policy=policy)
+                self._drop_queued_event(queued_event, reason="dropped by backpressure")
                 return
 
         async with self._queue_not_empty:
@@ -407,23 +499,54 @@ class AsyncioEventDispatcher:
     async def _run(self) -> None:
         """Drain the background queue until shutdown begins and queued work is exhausted."""
         current_task = asyncio.current_task()
+        termination_error: BaseException | None = None
         try:
             while True:
-                event: NetworkEvent | None = None
+                queued_event: _QueuedEvent | None = None
                 async with self._queue_not_empty:
                     while not self._queue and not self._stopping:
                         await self._queue_not_empty.wait()
                     if self._stopping and not self._queue:
                         return
                     if self._queue:
-                        event = self._queue.popleft()
+                        queued_event = self._queue.popleft()
                 async with self._queue_not_full:
                     self._queue_not_full.notify()
-                if event is not None:
-                    await self._emit_now(event)
+                if queued_event is not None:
+                    try:
+                        await self._emit_now(queued_event.event)
+                    except BaseException as delivery_error:
+                        termination_error = delivery_error
+                        self._fail_queued_event(queued_event, delivery_error)
+                        raise
+                    else:
+                        self._complete_queued_event(queued_event)
         finally:
+            if self._queue:
+                pending_error = termination_error or asyncio.CancelledError()
+                for queued_event in self._queue:
+                    self._fail_queued_event(queued_event, pending_error)
+                self._queue.clear()
             if self._worker_task is current_task:
                 self._worker_task = None
+
+    def _complete_queued_event(self, queued_event: _QueuedEvent) -> None:
+        """Wake an emit-and-wait caller after successful handling or intentional drop."""
+        handled = queued_event.handled
+        if handled is not None and not handled.done():
+            handled.set_result(None)
+
+    def _drop_queued_event(self, queued_event: _QueuedEvent, *, reason: str) -> None:
+        """Wake an emit-and-wait caller when its barrier event was dropped."""
+        handled = queued_event.handled
+        if handled is not None and not handled.done():
+            handled.set_exception(RuntimeError(f"Queued event was {reason}."))
+
+    def _fail_queued_event(self, queued_event: _QueuedEvent, error: BaseException) -> None:
+        """Wake an emit-and-wait caller when worker delivery fails unexpectedly."""
+        handled = queued_event.handled
+        if handled is not None and not handled.done():
+            handled.set_exception(error)
 
     async def _emit_now(self, event: NetworkEvent) -> None:
         """Deliver one event to the handler and route failures through policy handling.
