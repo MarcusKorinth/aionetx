@@ -274,11 +274,10 @@ class _AsyncioDatagramReceiverBase:
 
         Flow overview:
             lock      : plan snapshot, detach task/socket, compute STOPPING
-            unlock    : emit STOPPING
-            unlock    : cancel task and close socket
-            unlock    : emit ConnectionClosedEvent when this is not startup rollback
-            lock      : compute STOPPED
-            unlock    : emit STOPPED and stop dispatcher
+            ordinary  : emit STOPPING, tear down resources, then publish
+                        ConnectionClosedEvent/STOPPED and stop dispatcher
+            deferred  : tear down resources first, stop handler-origin dispatch,
+                        then publish terminal events after active handlers unwind
         """
         snapshot = await self._plan_stop_snapshot()
         handler_originated_stop = (
