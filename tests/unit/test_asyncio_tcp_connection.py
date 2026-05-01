@@ -11,6 +11,7 @@ are covered in detail.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -23,6 +24,7 @@ from aionetx.api.connection_lifecycle import ConnectionRole
 from aionetx.api.connection_lifecycle import ConnectionState
 from aionetx.api.network_error_event import NetworkErrorEvent
 from aionetx.api.event_delivery_settings import (
+    EventBackpressurePolicy,
     EventDeliverySettings,
     EventDispatchMode,
     EventHandlerFailurePolicy,
@@ -49,6 +51,32 @@ async def _no_op_server_handler(
 
     writer.close()
     await writer.wait_closed()
+
+
+class _DummyWriter:
+    def __init__(self) -> None:
+        self.closed = False
+        self.closed_event = asyncio.Event()
+
+    def get_extra_info(self, key: str):
+        if key == "sockname":
+            return ("127.0.0.1", 10001)
+        if key == "peername":
+            return ("127.0.0.1", 10002)
+        return None
+
+    def write(self, data: bytes) -> None:
+        return None
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+        self.closed_event.set()
+
+    async def wait_closed(self) -> None:
+        return None
 
 
 # Startup, receive ordering, and basic send behavior.
@@ -122,10 +150,95 @@ async def test_tcp_connection_invariant_connection_opened_precedes_bytes_receive
 
 
 @pytest.mark.asyncio
-async def test_tcp_connection_start_enters_connecting_before_connected(
+@pytest.mark.parametrize(
+    "dispatch_mode",
+    [EventDispatchMode.INLINE, EventDispatchMode.BACKGROUND],
+)
+async def test_tcp_connection_dispatch_waits_for_opened_before_reading(
+    dispatch_mode: EventDispatchMode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingOpenedHandler:
+        def __init__(self) -> None:
+            self.opened_started = asyncio.Event()
+            self.opened_finished = asyncio.Event()
+            self.allow_opened_to_finish = asyncio.Event()
+            self.bytes_started = asyncio.Event()
+            self.active_handlers = 0
+            self.max_active_handlers = 0
+
+        async def on_event(self, event) -> None:
+            is_opened_event = isinstance(event, ConnectionOpenedEvent)
+            self.active_handlers += 1
+            self.max_active_handlers = max(self.max_active_handlers, self.active_handlers)
+            try:
+                if is_opened_event:
+                    self.opened_started.set()
+                    await self.allow_opened_to_finish.wait()
+                elif isinstance(event, BytesReceivedEvent):
+                    self.bytes_started.set()
+            finally:
+                self.active_handlers -= 1
+                if is_opened_event:
+                    self.opened_finished.set()
+
+    handler = BlockingOpenedHandler()
+    read_task_created = asyncio.Event()
+    original_create_task = asyncio.create_task
+
+    def tracking_create_task(coro, *args, **kwargs):
+        coro_name = getattr(getattr(coro, "cr_code", None), "co_name", "")
+        task = original_create_task(coro, *args, **kwargs)
+        if coro_name == "_read_loop":
+            read_task_created.set()
+        return task
+
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(dispatch_mode=dispatch_mode),
+        logger=logging.getLogger("test"),
+    )
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"hello")
+    connection = AsyncioTcpConnection(
+        "client:inline-ordering",
+        ConnectionRole.CLIENT,
+        reader,
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    monkeypatch.setattr(asyncio, "create_task", tracking_create_task)
+    start_task = asyncio.create_task(connection.start())
+    try:
+        await asyncio.wait_for(handler.opened_started.wait(), timeout=1.0)
+
+        assert not read_task_created.is_set()
+        assert not handler.bytes_started.is_set()
+        assert handler.max_active_handlers == 1
+
+        handler.allow_opened_to_finish.set()
+        await asyncio.wait_for(handler.opened_finished.wait(), timeout=1.0)
+        await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(read_task_created.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+        assert handler.max_active_handlers == 1
+    finally:
+        handler.allow_opened_to_finish.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=1.0)
+        await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_tcp_connection_starts_read_loop_after_opened_event_publication(
     recording_event_handler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen_state_at_task_creation: list[ConnectionState] = []
+    seen_opened_emit_completed_at_task_creation: list[bool] = []
 
     original_create_task = asyncio.create_task
 
@@ -133,47 +246,120 @@ async def test_tcp_connection_start_enters_connecting_before_connected(
         coro_name = getattr(getattr(coro, "cr_code", None), "co_name", "")
         if coro_name == "_read_loop":
             seen_state_at_task_creation.append(connection.state)
+            seen_opened_emit_completed_at_task_creation.append(opened_emit_completed)
         return original_create_task(coro, *args, **kwargs)
-
-    class DummyWriter:
-        def get_extra_info(self, key: str):
-            if key == "sockname":
-                return ("127.0.0.1", 10001)
-            if key == "peername":
-                return ("127.0.0.1", 10002)
-            return None
-
-        def write(self, data: bytes) -> None:
-            return None
-
-        async def drain(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-        async def wait_closed(self) -> None:
-            return None
 
     dispatcher = make_dispatcher(recording_event_handler)
     await dispatcher.start()
+    original_emit_and_wait = dispatcher.emit_and_wait
+    opened_emit_completed = False
+
+    async def tracking_emit_and_wait(event, **kwargs):
+        nonlocal opened_emit_completed
+        await original_emit_and_wait(event, **kwargs)
+        if isinstance(event, ConnectionOpenedEvent):
+            opened_emit_completed = True
+
     connection = AsyncioTcpConnection(
         "client:test-connecting",
         ConnectionRole.CLIENT,
         asyncio.StreamReader(),
-        DummyWriter(),  # type: ignore[arg-type]
+        _DummyWriter(),  # type: ignore[arg-type]
         dispatcher,
         4096,
     )
 
     monkeypatch.setattr(asyncio, "create_task", tracking_create_task)
+    monkeypatch.setattr(dispatcher, "emit_and_wait", tracking_emit_and_wait)
 
     await connection.start()
     await connection.close()
     await dispatcher.stop()
 
     assert seen_state_at_task_creation
-    assert seen_state_at_task_creation[0] == ConnectionState.CONNECTING
+    assert seen_state_at_task_creation[0] == ConnectionState.CONNECTED
+    assert seen_opened_emit_completed_at_task_creation == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy",
+    [EventBackpressurePolicy.DROP_NEWEST, EventBackpressurePolicy.DROP_OLDEST],
+)
+async def test_tcp_connection_opened_barrier_is_not_dropped_by_background_backpressure(
+    policy: EventBackpressurePolicy,
+) -> None:
+    blocker_started = asyncio.Event()
+    allow_blocker_to_finish = asyncio.Event()
+    opened_seen = asyncio.Event()
+
+    class BlockingHandler:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, BytesReceivedEvent):
+                self.events.append(event.resource_id)
+                if event.resource_id == "blocker":
+                    blocker_started.set()
+                    await allow_blocker_to_finish.wait()
+            elif isinstance(event, ConnectionOpenedEvent):
+                self.events.append("opened")
+                opened_seen.set()
+
+    handler = BlockingHandler()
+    dispatcher = AsyncioEventDispatcher(
+        event_handler=handler,
+        delivery=EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            max_pending_events=1,
+            backpressure_policy=policy,
+        ),
+        logger=logging.getLogger("test"),
+    )
+    connection = AsyncioTcpConnection(
+        "client:opened-barrier-not-dropped",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        _DummyWriter(),  # type: ignore[arg-type]
+        dispatcher,
+        4096,
+    )
+
+    await dispatcher.start()
+    start_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(BytesReceivedEvent(resource_id="blocker", data=b""))
+        await asyncio.wait_for(blocker_started.wait(), timeout=1.0)
+        await dispatcher.emit(BytesReceivedEvent(resource_id="queued", data=b""))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        start_task = asyncio.create_task(connection.start())
+        await asyncio.sleep(0)
+        assert not start_task.done()
+        assert dispatcher.runtime_stats.queue_depth == 1
+
+        allow_blocker_to_finish.set()
+        await asyncio.wait_for(start_task, timeout=1.0)
+        await asyncio.wait_for(opened_seen.wait(), timeout=1.0)
+    finally:
+        allow_blocker_to_finish.set()
+        if start_task is not None and not start_task.done():
+            start_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(start_task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+    if policy == EventBackpressurePolicy.DROP_OLDEST:
+        assert handler.events == ["blocker", "opened"]
+    else:
+        assert handler.events == ["blocker", "queued", "opened"]
 
 
 @pytest.mark.asyncio
