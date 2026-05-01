@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
 
+from aionetx.api.bytes_received_event import BytesReceivedEvent
 from aionetx.api.event_delivery_settings import (
     EventBackpressurePolicy,
     EventDeliverySettings,
@@ -36,6 +37,15 @@ _stop_drop_warning_limiter = WarningRateLimiter(interval_seconds=5.0)
 _backpressure_drop_warning_limiter = WarningRateLimiter(interval_seconds=5.0)
 _inline_dispatcher_context: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar(
     "aionetx_inline_dispatcher_context", default=frozenset()
+)
+_stop_await_bypass_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = (
+    contextvars.ContextVar("aionetx_stop_await_bypass_context", default=frozenset())
+)
+_handler_dispatch_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = (
+    contextvars.ContextVar("aionetx_handler_dispatch_context", default=frozenset())
+)
+_handler_origin_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = (
+    contextvars.ContextVar("aionetx_handler_origin_context", default=frozenset())
 )
 
 
@@ -71,6 +81,13 @@ class DispatcherRuntimeStats:
     dropped_stop_phase_total: int
     queue_depth: int
     queue_peak: int
+
+
+@dataclass(slots=True)
+class _QueuedEvent:
+    event: NetworkEvent
+    handled: asyncio.Future[None] | None = None
+    drop_on_backpressure: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +184,7 @@ class AsyncioEventDispatcher:
         self._stop_policy_enabled = stop_policy.enabled
         self._stop_component_callback = stop_policy.callback
         self._worker_task: asyncio.Task[None] | None = None
-        self._queue: deque[NetworkEvent] = deque()
+        self._queue: deque[_QueuedEvent] = deque()
         self._queue_not_empty = asyncio.Condition()
         self._queue_not_full = asyncio.Condition()
         self._stopping = False
@@ -180,6 +197,14 @@ class AsyncioEventDispatcher:
         self._dropped_backpressure_newest_total = 0
         self._dropped_stop_phase_total = 0
         self._queue_peak = 0
+        self._active_handler_origin_tokens: set[int] = set()
+        self._active_handler_origin_resources: dict[int, str | None] = {}
+        self._active_handler_origin_owner_tasks: dict[int, int | None] = {}
+        self._active_handler_origin_child_provenance_tokens: set[int] = set()
+        self._next_handler_origin_token = 0
+        self._active_stop_await_bypass_tokens: set[int] = set()
+        self._active_stop_await_bypass_owner_tasks: dict[int, int] = {}
+        self._next_stop_await_bypass_token = 0
 
     def _has_background_worker(self) -> bool:
         return self._worker_task is not None
@@ -260,11 +285,18 @@ class AsyncioEventDispatcher:
         # In background mode, handlers run on the worker task. If a handler
         # triggers component shutdown, stop() may execute on that same task, so
         # it must not await the worker it is currently unwinding.
-        if current_task is worker_task:
+        if current_task is worker_task or self._is_in_stop_await_bypass_context():
             self._dropped_stop_phase_total += len(self._queue)
+            for queued_event in self._queue:
+                self._drop_queued_event(queued_event, reason="dropped because dispatcher stopped")
             self._queue.clear()
             return
-        _ = await cast(Awaitable[object], worker_task)
+        _ = await asyncio.shield(cast(Awaitable[object], worker_task))
+
+    async def stop_from_handler_origin(self) -> None:
+        """Begin dispatcher stop without awaiting the active handler worker."""
+        with self._stop_await_bypass_context():
+            await self.stop()
 
     async def emit(self, event: NetworkEvent) -> None:
         """
@@ -301,22 +333,107 @@ class AsyncioEventDispatcher:
             self._inline_fallback_total += 1
             await self._emit_now(event)
             return
-        await self._enqueue(event)
+        await self._enqueue(_QueuedEvent(event=event))
 
-    async def _enqueue(self, event: NetworkEvent) -> None:
+    async def emit_and_wait(
+        self, event: NetworkEvent, *, drop_on_backpressure: bool = True
+    ) -> None:
+        """
+        Emit an event and wait until handler execution has completed.
+
+        This preserves normal ``emit()`` behavior for callers that only need
+        queue acceptance, while giving lifecycle-sensitive transports a narrow
+        internal hook for event-completion barriers.
+        """
+        self._emit_calls_total += 1
+        if self._delivery.dispatch_mode == EventDispatchMode.INLINE:
+            await self._emit_now(event)
+            return
+        if self._is_in_inline_dispatch_context():
+            self._inline_fallback_total += 1
+            await self._emit_now(event)
+            return
+        if not self._accepting_background_events():
+            self._record_stop_phase_drop(event)
+            raise RuntimeError("Queued event was dropped because dispatcher stopped.")
+        if self.current_task_is_worker():
+            self._inline_fallback_total += 1
+            await self._emit_now(event)
+            return
+        if not self._has_background_worker():
+            self._inline_fallback_total += 1
+            await self._emit_now(event)
+            return
+        current_task = asyncio.current_task()
+        worker_task = cast(asyncio.Task[None], self._worker_task)
+        loop = current_task.get_loop() if current_task is not None else worker_task.get_loop()
+        handled = loop.create_future()
+        await self._enqueue(
+            _QueuedEvent(
+                event=event,
+                handled=handled,
+                drop_on_backpressure=drop_on_backpressure,
+            )
+        )
+        caller_cancelled = False
+        while True:
+            try:
+                await asyncio.shield(handled)
+                break
+            except asyncio.CancelledError:
+                caller_cancelled = True
+                if handled.done():
+                    break
+                continue
+        if handled.cancelled():
+            raise asyncio.CancelledError
+        if error := handled.exception():
+            raise error
+        if caller_cancelled:
+            raise asyncio.CancelledError
+
+    async def drop_queued_events_for_resource(self, resource_id: str) -> int:
+        """Drop queued payload events for one resource and release any waiters."""
+        dropped_events: list[_QueuedEvent] = []
+        kept_events: deque[_QueuedEvent] = deque()
+        for queued_event in self._queue:
+            if (
+                isinstance(queued_event.event, BytesReceivedEvent)
+                and queued_event.event.resource_id == resource_id
+            ):
+                dropped_events.append(queued_event)
+            else:
+                kept_events.append(queued_event)
+        if not dropped_events:
+            return 0
+        self._queue = kept_events
+        self._dropped_stop_phase_total += len(dropped_events)
+        for queued_event in dropped_events:
+            self._drop_queued_event(
+                queued_event, reason=f"dropped because resource {resource_id} closed"
+            )
+        async with self._queue_not_full:
+            self._queue_not_full.notify_all()
+        return len(dropped_events)
+
+    async def _enqueue(self, queued_event: _QueuedEvent) -> None:
         """
         Queue one event for background delivery under backpressure rules.
 
         The method keeps shutdown predictable: once stop begins, blocked
         producers are released and no additional background work is accepted.
         """
+        event = queued_event.event
         while True:
             async with self._queue_not_full:
                 if not self._accepting_background_events():
                     self._record_stop_phase_drop(event)
+                    self._drop_queued_event(
+                        queued_event, reason="dropped because dispatcher stopped"
+                    )
                     return
                 if len(self._queue) < self._delivery.max_pending_events:
-                    self._queue.append(event)
+                    self._queue.append(queued_event)
                     self._enqueued_total += 1
                     self._queue_peak = max(self._queue_peak, len(self._queue))
                     break
@@ -325,15 +442,37 @@ class AsyncioEventDispatcher:
                     await self._queue_not_full.wait()
                     continue
                 if policy == EventBackpressurePolicy.DROP_OLDEST:
-                    self._queue.popleft()
-                    self._queue.append(event)
+                    droppable_index = next(
+                        (
+                            index
+                            for index, pending in enumerate(self._queue)
+                            if pending.drop_on_backpressure
+                        ),
+                        None,
+                    )
+                    if droppable_index is None:
+                        if not queued_event.drop_on_backpressure:
+                            await self._queue_not_full.wait()
+                            continue
+                        self._dropped_backpressure_newest_total += 1
+                        self._warn_backpressure_drop(policy=EventBackpressurePolicy.DROP_NEWEST)
+                        self._drop_queued_event(queued_event, reason="dropped by backpressure")
+                        return
+                    dropped_event = self._queue[droppable_index]
+                    del self._queue[droppable_index]
+                    self._drop_queued_event(dropped_event, reason="dropped by backpressure")
+                    self._queue.append(queued_event)
                     self._dropped_backpressure_oldest_total += 1
                     self._enqueued_total += 1
                     self._queue_peak = max(self._queue_peak, len(self._queue))
                     self._warn_backpressure_drop(policy=policy)
                     break
+                if not queued_event.drop_on_backpressure:
+                    await self._queue_not_full.wait()
+                    continue
                 self._dropped_backpressure_newest_total += 1
                 self._warn_backpressure_drop(policy=policy)
+                self._drop_queued_event(queued_event, reason="dropped by backpressure")
                 return
 
         async with self._queue_not_empty:
@@ -369,6 +508,187 @@ class AsyncioEventDispatcher:
         same background queue that the initiating handler is currently blocking.
         """
         return id(self) in _inline_dispatcher_context.get()
+
+    def current_task_has_inline_delivery_context(self) -> bool:
+        """
+        Return whether the caller inherited this dispatcher's inline-delivery context.
+
+        This is used by shutdown helper tasks created from handler-originated
+        stop paths. They are not the dispatcher worker task, but they must still
+        avoid queueing terminal events behind the handler currently unwinding.
+        """
+        return self._is_in_inline_dispatch_context()
+
+    def current_task_is_dispatching_handler(self, resource_id: str | None = None) -> bool:
+        """Return whether the current task is directly running this dispatcher's handler."""
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        if (id(self), id(current_task)) not in _handler_dispatch_context.get():
+            return False
+        if resource_id is None:
+            return True
+        return self.current_task_has_handler_origin_context(resource_id)
+
+    def current_task_has_handler_origin_context(self, resource_id: str | None = None) -> bool:
+        """Return whether this task was created from this dispatcher's handler context."""
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        current_task_id = id(current_task)
+        dispatcher_id = id(self)
+        return any(
+            origin_dispatcher_id == dispatcher_id
+            and origin_token in self._active_handler_origin_tokens
+            and (
+                self._active_handler_origin_owner_tasks.get(origin_token) is None
+                or self._active_handler_origin_owner_tasks.get(origin_token) == current_task_id
+            )
+            and (
+                resource_id is None
+                or self._active_handler_origin_resources.get(origin_token) == resource_id
+            )
+            for origin_dispatcher_id, origin_token in _handler_origin_context.get()
+        )
+
+    def current_task_inherits_handler_origin_context(self, resource_id: str | None = None) -> bool:
+        """
+        Return whether the caller carries handler-origin provenance.
+
+        Unlike ``current_task_has_handler_origin_context()``, this method does
+        not grant handler-origin authority. It exists only for deadlock
+        avoidance when a user handler spawns and awaits a child task before
+        returning.
+        """
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        current_task_id = id(current_task)
+        dispatcher_id = id(self)
+        return any(
+            origin_dispatcher_id == dispatcher_id
+            and origin_token in self._active_handler_origin_tokens
+            and (
+                origin_token in self._active_handler_origin_child_provenance_tokens
+                or self._active_handler_origin_owner_tasks.get(origin_token) == current_task_id
+            )
+            and (
+                resource_id is None
+                or self._active_handler_origin_resources.get(origin_token) == resource_id
+            )
+            for origin_dispatcher_id, origin_token in _handler_origin_context.get()
+        )
+
+    def has_active_handler_context(self, resource_id: str | None = None) -> bool:
+        """Return whether this dispatcher currently has an active handler barrier."""
+        if resource_id is None:
+            return bool(self._active_handler_origin_tokens)
+        return any(
+            active_resource_id == resource_id
+            for active_resource_id in self._active_handler_origin_resources.values()
+        )
+
+    def has_active_handler_origin(self) -> bool:
+        """Return whether this dispatcher currently has an active handler-origin barrier."""
+        return self.has_active_handler_context()
+
+    def current_task_would_deliver_inline(self) -> bool:
+        """Return whether emit() from this task would invoke the handler inline."""
+        return (
+            self._delivery.dispatch_mode == EventDispatchMode.INLINE
+            or self._is_in_inline_dispatch_context()
+            or self.current_task_is_worker()
+            or not self._has_background_worker()
+        )
+
+    @contextmanager
+    def _handler_dispatch_context(self, resource_id: str | None) -> Iterator[None]:
+        """Mark the current task as directly executing this dispatcher's handler."""
+        current_task = asyncio.current_task()
+        if current_task is None:
+            yield
+            return
+        self._next_handler_origin_token += 1
+        origin_token = self._next_handler_origin_token
+        self._active_handler_origin_tokens.add(origin_token)
+        self._active_handler_origin_resources[origin_token] = resource_id
+        self._active_handler_origin_owner_tasks[origin_token] = id(current_task)
+        self._active_handler_origin_child_provenance_tokens.add(origin_token)
+        active_handlers = _handler_dispatch_context.get()
+        active_handler_origins = _handler_origin_context.get()
+        reset_token = _handler_dispatch_context.set(
+            active_handlers | {(id(self), id(current_task))}
+        )
+        origin_reset_token = _handler_origin_context.set(
+            active_handler_origins | {(id(self), origin_token)}
+        )
+        try:
+            yield
+        finally:
+            self._active_handler_origin_tokens.discard(origin_token)
+            self._active_handler_origin_resources.pop(origin_token, None)
+            self._active_handler_origin_owner_tasks.pop(origin_token, None)
+            self._active_handler_origin_child_provenance_tokens.discard(origin_token)
+            _handler_dispatch_context.reset(reset_token)
+            _handler_origin_context.reset(origin_reset_token)
+
+    @contextmanager
+    def _handler_origin_context_only(self, resource_id: str | None) -> Iterator[None]:
+        """Mark work as originating from a handler after handler dispatch unwound."""
+        current_task = asyncio.current_task()
+        self._next_handler_origin_token += 1
+        origin_token = self._next_handler_origin_token
+        self._active_handler_origin_tokens.add(origin_token)
+        self._active_handler_origin_resources[origin_token] = resource_id
+        self._active_handler_origin_owner_tasks[origin_token] = (
+            id(current_task) if current_task is not None else None
+        )
+        active_handler_origins = _handler_origin_context.get()
+        origin_reset_token = _handler_origin_context.set(
+            active_handler_origins | {(id(self), origin_token)}
+        )
+        try:
+            yield
+        finally:
+            self._active_handler_origin_tokens.discard(origin_token)
+            self._active_handler_origin_resources.pop(origin_token, None)
+            self._active_handler_origin_owner_tasks.pop(origin_token, None)
+            self._active_handler_origin_child_provenance_tokens.discard(origin_token)
+            _handler_origin_context.reset(origin_reset_token)
+
+    def _is_in_stop_await_bypass_context(self) -> bool:
+        """Return whether the current task has this dispatcher's active stop-bypass token."""
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        current_task_id = id(current_task)
+        dispatcher_id = id(self)
+        return any(
+            origin_dispatcher_id == dispatcher_id
+            and origin_token in self._active_stop_await_bypass_tokens
+            and self._active_stop_await_bypass_owner_tasks.get(origin_token) == current_task_id
+            for origin_dispatcher_id, origin_token in _stop_await_bypass_context.get()
+        )
+
+    @contextmanager
+    def _stop_await_bypass_context(self) -> Iterator[None]:
+        """Temporarily let a component-owned stop path avoid awaiting the worker."""
+        self._next_stop_await_bypass_token += 1
+        origin_token = self._next_stop_await_bypass_token
+        self._active_stop_await_bypass_tokens.add(origin_token)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_stop_await_bypass_owner_tasks[origin_token] = id(current_task)
+        active_bypass_contexts = _stop_await_bypass_context.get()
+        reset_token = _stop_await_bypass_context.set(
+            active_bypass_contexts | {(id(self), origin_token)}
+        )
+        try:
+            yield
+        finally:
+            self._active_stop_await_bypass_tokens.discard(origin_token)
+            self._active_stop_await_bypass_owner_tasks.pop(origin_token, None)
+            _stop_await_bypass_context.reset(reset_token)
 
     @contextmanager
     def inline_delivery_context(self) -> Iterator[None]:
@@ -407,23 +727,54 @@ class AsyncioEventDispatcher:
     async def _run(self) -> None:
         """Drain the background queue until shutdown begins and queued work is exhausted."""
         current_task = asyncio.current_task()
+        termination_error: BaseException | None = None
         try:
             while True:
-                event: NetworkEvent | None = None
+                queued_event: _QueuedEvent | None = None
                 async with self._queue_not_empty:
                     while not self._queue and not self._stopping:
                         await self._queue_not_empty.wait()
                     if self._stopping and not self._queue:
                         return
                     if self._queue:
-                        event = self._queue.popleft()
+                        queued_event = self._queue.popleft()
                 async with self._queue_not_full:
                     self._queue_not_full.notify()
-                if event is not None:
-                    await self._emit_now(event)
+                if queued_event is not None:
+                    try:
+                        await self._emit_now(queued_event.event)
+                    except BaseException as delivery_error:
+                        termination_error = delivery_error
+                        self._fail_queued_event(queued_event, delivery_error)
+                        raise
+                    else:
+                        self._complete_queued_event(queued_event)
         finally:
+            if self._queue:
+                pending_error = termination_error or asyncio.CancelledError()
+                for queued_event in self._queue:
+                    self._fail_queued_event(queued_event, pending_error)
+                self._queue.clear()
             if self._worker_task is current_task:
                 self._worker_task = None
+
+    def _complete_queued_event(self, queued_event: _QueuedEvent) -> None:
+        """Wake an emit-and-wait caller after successful handling or intentional drop."""
+        handled = queued_event.handled
+        if handled is not None and not handled.done():
+            handled.set_result(None)
+
+    def _drop_queued_event(self, queued_event: _QueuedEvent, *, reason: str) -> None:
+        """Wake an emit-and-wait caller when its barrier event was dropped."""
+        handled = queued_event.handled
+        if handled is not None and not handled.done():
+            handled.set_exception(RuntimeError(f"Queued event was {reason}."))
+
+    def _fail_queued_event(self, queued_event: _QueuedEvent, error: BaseException) -> None:
+        """Wake an emit-and-wait caller when worker delivery fails unexpectedly."""
+        handled = queued_event.handled
+        if handled is not None and not handled.done():
+            handled.set_exception(error)
 
     async def _emit_now(self, event: NetworkEvent) -> None:
         """Deliver one event to the handler and route failures through policy handling.
@@ -442,7 +793,8 @@ class AsyncioEventDispatcher:
         """
         self._handler_dispatch_attempts_total += 1
         try:
-            await self._event_handler.on_event(event)
+            with self._handler_dispatch_context(getattr(event, "resource_id", None)):
+                await self._event_handler.on_event(event)
         except asyncio.CancelledError as error:
             if is_task_being_cancelled():
                 raise
@@ -515,8 +867,11 @@ class AsyncioEventDispatcher:
                     dispatch_mode=self._delivery.dispatch_mode,
                 )
             )
-            with self.inline_delivery_context():
-                await stop_callback()
+            with self._stop_await_bypass_context():
+                with self._handler_origin_context_only(
+                    getattr(triggering_event, "resource_id", None)
+                ):
+                    await stop_callback()
             return
         raise RuntimeError(f"Unhandled EventHandlerFailurePolicy: {policy!r}")
 

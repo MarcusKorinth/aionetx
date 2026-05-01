@@ -11,6 +11,7 @@ implementation detail.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -33,7 +34,7 @@ from aionetx.implementations.asyncio_impl.event_dispatcher import (
     AsyncioEventDispatcher,
     DispatcherStopPolicy,
 )
-from tests.helpers import assert_awaitable_cancelled
+from tests.helpers import assert_awaitable_cancelled, wait_for_condition
 
 pytestmark = pytest.mark.behavior_critical
 
@@ -121,6 +122,70 @@ async def test_stop_cancels_background_worker_cleanly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_stop_does_not_strand_emit_and_wait_waiters() -> None:
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+    second_started = asyncio.Event()
+    allow_second_to_finish = asyncio.Event()
+    second_handled = asyncio.Event()
+
+    class BlockingHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            if event.metadata.connection_id == "c1":
+                first_started.set()
+                await allow_first_to_finish.wait()
+            elif event.metadata.connection_id == "c2":
+                second_started.set()
+                await allow_second_to_finish.wait()
+                second_handled.set()
+
+    dispatcher = AsyncioEventDispatcher(
+        BlockingHandler(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+    emit_wait_task: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        emit_wait_task = asyncio.create_task(dispatcher.emit_and_wait(_opened(2)))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        stop_task = asyncio.create_task(dispatcher.stop())
+        await asyncio.wait_for(_wait_until_dispatcher_stopping(dispatcher), timeout=1.0)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stop_task, timeout=1.0)
+
+        allow_first_to_finish.set()
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        assert not emit_wait_task.done()
+        allow_second_to_finish.set()
+        await asyncio.wait_for(emit_wait_task, timeout=1.0)
+        await asyncio.wait_for(second_handled.wait(), timeout=1.0)
+    finally:
+        allow_first_to_finish.set()
+        allow_second_to_finish.set()
+        if emit_wait_task is not None and not emit_wait_task.done():
+            emit_wait_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_wait_task, timeout=1.0)
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stop_task, timeout=1.0)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+
+
+@pytest.mark.asyncio
 async def test_stop_called_from_event_callback_is_safe(caplog: pytest.LogCaptureFixture) -> None:
     class StopFromCallbackHandler:
         def __init__(self) -> None:
@@ -146,6 +211,160 @@ async def test_stop_called_from_event_callback_is_safe(caplog: pytest.LogCapture
     assert handler.count == 1
     assert dispatcher.is_running is False
     assert "Task cannot await on itself" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_handler_origin_context_expires_when_handler_returns() -> None:
+    handler_finished = asyncio.Event()
+    observed_origin_context: list[bool] = []
+
+    class SpawnChildFromHandler:
+        def __init__(self) -> None:
+            self.dispatcher: AsyncioEventDispatcher | None = None
+            self.child_task: asyncio.Task[None] | None = None
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            del event
+            if self.dispatcher is None:
+                raise AssertionError("dispatcher reference was not attached")
+
+            async def observe_after_handler_returns() -> None:
+                await handler_finished.wait()
+                observed_origin_context.append(
+                    self.dispatcher.current_task_has_handler_origin_context()
+                )
+
+            self.child_task = asyncio.create_task(observe_after_handler_returns())
+
+    handler = SpawnChildFromHandler()
+    dispatcher = AsyncioEventDispatcher(
+        handler,
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    handler.dispatcher = dispatcher
+    await dispatcher.start()
+    try:
+        await dispatcher.emit_and_wait(_opened("origin"))
+        handler_finished.set()
+        assert handler.child_task is not None
+        await asyncio.wait_for(handler.child_task, timeout=1.0)
+    finally:
+        handler_finished.set()
+        if handler.child_task is not None and not handler.child_task.done():
+            handler.child_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(handler.child_task, timeout=1.0)
+        await dispatcher.stop()
+
+    assert observed_origin_context == [False]
+
+
+@pytest.mark.asyncio
+async def test_handler_origin_context_is_not_inherited_by_child_tasks() -> None:
+    child_ready = asyncio.Event()
+    allow_child_to_check = asyncio.Event()
+    child_checked = asyncio.Event()
+    allow_handler_to_finish = asyncio.Event()
+    observed_handler_origin_context: list[bool] = []
+    observed_child_origin_context: list[bool] = []
+    observed_child_inherited_context: list[bool] = []
+
+    class SpawnChildFromActiveHandler:
+        def __init__(self) -> None:
+            self.dispatcher: AsyncioEventDispatcher | None = None
+            self.child_task: asyncio.Task[None] | None = None
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            del event
+            if self.dispatcher is None:
+                raise AssertionError("dispatcher reference was not attached")
+            observed_handler_origin_context.append(
+                self.dispatcher.current_task_has_handler_origin_context()
+            )
+
+            async def observe_while_handler_is_suspended() -> None:
+                child_ready.set()
+                await allow_child_to_check.wait()
+                observed_child_origin_context.append(
+                    self.dispatcher.current_task_has_handler_origin_context()
+                )
+                observed_child_inherited_context.append(
+                    self.dispatcher.current_task_inherits_handler_origin_context()
+                )
+                child_checked.set()
+
+            self.child_task = asyncio.create_task(observe_while_handler_is_suspended())
+            await child_ready.wait()
+            await child_checked.wait()
+            await allow_handler_to_finish.wait()
+
+    handler = SpawnChildFromActiveHandler()
+    dispatcher = AsyncioEventDispatcher(
+        handler,
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    handler.dispatcher = dispatcher
+    await dispatcher.start()
+    emit_task: asyncio.Task[None] | None = None
+    try:
+        emit_task = asyncio.create_task(dispatcher.emit_and_wait(_opened("origin")))
+        await asyncio.wait_for(child_ready.wait(), timeout=1.0)
+        allow_child_to_check.set()
+        await asyncio.wait_for(child_checked.wait(), timeout=1.0)
+        assert observed_handler_origin_context == [True]
+        assert observed_child_origin_context == [False]
+        assert observed_child_inherited_context == [True]
+
+        allow_handler_to_finish.set()
+        await asyncio.wait_for(emit_task, timeout=1.0)
+        assert handler.child_task is not None
+        await asyncio.wait_for(handler.child_task, timeout=1.0)
+    finally:
+        allow_child_to_check.set()
+        allow_handler_to_finish.set()
+        if emit_task is not None and not emit_task.done():
+            emit_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_task, timeout=1.0)
+        if handler.child_task is not None and not handler.child_task.done():
+            handler.child_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(handler.child_task, timeout=1.0)
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_inline_delivery_context_is_inherited_by_tasks_spawned_inside_context() -> None:
+    context_exited = asyncio.Event()
+    observed_inline_context: list[bool] = []
+
+    dispatcher = AsyncioEventDispatcher(
+        Recorder(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+
+    async def observe_after_context_exits() -> None:
+        await context_exited.wait()
+        observed_inline_context.append(dispatcher.current_task_has_inline_delivery_context())
+
+    with dispatcher.inline_delivery_context():
+        assert dispatcher.current_task_has_inline_delivery_context() is True
+        child_task = asyncio.create_task(observe_after_context_exits())
+
+    try:
+        context_exited.set()
+        await asyncio.wait_for(child_task, timeout=1.0)
+    finally:
+        context_exited.set()
+        if not child_task.done():
+            child_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(child_task, timeout=1.0)
+
+    assert observed_inline_context == [True]
 
 
 # Backpressure semantics under queue saturation.
@@ -221,6 +440,362 @@ async def test_drop_oldest_backpressure_policy_keeps_newer_events() -> None:
     await asyncio.wait_for(third_handled.wait(), timeout=1.0)
     await dispatcher.stop()
     assert handler.ids == ["c1", "c3"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy",
+    [EventBackpressurePolicy.DROP_NEWEST, EventBackpressurePolicy.DROP_OLDEST],
+)
+async def test_emit_and_wait_raises_when_barrier_event_is_dropped(
+    policy: EventBackpressurePolicy,
+) -> None:
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+
+    class BlockingHandler:
+        def __init__(self) -> None:
+            self.ids: list[str] = []
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            connection_id = event.metadata.connection_id
+            self.ids.append(connection_id)
+            if connection_id == "c1":
+                first_started.set()
+                await allow_first_to_finish.wait()
+
+    handler = BlockingHandler()
+    settings = EventDeliverySettings(
+        dispatch_mode=EventDispatchMode.BACKGROUND,
+        max_pending_events=1,
+        backpressure_policy=policy,
+    )
+    dispatcher = AsyncioEventDispatcher(handler, settings, logging.getLogger("test"))
+    await dispatcher.start()
+    emit_wait_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        if policy == EventBackpressurePolicy.DROP_NEWEST:
+            await dispatcher.emit(_opened(2))
+            with pytest.raises(RuntimeError, match="dropped"):
+                await dispatcher.emit_and_wait(_opened(3))
+        else:
+            emit_wait_task = asyncio.create_task(dispatcher.emit_and_wait(_opened(2)))
+            await wait_for_condition(
+                lambda: dispatcher.runtime_stats.queue_depth == 1,
+                timeout_seconds=1.0,
+            )
+            await dispatcher.emit(_opened(3))
+            with pytest.raises(RuntimeError, match="dropped"):
+                await asyncio.wait_for(emit_wait_task, timeout=1.0)
+    finally:
+        allow_first_to_finish.set()
+        if emit_wait_task is not None and not emit_wait_task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_wait_task, timeout=1.0)
+        await dispatcher.stop()
+    if policy == EventBackpressurePolicy.DROP_NEWEST:
+        assert handler.ids == ["c1", "c2"]
+    else:
+        assert handler.ids == ["c1", "c3"]
+
+
+@pytest.mark.asyncio
+async def test_drop_oldest_skips_protected_barrier_events() -> None:
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+
+    class BlockingHandler:
+        def __init__(self) -> None:
+            self.ids: list[str] = []
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            connection_id = event.metadata.connection_id
+            self.ids.append(connection_id)
+            if connection_id == "c1":
+                first_started.set()
+                await allow_first_to_finish.wait()
+
+    handler = BlockingHandler()
+    dispatcher = AsyncioEventDispatcher(
+        handler,
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            max_pending_events=2,
+            backpressure_policy=EventBackpressurePolicy.DROP_OLDEST,
+        ),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+    protected_emit_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        protected_emit_task = asyncio.create_task(
+            dispatcher.emit_and_wait(_opened(2), drop_on_backpressure=False)
+        )
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+        await dispatcher.emit(_opened(3))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 2,
+            timeout_seconds=1.0,
+        )
+
+        await dispatcher.emit(_opened(4))
+        allow_first_to_finish.set()
+        await asyncio.wait_for(protected_emit_task, timeout=1.0)
+        await wait_for_condition(lambda: handler.ids == ["c1", "c2", "c4"])
+    finally:
+        allow_first_to_finish.set()
+        if protected_emit_task is not None and not protected_emit_task.done():
+            protected_emit_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(protected_emit_task, timeout=1.0)
+        await dispatcher.stop()
+
+    assert handler.ids == ["c1", "c2", "c4"]
+
+
+@pytest.mark.asyncio
+async def test_drop_oldest_protected_incoming_event_evicts_oldest_droppable_event() -> None:
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+
+    class BlockingHandler:
+        def __init__(self) -> None:
+            self.ids: list[str] = []
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            connection_id = event.metadata.connection_id
+            self.ids.append(connection_id)
+            if connection_id == "c1":
+                first_started.set()
+                await allow_first_to_finish.wait()
+
+    handler = BlockingHandler()
+    dispatcher = AsyncioEventDispatcher(
+        handler,
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            max_pending_events=2,
+            backpressure_policy=EventBackpressurePolicy.DROP_OLDEST,
+        ),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+    protected_emit_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        await dispatcher.emit(_opened(2))
+        await dispatcher.emit(_opened(3))
+        await wait_for_condition(lambda: dispatcher.runtime_stats.queue_depth == 2)
+
+        protected_emit_task = asyncio.create_task(
+            dispatcher.emit_and_wait(_opened(4), drop_on_backpressure=False)
+        )
+        await wait_for_condition(
+            lambda: (
+                dispatcher.runtime_stats.dropped_backpressure_oldest_total == 1
+                and dispatcher.runtime_stats.queue_depth == 2
+            )
+        )
+        assert protected_emit_task.done() is False
+
+        allow_first_to_finish.set()
+        await asyncio.wait_for(protected_emit_task, timeout=1.0)
+        await wait_for_condition(lambda: handler.ids == ["c1", "c3", "c4"])
+    finally:
+        allow_first_to_finish.set()
+        if protected_emit_task is not None and not protected_emit_task.done():
+            protected_emit_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(protected_emit_task, timeout=1.0)
+        await dispatcher.stop()
+
+    assert handler.ids == ["c1", "c3", "c4"]
+
+
+@pytest.mark.asyncio
+async def test_emit_and_wait_raises_when_stop_drops_queued_barrier_event() -> None:
+    first_started = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    class StopFromHandler:
+        def __init__(self) -> None:
+            self.dispatcher: AsyncioEventDispatcher | None = None
+            self.ids: list[str] = []
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            connection_id = event.metadata.connection_id
+            self.ids.append(connection_id)
+            if connection_id == "c1":
+                first_started.set()
+                await allow_stop.wait()
+                if self.dispatcher is not None:
+                    await self.dispatcher.stop()
+
+    handler = StopFromHandler()
+    dispatcher = AsyncioEventDispatcher(
+        handler,
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    handler.dispatcher = dispatcher
+    await dispatcher.start()
+    emit_wait_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        emit_wait_task = asyncio.create_task(dispatcher.emit_and_wait(_opened(2)))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        allow_stop.set()
+        with pytest.raises(RuntimeError, match="dropped"):
+            await asyncio.wait_for(emit_wait_task, timeout=1.0)
+    finally:
+        allow_stop.set()
+        if emit_wait_task is not None and not emit_wait_task.done():
+            emit_wait_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_wait_task, timeout=1.0)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+    assert handler.ids == ["c1"]
+
+
+@pytest.mark.asyncio
+async def test_handler_origin_stop_without_inline_context_drains_queued_events() -> None:
+    first_started = asyncio.Event()
+    allow_stop_to_spawn = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+
+    class SpawnStopFromHandler:
+        def __init__(self) -> None:
+            self.dispatcher: AsyncioEventDispatcher | None = None
+            self.stop_task: asyncio.Task[None] | None = None
+            self.ids: list[str] = []
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            connection_id = event.metadata.connection_id
+            self.ids.append(connection_id)
+            if connection_id == "c1":
+                first_started.set()
+                await allow_stop_to_spawn.wait()
+                if self.dispatcher is not None:
+                    self.stop_task = asyncio.create_task(self.dispatcher.stop())
+                await allow_first_to_finish.wait()
+
+    handler = SpawnStopFromHandler()
+    dispatcher = AsyncioEventDispatcher(
+        handler,
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    handler.dispatcher = dispatcher
+    await dispatcher.start()
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await dispatcher.emit(_opened(2))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        allow_stop_to_spawn.set()
+        await wait_for_condition(lambda: handler.stop_task is not None, timeout_seconds=1.0)
+        await asyncio.sleep(0)
+        assert dispatcher.runtime_stats.queue_depth == 1
+
+        allow_first_to_finish.set()
+        await wait_for_condition(lambda: handler.ids == ["c1", "c2"], timeout_seconds=1.0)
+        assert handler.stop_task is not None
+        await asyncio.wait_for(handler.stop_task, timeout=1.0)
+    finally:
+        allow_stop_to_spawn.set()
+        allow_first_to_finish.set()
+        if handler.stop_task is not None and not handler.stop_task.done():
+            handler.stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(handler.stop_task, timeout=1.0)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_block_backpressure_stop_fails_emit_and_wait_blocked_for_queue_space() -> None:
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+
+    class BlockingHandler:
+        def __init__(self) -> None:
+            self.ids: list[str] = []
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            connection_id = event.metadata.connection_id
+            self.ids.append(connection_id)
+            if connection_id == "c1":
+                first_started.set()
+                await allow_first_to_finish.wait()
+
+    handler = BlockingHandler()
+    settings = EventDeliverySettings(
+        dispatch_mode=EventDispatchMode.BACKGROUND,
+        max_pending_events=1,
+        backpressure_policy=EventBackpressurePolicy.BLOCK,
+    )
+    dispatcher = AsyncioEventDispatcher(handler, settings, logging.getLogger("test"))
+    await dispatcher.start()
+    emit_wait_task: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await dispatcher.emit(_opened(2))
+        emit_wait_task = asyncio.create_task(dispatcher.emit_and_wait(_opened(3)))
+        await wait_for_condition(
+            lambda: bool(getattr(dispatcher._queue_not_full, "_waiters", None)),
+            timeout_seconds=1.0,
+        )
+
+        stop_task = asyncio.create_task(dispatcher.stop())
+        await asyncio.wait_for(_wait_until_dispatcher_stopping(dispatcher), timeout=1.0)
+        with pytest.raises(RuntimeError, match="dropped"):
+            await asyncio.wait_for(emit_wait_task, timeout=1.0)
+    finally:
+        allow_first_to_finish.set()
+        if emit_wait_task is not None and not emit_wait_task.done():
+            emit_wait_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(emit_wait_task, timeout=1.0)
+        if stop_task is not None and not stop_task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stop_task, timeout=1.0)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+    assert handler.ids == ["c1", "c2"]
 
 
 @pytest.mark.asyncio
@@ -1453,6 +2028,202 @@ async def test_handler_failure_policy_stop_component_is_safe_in_background_worke
     await asyncio.wait_for(stopped.wait(), timeout=1.0)
     await dispatcher.stop()
     assert stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_component_callback_does_not_expose_inline_context_to_user_tasks() -> None:
+    class FailThenStop:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                raise RuntimeError("boom")
+
+    child_task_started = asyncio.Event()
+    allow_child_to_emit = asyncio.Event()
+    child_emit_finished = asyncio.Event()
+    observed_inline_context: list[bool] = []
+    observed_origin_context: list[bool] = []
+
+    async def stop_component() -> None:
+        observed_origin_context.append(dispatcher.current_task_has_handler_origin_context())
+
+        async def child_emit() -> None:
+            child_task_started.set()
+            await allow_child_to_emit.wait()
+            observed_inline_context.append(dispatcher.current_task_has_inline_delivery_context())
+            await dispatcher.emit(_opened("child"))
+            child_emit_finished.set()
+
+        child_task = asyncio.create_task(child_emit())
+        await asyncio.wait_for(child_task_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert child_emit_finished.is_set() is False
+        await dispatcher.stop()
+        allow_child_to_emit.set()
+        await asyncio.wait_for(child_task, timeout=1.0)
+
+    dispatcher = AsyncioEventDispatcher(
+        FailThenStop(),
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            max_pending_events=1,
+            handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+        ),
+        logging.getLogger("test"),
+        stop_policy=DispatcherStopPolicy.stop_component(stop_component),
+    )
+
+    await dispatcher.start()
+    await dispatcher.emit(_opened("failure"))
+    await wait_for_condition(lambda: dispatcher.is_running is False, timeout_seconds=1.0)
+
+    assert observed_inline_context == [False]
+    assert observed_origin_context == [True]
+    assert child_emit_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stop_component_callback_awaited_child_does_not_inherit_stop_authority() -> None:
+    first_started = asyncio.Event()
+    release_failure = asyncio.Event()
+    child_ready = asyncio.Event()
+    allow_child_to_stop = asyncio.Event()
+    child_stop_blocked = asyncio.Event()
+    child_stop_finished = asyncio.Event()
+    second_seen = asyncio.Event()
+    observed_child_origin_context: list[bool] = []
+    observed_child_inherited_context: list[bool] = []
+
+    class FailFirstThenRecordSecond:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            if event.metadata.connection_id == "c1":
+                first_started.set()
+                await release_failure.wait()
+                raise RuntimeError("boom")
+            if event.metadata.connection_id == "c2":
+                second_seen.set()
+
+    async def stop_component() -> None:
+        async def child_stop() -> None:
+            child_ready.set()
+            await allow_child_to_stop.wait()
+            observed_child_origin_context.append(
+                dispatcher.current_task_has_handler_origin_context()
+            )
+            observed_child_inherited_context.append(
+                dispatcher.current_task_inherits_handler_origin_context()
+            )
+            stop_task = asyncio.create_task(dispatcher.stop())
+            await asyncio.sleep(0)
+            if stop_task.done():
+                await asyncio.wait_for(stop_task, timeout=1.0)
+                child_stop_finished.set()
+                return
+            child_stop_blocked.set()
+            stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stop_task, timeout=1.0)
+            child_stop_finished.set()
+
+        await asyncio.create_task(child_stop())
+
+    dispatcher = AsyncioEventDispatcher(
+        FailFirstThenRecordSecond(),
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+        ),
+        logging.getLogger("test"),
+        stop_policy=DispatcherStopPolicy.stop_component(stop_component),
+    )
+    await dispatcher.start()
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await dispatcher.emit(_opened(2))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        release_failure.set()
+        await asyncio.wait_for(child_ready.wait(), timeout=1.0)
+        allow_child_to_stop.set()
+        await asyncio.wait_for(child_stop_blocked.wait(), timeout=1.0)
+        await asyncio.wait_for(second_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(child_stop_finished.wait(), timeout=1.0)
+        assert observed_child_origin_context == [False]
+        assert observed_child_inherited_context == [False]
+    finally:
+        release_failure.set()
+        allow_child_to_stop.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_stop_component_callback_child_stop_waits_for_queued_events() -> None:
+    first_started = asyncio.Event()
+    release_failure = asyncio.Event()
+    child_ready = asyncio.Event()
+    allow_child_to_stop = asyncio.Event()
+    child_stop_finished = asyncio.Event()
+    second_seen = asyncio.Event()
+    ordering_errors: list[str] = []
+
+    class FailFirstThenRecordSecond:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if not isinstance(event, ConnectionOpenedEvent):
+                return
+            if event.metadata.connection_id == "c1":
+                first_started.set()
+                await release_failure.wait()
+                raise RuntimeError("boom")
+            if event.metadata.connection_id == "c2":
+                if child_stop_finished.is_set():
+                    ordering_errors.append("child stop returned before queued c2 event")
+                second_seen.set()
+
+    async def stop_component() -> None:
+        async def child_stop() -> None:
+            child_ready.set()
+            await allow_child_to_stop.wait()
+            await dispatcher.stop()
+            child_stop_finished.set()
+
+        _ = asyncio.create_task(child_stop())
+
+    dispatcher = AsyncioEventDispatcher(
+        FailFirstThenRecordSecond(),
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+        ),
+        logging.getLogger("test"),
+        stop_policy=DispatcherStopPolicy.stop_component(stop_component),
+    )
+    await dispatcher.start()
+    try:
+        await dispatcher.emit(_opened(1))
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await dispatcher.emit(_opened(2))
+        await wait_for_condition(
+            lambda: dispatcher.runtime_stats.queue_depth == 1,
+            timeout_seconds=1.0,
+        )
+
+        release_failure.set()
+        await asyncio.wait_for(child_ready.wait(), timeout=1.0)
+        allow_child_to_stop.set()
+        await asyncio.wait_for(second_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(child_stop_finished.wait(), timeout=1.0)
+        assert ordering_errors == []
+    finally:
+        release_failure.set()
+        allow_child_to_stop.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
 
 
 @pytest.mark.asyncio
