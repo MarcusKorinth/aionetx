@@ -363,10 +363,7 @@ class _AsyncioDatagramReceiverBase:
                     stop_waiter.set_result(None)
         finally:
             if stop_waiter is not None and not stop_state.stop_waiter_completion_deferred:
-                async with self._state_lock:
-                    if self._runtime.stop_waiter is stop_waiter:
-                        self._runtime.stop_waiter = None
-                        self._runtime.stop_owner_task = None
+                await self._clear_stop_waiter_if_current(stop_waiter)
 
     def _capture_stop_provenance(self) -> _DatagramStopProvenance:
         """Capture handler-origin facts for the current stop caller."""
@@ -465,6 +462,13 @@ class _AsyncioDatagramReceiverBase:
         if first_error is not None:
             raise first_error
 
+    async def _clear_stop_waiter_if_current(self, stop_waiter: asyncio.Future[None] | None) -> None:
+        """Clear the shared stop waiter when the caller still owns it."""
+        async with self._state_lock:
+            if self._runtime.stop_waiter is stop_waiter:
+                self._runtime.stop_waiter = None
+                self._runtime.stop_owner_task = None
+
     def _complete_stop_waiter_after_deferred_close(
         self,
         stop_waiter: asyncio.Future[None],
@@ -484,10 +488,7 @@ class _AsyncioDatagramReceiverBase:
                 if not stop_waiter.done():
                     stop_waiter.set_result(None)
             finally:
-                async with self._state_lock:
-                    if self._runtime.stop_waiter is stop_waiter:
-                        self._runtime.stop_waiter = None
-                        self._runtime.stop_owner_task = None
+                await self._clear_stop_waiter_if_current(stop_waiter)
 
         _ = asyncio.create_task(_complete())
 
@@ -531,10 +532,7 @@ class _AsyncioDatagramReceiverBase:
                 if stop_waiter is not None and not stop_waiter.done():
                     stop_waiter.set_result(None)
             finally:
-                async with self._state_lock:
-                    if self._runtime.stop_waiter is stop_waiter:
-                        self._runtime.stop_waiter = None
-                        self._runtime.stop_owner_task = None
+                await self._clear_stop_waiter_if_current(stop_waiter)
 
         _ = asyncio.create_task(_complete())
 
@@ -588,10 +586,7 @@ class _AsyncioDatagramReceiverBase:
                 if stop_waiter is not None and not stop_waiter.done():
                     stop_waiter.set_result(None)
             finally:
-                async with self._state_lock:
-                    if self._runtime.stop_waiter is stop_waiter:
-                        self._runtime.stop_waiter = None
-                        self._runtime.stop_owner_task = None
+                await self._clear_stop_waiter_if_current(stop_waiter)
 
         _ = asyncio.create_task(_complete())
 
