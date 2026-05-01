@@ -40,6 +40,7 @@ from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioT
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from tests.helpers import assert_awaitable_cancelled
 from tests.helpers import drain_awaitable_ignoring_cancelled
+from tests.helpers import wait_for_condition
 from tests.internal_asyncio_impl_refs import WarningRateLimiter
 
 
@@ -595,6 +596,8 @@ async def test_client_connect_attempt_clears_cached_last_connect_error_before_ne
     )
     observed_cached_error: list[object] = []
     client._last_connect_error = RuntimeError("stale-connect-error")  # type: ignore[attr-defined]
+    client._apply_lifecycle_state(ComponentLifecycleState.STARTING)  # type: ignore[attr-defined]
+    client._apply_lifecycle_state(ComponentLifecycleState.RUNNING)  # type: ignore[attr-defined]
 
     async def fake_connect_once() -> None:
         observed_cached_error.append(client._last_connect_error)  # type: ignore[attr-defined]
@@ -1173,6 +1176,14 @@ async def test_stop_component_policy_from_worker_with_full_queue_stops_client() 
 
     await asyncio.wait_for(_wait_until_stopped(), timeout=1.0)
     await asyncio.wait_for(client._event_dispatcher.stop(), timeout=1.0)  # type: ignore[attr-defined]
+    await wait_for_condition(
+        lambda: any(
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == tcp_client_module.ComponentLifecycleState.STOPPING
+            for event in observed_events
+        ),
+        timeout_seconds=1.0,
+    )
 
     lifecycle_states = [
         event.current
