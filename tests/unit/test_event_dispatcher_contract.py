@@ -336,7 +336,7 @@ async def test_handler_origin_context_is_not_inherited_by_child_tasks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_inline_delivery_context_expires_for_tasks_spawned_inside_context() -> None:
+async def test_inline_delivery_context_is_inherited_by_tasks_spawned_inside_context() -> None:
     context_exited = asyncio.Event()
     observed_inline_context: list[bool] = []
 
@@ -364,7 +364,7 @@ async def test_inline_delivery_context_expires_for_tasks_spawned_inside_context(
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await asyncio.wait_for(child_task, timeout=1.0)
 
-    assert observed_inline_context == [False]
+    assert observed_inline_context == [True]
 
 
 # Backpressure semantics under queue saturation.
@@ -2117,7 +2117,7 @@ async def test_stop_component_callback_awaited_child_does_not_inherit_stop_autho
             stop_task = asyncio.create_task(dispatcher.stop())
             await asyncio.sleep(0)
             if stop_task.done():
-                stop_task.result()
+                await asyncio.wait_for(stop_task, timeout=1.0)
                 child_stop_finished.set()
                 return
             child_stop_blocked.set()
