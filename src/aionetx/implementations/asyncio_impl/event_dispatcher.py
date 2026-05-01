@@ -35,8 +35,8 @@ from aionetx.implementations.asyncio_impl.runtime_utils import (
 
 _stop_drop_warning_limiter = WarningRateLimiter(interval_seconds=5.0)
 _backpressure_drop_warning_limiter = WarningRateLimiter(interval_seconds=5.0)
-_inline_dispatcher_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = (
-    contextvars.ContextVar("aionetx_inline_dispatcher_context", default=frozenset())
+_inline_dispatcher_context: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar(
+    "aionetx_inline_dispatcher_context", default=frozenset()
 )
 _stop_await_bypass_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = (
     contextvars.ContextVar("aionetx_stop_await_bypass_context", default=frozenset())
@@ -197,8 +197,6 @@ class AsyncioEventDispatcher:
         self._dropped_backpressure_newest_total = 0
         self._dropped_stop_phase_total = 0
         self._queue_peak = 0
-        self._active_inline_delivery_tokens: set[int] = set()
-        self._next_inline_delivery_token = 0
         self._active_handler_origin_tokens: set[int] = set()
         self._active_handler_origin_resources: dict[int, str | None] = {}
         self._active_handler_origin_owner_tasks: dict[int, int | None] = {}
@@ -509,12 +507,7 @@ class AsyncioEventDispatcher:
         those tasks, so this lets terminal internal events avoid re-entering the
         same background queue that the initiating handler is currently blocking.
         """
-        dispatcher_id = id(self)
-        return any(
-            origin_dispatcher_id == dispatcher_id
-            and origin_token in self._active_inline_delivery_tokens
-            for origin_dispatcher_id, origin_token in _inline_dispatcher_context.get()
-        )
+        return id(self) in _inline_dispatcher_context.get()
 
     def current_task_has_inline_delivery_context(self) -> bool:
         """
@@ -708,17 +701,11 @@ class AsyncioEventDispatcher:
         leak into user-created tasks through context variable inheritance and
         break normal BACKGROUND queue semantics.
         """
-        self._next_inline_delivery_token += 1
-        origin_token = self._next_inline_delivery_token
-        self._active_inline_delivery_tokens.add(origin_token)
         active_dispatchers = _inline_dispatcher_context.get()
-        reset_token = _inline_dispatcher_context.set(
-            active_dispatchers | {(id(self), origin_token)}
-        )
+        reset_token = _inline_dispatcher_context.set(active_dispatchers | {id(self)})
         try:
             yield
         finally:
-            self._active_inline_delivery_tokens.discard(origin_token)
             _inline_dispatcher_context.reset(reset_token)
 
     def _warn_backpressure_drop(self, *, policy: EventBackpressurePolicy) -> None:
