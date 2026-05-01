@@ -315,24 +315,12 @@ class _AsyncioDatagramReceiverBase:
         stop_waiter_completion_deferred = False
         try:
             if provenance.defers_terminal_events:
-                try:
-                    if provenance.active_inline_handler:
-                        snapshot.cancel_task = False
-                    await self._teardown_stop_resources(
-                        snapshot=snapshot, socket_cleanup=socket_cleanup
-                    )
-                except (Exception, asyncio.CancelledError) as error:
-                    first_error = error
-                if first_error is None:
-                    try:
-                        await self._event_dispatcher.stop_from_handler_origin()
-                    except (Exception, asyncio.CancelledError) as error:
-                        first_error = error
-                if first_error is None:
-                    self._complete_stop_waiter_after_deferred_stop_events(stop_waiter, snapshot)
-                    stop_waiter_completion_deferred = True
-                if first_error is not None:
-                    raise first_error
+                stop_waiter_completion_deferred = await self._prepare_deferred_stop_events(
+                    snapshot=snapshot,
+                    provenance=provenance,
+                    stop_waiter=stop_waiter,
+                    socket_cleanup=socket_cleanup,
+                )
                 if not provenance.has_handler_provenance and stop_waiter is not None:
                     await asyncio.shield(stop_waiter)
             else:
@@ -429,6 +417,32 @@ class _AsyncioDatagramReceiverBase:
             inherited_handler_origin=inherited_handler_origin,
             active_inline_handler=active_inline_handler,
         )
+
+    async def _prepare_deferred_stop_events(
+        self,
+        *,
+        snapshot: _DatagramStopSnapshot,
+        provenance: _DatagramStopProvenance,
+        stop_waiter: asyncio.Future[None] | None,
+        socket_cleanup: SocketCleanup | None,
+    ) -> bool:
+        """Tear down resources and schedule terminal publication after handlers unwind."""
+        first_error: BaseException | None = None
+        try:
+            if provenance.active_inline_handler:
+                snapshot.cancel_task = False
+            await self._teardown_stop_resources(snapshot=snapshot, socket_cleanup=socket_cleanup)
+        except (Exception, asyncio.CancelledError) as error:
+            first_error = error
+        if first_error is None:
+            try:
+                await self._event_dispatcher.stop_from_handler_origin()
+            except (Exception, asyncio.CancelledError) as error:
+                first_error = error
+        if first_error is None:
+            self._complete_stop_waiter_after_deferred_stop_events(stop_waiter, snapshot)
+            return True
+        raise first_error
 
     def _complete_stop_waiter_after_deferred_close(
         self,
