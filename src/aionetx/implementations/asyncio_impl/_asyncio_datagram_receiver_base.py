@@ -106,6 +106,25 @@ class _DatagramStopSnapshot:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _DatagramStopProvenance:
+    """Where the current stop request originated relative to active handlers."""
+
+    handler_originated: bool = False
+    inherited_handler_origin: bool = False
+    active_inline_handler: bool = False
+
+    @property
+    def has_handler_provenance(self) -> bool:
+        """Whether the caller is the active handler or inherited handler-origin context."""
+        return self.handler_originated or self.inherited_handler_origin
+
+    @property
+    def defers_terminal_events(self) -> bool:
+        """Whether terminal publication must wait for active handler work to unwind."""
+        return self.has_handler_provenance or self.active_inline_handler
+
+
 class _AsyncioDatagramReceiverBase:
     """
     Shared internals for asyncio datagram receiver implementations.
@@ -280,22 +299,9 @@ class _AsyncioDatagramReceiverBase:
                         then publish terminal events after active handlers unwind
         """
         snapshot = await self._plan_stop_snapshot()
-        handler_originated_stop = (
-            self._event_dispatcher.current_task_is_dispatching_handler()
-            or self._event_dispatcher.current_task_has_handler_origin_context()
-        )
-        inherited_handler_origin = (
-            self._event_dispatcher.current_task_inherits_handler_origin_context()
-        )
-        handler_provenance_stop = handler_originated_stop or inherited_handler_origin
-        active_inline_handler_stop = (
-            not handler_provenance_stop
-            and self._event_dispatcher.has_active_handler_context()
-            and self._event_dispatcher.current_task_would_deliver_inline()
-        )
-        defer_stop_events = handler_provenance_stop or active_inline_handler_stop
+        provenance = self._capture_stop_provenance()
         if snapshot.waits_for_owner:
-            if handler_provenance_stop:
+            if provenance.has_handler_provenance:
                 return
             # Non-owner stop callers observe the active owner stop path instead
             # of planning another teardown. shield() prevents caller
@@ -308,9 +314,9 @@ class _AsyncioDatagramReceiverBase:
         deferred_close_waiter: asyncio.Future[None] | None = None
         stop_waiter_completion_deferred = False
         try:
-            if defer_stop_events:
+            if provenance.defers_terminal_events:
                 try:
-                    if active_inline_handler_stop:
+                    if provenance.active_inline_handler:
                         snapshot.cancel_task = False
                     await self._teardown_stop_resources(
                         snapshot=snapshot, socket_cleanup=socket_cleanup
@@ -327,7 +333,7 @@ class _AsyncioDatagramReceiverBase:
                     stop_waiter_completion_deferred = True
                 if first_error is not None:
                     raise first_error
-                if not handler_provenance_stop and stop_waiter is not None:
+                if not provenance.has_handler_provenance and stop_waiter is not None:
                     await asyncio.shield(stop_waiter)
             else:
                 try:
@@ -389,7 +395,7 @@ class _AsyncioDatagramReceiverBase:
             if stop_waiter is not None and not stop_waiter.done():
                 if stop_waiter_completion_deferred:
                     pass
-                elif handler_originated_stop and deferred_close_waiter is not None:
+                elif provenance.handler_originated and deferred_close_waiter is not None:
                     self._complete_stop_waiter_after_deferred_close(
                         stop_waiter, deferred_close_waiter
                     )
@@ -402,6 +408,27 @@ class _AsyncioDatagramReceiverBase:
                     if self._runtime.stop_waiter is stop_waiter:
                         self._runtime.stop_waiter = None
                         self._runtime.stop_owner_task = None
+
+    def _capture_stop_provenance(self) -> _DatagramStopProvenance:
+        """Capture handler-origin facts for the current stop caller."""
+        handler_originated = (
+            self._event_dispatcher.current_task_is_dispatching_handler()
+            or self._event_dispatcher.current_task_has_handler_origin_context()
+        )
+        inherited_handler_origin = (
+            self._event_dispatcher.current_task_inherits_handler_origin_context()
+        )
+        active_inline_handler = (
+            not handler_originated
+            and not inherited_handler_origin
+            and self._event_dispatcher.has_active_handler_context()
+            and self._event_dispatcher.current_task_would_deliver_inline()
+        )
+        return _DatagramStopProvenance(
+            handler_originated=handler_originated,
+            inherited_handler_origin=inherited_handler_origin,
+            active_inline_handler=active_inline_handler,
+        )
 
     def _complete_stop_waiter_after_deferred_close(
         self,
