@@ -24,7 +24,6 @@ body:
     attributes:
       label: Proposed change
       description: What specifically should change? Include tool names, configuration snippets, or CI job definitions where helpful.
-      render: yaml
     validations:
       required: true
 
