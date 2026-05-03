@@ -27,3 +27,5 @@ Planned contents for the initial public alpha release (`0.1.0`).
   active same-connection handler has returned.
 - UDP receivers now preserve deferred stop publication when stop originates
   from a handler or when an external stop caller is cancelled.
+- UDP and multicast receivers now abort startup when a STARTING lifecycle
+  handler stops the receiver, preventing stale socket or running state.

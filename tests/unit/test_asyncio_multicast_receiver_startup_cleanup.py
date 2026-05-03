@@ -45,6 +45,21 @@ class FailOnOpenedHandler:
             raise RuntimeError("boom-on-opened")
 
 
+class StopOnStartingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.receiver: AsyncioMulticastReceiver | None = None
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            self.receiver is not None
+            and isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STARTING
+        ):
+            await self.receiver.stop()
+
+
 class BlockingStoppingHandler:
     def __init__(self) -> None:
         self.events: list[object] = []
@@ -194,6 +209,61 @@ async def test_multicast_opened_handler_failure_rolls_back_runtime_resources() -
     assert receiver._socket is None  # type: ignore[attr-defined]
     assert receiver._task is None  # type: ignore[attr-defined]
     assert not receiver._event_dispatcher.is_running  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch_mode",
+    [EventDispatchMode.INLINE, EventDispatchMode.BACKGROUND],
+)
+async def test_multicast_starting_handler_stop_aborts_startup_without_resources(
+    dispatch_mode: EventDispatchMode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SocketSetupShouldNotRun:
+        AF_INET = socket.AF_INET
+        SOCK_DGRAM = socket.SOCK_DGRAM
+        IPPROTO_UDP = socket.IPPROTO_UDP
+
+        @staticmethod
+        def socket(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("socket setup should not continue after STARTING stop")
+
+    monkeypatch.setattr(multicast_module, "socket", SocketSetupShouldNotRun)
+
+    handler = StopOnStartingHandler()
+    receiver = AsyncioMulticastReceiver(
+        settings=MulticastReceiverSettings(
+            group_ip="239.255.0.12",
+            port=20112,
+            bind_ip="0.0.0.0",
+            interface_ip="127.0.0.1",
+            event_delivery=EventDeliverySettings(dispatch_mode=dispatch_mode),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+
+    await receiver.start()
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+
+    lifecycle_states = [
+        event.current
+        for event in handler.events
+        if isinstance(event, ComponentLifecycleChangedEvent)
+    ]
+    assert lifecycle_states == [
+        ComponentLifecycleState.STARTING,
+        ComponentLifecycleState.STOPPING,
+        ComponentLifecycleState.STOPPED,
+    ]
+    assert not any(isinstance(event, ConnectionOpenedEvent) for event in handler.events)
+    assert not any(isinstance(event, ConnectionClosedEvent) for event in handler.events)
+    assert not receiver._running  # type: ignore[attr-defined]
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
