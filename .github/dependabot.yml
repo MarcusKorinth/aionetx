@@ -7,8 +7,8 @@ updates:
       interval: "weekly"
       day: "monday"
     labels:
-      - "dependencies"
-      - "python"
+      - "type:build"
+      - "area:dependencies"
     # Group all dev dep bumps into a single PR to reduce noise
     groups:
       dev-dependencies:
@@ -22,8 +22,9 @@ updates:
       interval: "weekly"
       day: "monday"
     labels:
-      - "dependencies"
-      - "github-actions"
+      - "type:ci"
+      - "area:ci"
+      - "area:dependencies"
     groups:
       action-updates:
         patterns:

@@ -1,7 +1,7 @@
 name: Feature request
 description: Propose a concrete behavior change or new capability for aionetx.
 title: "[feature] "
-labels: ["enhancement", "triage"]
+labels: ["type:feat", "triage"]
 body:
   - type: markdown
     attributes:

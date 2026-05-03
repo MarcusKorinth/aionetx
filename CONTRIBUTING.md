@@ -206,6 +206,22 @@ A good PR should clearly explain:
 - why it was changed
 - any important side effects or constraints
 
+### Labels
+
+Issues and pull requests use scoped labels to describe different review
+questions:
+
+- use exactly one `type:*` label for the intended change kind, matching the
+  Conventional Commit type when possible
+- use zero or more `area:*` labels for the affected subsystem or project
+  surface
+- use `severity:*` labels for defects, findings, security work, or other
+  risk-bearing changes where priority matters
+
+`type:*` and `area:*` labels may intentionally overlap. For example, a CI
+workflow change can use both `type:ci` (the change kind) and `area:ci` (the
+affected project area).
+
 ## Testing
 
 - add tests for new behavior
