@@ -76,6 +76,16 @@ def _opened(idx: int | str) -> ConnectionOpenedEvent:
     return ConnectionOpenedEvent(resource_id=metadata.connection_id, metadata=metadata)
 
 
+def _assert_handler_origin_tracking_empty(dispatcher: AsyncioEventDispatcher) -> None:
+    """Assert handler-origin bookkeeping does not retain stale active entries."""
+
+    assert dispatcher._active_handler_origin_tokens == set()
+    assert dispatcher._active_handler_origin_resources == {}
+    assert dispatcher._active_handler_origin_owner_tasks == {}
+    assert dispatcher._active_handler_origin_child_provenance_tokens == set()
+    assert dispatcher.has_active_handler_origin() is False
+
+
 async def _wait_until_dispatcher_stopping(dispatcher: AsyncioEventDispatcher) -> None:
     """Yield until stop() has entered the dispatcher stopping state."""
 
@@ -2079,6 +2089,49 @@ async def test_stop_component_callback_does_not_expose_inline_context_to_user_ta
     assert observed_inline_context == [False]
     assert observed_origin_context == [True]
     assert child_emit_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stop_component_handler_origin_tracking_cleanup_stays_bounded_across_cycles() -> None:
+    cycles = 50
+    stop_calls = 0
+    observed_origin_context: list[bool] = []
+
+    class FailEveryOpenedEvent:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                raise RuntimeError(f"boom {event.metadata.connection_id}")
+
+    async def stop_component() -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        observed_origin_context.append(dispatcher.current_task_has_handler_origin_context())
+        await dispatcher.stop()
+
+    dispatcher = AsyncioEventDispatcher(
+        FailEveryOpenedEvent(),
+        EventDeliverySettings(
+            dispatch_mode=EventDispatchMode.BACKGROUND,
+            handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+        ),
+        logging.getLogger("test"),
+        stop_policy=DispatcherStopPolicy.stop_component(stop_component),
+    )
+
+    try:
+        for index in range(cycles):
+            await dispatcher.start()
+            await dispatcher.emit_and_wait(_opened(f"cleanup-{index}"))
+            await wait_for_condition(lambda: dispatcher.is_running is False, timeout_seconds=1.0)
+
+            _assert_handler_origin_tracking_empty(dispatcher)
+    finally:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+
+    assert stop_calls == cycles
+    assert observed_origin_context == [True] * cycles
+    _assert_handler_origin_tracking_empty(dispatcher)
 
 
 @pytest.mark.asyncio
