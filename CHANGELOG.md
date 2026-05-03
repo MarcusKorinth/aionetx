@@ -29,3 +29,5 @@ Planned contents for the initial public alpha release (`0.1.0`).
   from a handler or when an external stop caller is cancelled.
 - UDP and multicast receivers now abort startup when a STARTING lifecycle
   handler stops the receiver, preventing stale socket or running state.
+- TCP clients now suppress stale RUNNING lifecycle publication when a
+  STARTING lifecycle handler stops the client.

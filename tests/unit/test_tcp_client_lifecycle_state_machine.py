@@ -22,6 +22,7 @@ from aionetx.api.event_delivery_settings import (
 )
 from aionetx.api.tcp_client import TcpClientSettings
 from aionetx.implementations.asyncio_impl.asyncio_tcp_client import AsyncioTcpClient
+from tests.helpers import wait_for_condition
 
 pytestmark = pytest.mark.behavior_critical
 
@@ -96,6 +97,54 @@ class _FailOnClientStartingLifecycle:
             and event.current == ComponentLifecycleState.STARTING
         ):
             raise RuntimeError("client-lifecycle-handler-failed")
+
+
+class _StopOnClientStartingLifecycle:
+    def __init__(self) -> None:
+        self.client: AsyncioTcpClient | None = None
+        self.lifecycle_events: list[ComponentLifecycleChangedEvent] = []
+        self._stop_requested = False
+
+    async def on_event(self, event) -> None:
+        if not isinstance(event, ComponentLifecycleChangedEvent):
+            return
+        self.lifecycle_events.append(event)
+        if event.current == ComponentLifecycleState.STARTING and not self._stop_requested:
+            self._stop_requested = True
+            assert self.client is not None
+            await self.client.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch_mode",
+    (EventDispatchMode.INLINE, EventDispatchMode.BACKGROUND),
+)
+async def test_client_starting_handler_stop_suppresses_stale_running_event(
+    dispatch_mode: EventDispatchMode,
+) -> None:
+    handler = _StopOnClientStartingLifecycle()
+    client = AsyncioTcpClient(
+        TcpClientSettings(
+            host="127.0.0.1",
+            port=12345,
+            event_delivery=EventDeliverySettings(dispatch_mode=dispatch_mode),
+        ),
+        handler,
+    )
+    handler.client = client
+
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    await wait_for_condition(lambda: len(handler.lifecycle_events) >= 3)
+
+    assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert client.connection is None
+    assert client.dispatcher_runtime_stats.queue_depth == 0
+    assert [event.current for event in handler.lifecycle_events] == [
+        ComponentLifecycleState.STARTING,
+        ComponentLifecycleState.STOPPING,
+        ComponentLifecycleState.STOPPED,
+    ]
 
 
 @pytest.mark.asyncio
