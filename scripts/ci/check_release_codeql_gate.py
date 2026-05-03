@@ -28,29 +28,121 @@ def _parse_next_link(link_header: str | None) -> str | None:
     return None
 
 
-def _iter_open_alerts(*, repository: str, ref: str, token: str) -> list[dict[str, object]]:
-    encoded_ref = urllib.parse.quote(ref, safe="")
-    url = (
-        f"https://api.github.com/repos/{repository}/code-scanning/alerts"
-        f"?state=open&ref={encoded_ref}&per_page=100"
-    )
-    headers = {
+def _github_api_headers(token: str) -> dict[str, str]:
+    return {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "aionetx-release-codeql-gate",
     }
 
-    alerts: list[dict[str, object]] = []
+
+def _fetch_paginated_list(*, url: str, token: str, response_name: str) -> list[dict[str, object]]:
+    headers = _github_api_headers(token)
+
+    items: list[dict[str, object]] = []
     while url:
         request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request) as response:
             payload = json.loads(response.read().decode("utf-8"))
             if not isinstance(payload, list):
-                raise RuntimeError("Unexpected code scanning alerts response shape.")
-            alerts.extend(item for item in payload if isinstance(item, dict))
+                raise RuntimeError(f"Unexpected {response_name} response shape.")
+            items.extend(item for item in payload if isinstance(item, dict))
             url = _parse_next_link(response.headers.get("Link"))
-    return alerts
+    return items
+
+
+def _fetch_json_object(*, url: str, token: str, response_name: str) -> dict[str, object]:
+    request = urllib.request.Request(url, headers=_github_api_headers(token))
+    with urllib.request.urlopen(request) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected {response_name} response shape.")
+    return payload
+
+
+def _iter_codeql_analyses(*, repository: str, token: str) -> list[dict[str, object]]:
+    url = f"https://api.github.com/repos/{repository}/code-scanning/analyses?per_page=100"
+    return _fetch_paginated_list(url=url, token=token, response_name="code scanning analyses")
+
+
+def _iter_open_alerts(*, repository: str, ref: str, token: str) -> list[dict[str, object]]:
+    encoded_ref = urllib.parse.quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{repository}/code-scanning/alerts"
+        f"?state=open&ref={encoded_ref}&per_page=100"
+    )
+    return _fetch_paginated_list(url=url, token=token, response_name="code scanning alerts")
+
+
+def _tool_name(analysis: dict[str, object]) -> str:
+    tool = analysis.get("tool")
+    if not isinstance(tool, dict):
+        return ""
+    name = tool.get("name")
+    if not isinstance(name, str):
+        return ""
+    return name
+
+
+def _analysis_ref(analysis: dict[str, object]) -> str:
+    ref = analysis.get("ref")
+    if not isinstance(ref, str):
+        return ""
+    return ref.strip()
+
+
+def _is_branch_ref(ref: str) -> bool:
+    return ref.startswith("refs/heads/")
+
+
+def _git_ref_api_path(ref: str) -> str:
+    if not ref.startswith("refs/"):
+        raise RuntimeError(f"CodeQL analysis returned an unsupported ref: {ref!r}")
+    ref_path = ref.removeprefix("refs/").strip()
+    if not ref_path:
+        raise RuntimeError("CodeQL analysis returned an empty analyzed ref.")
+    return urllib.parse.quote(ref_path, safe="/")
+
+
+def _current_ref_sha(*, repository: str, ref: str, token: str) -> str:
+    ref_path = _git_ref_api_path(ref)
+    url = f"https://api.github.com/repos/{repository}/git/ref/{ref_path}"
+    payload = _fetch_json_object(url=url, token=token, response_name="git ref")
+    object_value = payload.get("object")
+    if not isinstance(object_value, dict):
+        raise RuntimeError(f"Unexpected git ref response shape for {ref}.")
+    sha = object_value.get("sha")
+    if not isinstance(sha, str) or not sha.strip():
+        raise RuntimeError(f"Git ref response for {ref} did not include an object SHA.")
+    return sha.strip()
+
+
+def _is_successful_codeql_analysis_for_commit(
+    analysis: dict[str, object],
+    *,
+    release_sha: str,
+) -> bool:
+    if analysis.get("commit_sha") != release_sha:
+        return False
+    if _tool_name(analysis).casefold() != "codeql":
+        return False
+    ref = _analysis_ref(analysis)
+    if not ref or not _is_branch_ref(ref):
+        return False
+    error = analysis.get("error")
+    return not isinstance(error, str) or not error.strip()
+
+
+def _find_release_codeql_analysis(
+    analyses: list[dict[str, object]],
+    *,
+    release_sha: str,
+) -> dict[str, object] | None:
+    for analysis in analyses:
+        if _is_successful_codeql_analysis_for_commit(analysis, release_sha=release_sha):
+            return analysis
+    return None
 
 
 def _severity_rank(severity: str) -> int:
@@ -59,10 +151,40 @@ def _severity_rank(severity: str) -> int:
 
 def main() -> int:
     repository = _require_env("GITHUB_REPOSITORY")
-    ref = _require_env("GITHUB_REF")
+    release_ref = _require_env("GITHUB_REF")
+    release_sha = _require_env("GITHUB_SHA")
     token = _require_env("GITHUB_TOKEN")
 
-    open_alerts = _iter_open_alerts(repository=repository, ref=ref, token=token)
+    analyses = _iter_codeql_analyses(repository=repository, token=token)
+    release_analysis = _find_release_codeql_analysis(analyses, release_sha=release_sha)
+    if release_analysis is None:
+        print(
+            f"No successful CodeQL analysis was found for release commit {release_sha}. "
+            f"Failing closed for {release_ref}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    analyzed_ref = _analysis_ref(release_analysis)
+    try:
+        current_ref_sha = _current_ref_sha(
+            repository=repository,
+            ref=analyzed_ref,
+            token=token,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if current_ref_sha != release_sha:
+        print(
+            f"Analyzed CodeQL ref {analyzed_ref} does not currently point at release "
+            f"commit {release_sha} (current SHA: {current_ref_sha}). "
+            f"Failing closed for {release_ref}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    open_alerts = _iter_open_alerts(repository=repository, ref=analyzed_ref, token=token)
     blocking_alerts = []
     for alert in open_alerts:
         rule = alert.get("rule")
@@ -74,9 +196,13 @@ def main() -> int:
         if _severity_rank(severity) >= _severity_rank("high"):
             blocking_alerts.append(alert)
 
-    print(f"CodeQL release gate inspected {len(open_alerts)} open alert(s) for {ref}.")
+    print(
+        f"CodeQL release gate inspected {len(open_alerts)} open alert(s) "
+        f"for analyzed ref {analyzed_ref} at release commit {release_sha} "
+        f"(release ref {release_ref})."
+    )
     if not blocking_alerts:
-        print("No open high/critical CodeQL alerts block this release ref.")
+        print("No open high/critical CodeQL alerts block this release commit.")
         return 0
 
     print(
