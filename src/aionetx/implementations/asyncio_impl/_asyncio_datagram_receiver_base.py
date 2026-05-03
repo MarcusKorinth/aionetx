@@ -320,47 +320,22 @@ class _AsyncioDatagramReceiverBase:
         stop_waiter = snapshot.stop_waiter if snapshot.owns_stop else None
         stop_state = _DatagramStopExecutionState()
         try:
-            if provenance.defers_terminal_events:
-                stop_state.stop_waiter_completion_deferred = (
-                    await self._prepare_deferred_stop_events(
-                        snapshot=snapshot,
-                        provenance=provenance,
-                        stop_waiter=stop_waiter,
-                        socket_cleanup=socket_cleanup,
-                    )
-                )
-                if not provenance.has_handler_provenance and stop_waiter is not None:
-                    await asyncio.shield(stop_waiter)
-            else:
-                await self._run_ordinary_stop_path(
-                    snapshot=snapshot,
-                    stop_state=stop_state,
-                    stop_waiter=stop_waiter,
-                    socket_cleanup=socket_cleanup,
-                )
+            await self._execute_stop_path(
+                snapshot=snapshot,
+                provenance=provenance,
+                stop_state=stop_state,
+                stop_waiter=stop_waiter,
+                socket_cleanup=socket_cleanup,
+            )
         except (Exception, asyncio.CancelledError) as error:
-            if (
-                stop_waiter is not None
-                and not stop_waiter.done()
-                and not stop_state.stop_waiter_completion_deferred
-            ):
-                stop_waiter.set_exception(error)
-                # Mark the exception as retrieved so failed owner stops do not
-                # leave an unhandled-Future warning behind.
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    stop_waiter.exception()
+            self._fail_stop_waiter_if_needed(stop_waiter, stop_state, error)
             raise
         else:
-            if stop_waiter is not None and not stop_waiter.done():
-                if stop_state.stop_waiter_completion_deferred:
-                    pass
-                elif provenance.handler_originated and stop_state.deferred_close_waiter is not None:
-                    self._complete_stop_waiter_after_deferred_close(
-                        stop_waiter, stop_state.deferred_close_waiter
-                    )
-                    stop_state.stop_waiter_completion_deferred = True
-                else:
-                    stop_waiter.set_result(None)
+            self._complete_stop_waiter_after_owned_stop(
+                stop_waiter=stop_waiter,
+                provenance=provenance,
+                stop_state=stop_state,
+            )
         finally:
             if stop_waiter is not None and not stop_state.stop_waiter_completion_deferred:
                 await self._clear_stop_waiter_if_current(stop_waiter)
@@ -386,30 +361,62 @@ class _AsyncioDatagramReceiverBase:
             active_inline_handler=active_inline_handler,
         )
 
-    async def _prepare_deferred_stop_events(
+    async def _execute_stop_path(
         self,
         *,
         snapshot: _DatagramStopSnapshot,
         provenance: _DatagramStopProvenance,
+        stop_state: _DatagramStopExecutionState,
         stop_waiter: asyncio.Future[None] | None,
         socket_cleanup: SocketCleanup | None,
-    ) -> bool:
+    ) -> None:
+        """Execute the datagram stop plan through ordinary or deferred phases."""
+        if provenance.defers_terminal_events:
+            await self._run_deferred_stop_path(
+                snapshot=snapshot,
+                provenance=provenance,
+                stop_state=stop_state,
+                stop_waiter=stop_waiter,
+                socket_cleanup=socket_cleanup,
+            )
+            if provenance.active_inline_handler and stop_waiter is not None:
+                await asyncio.shield(stop_waiter)
+            return
+
+        await self._run_ordinary_stop_path(
+            snapshot=snapshot,
+            stop_state=stop_state,
+            stop_waiter=stop_waiter,
+            socket_cleanup=socket_cleanup,
+        )
+
+    async def _run_deferred_stop_path(
+        self,
+        *,
+        snapshot: _DatagramStopSnapshot,
+        provenance: _DatagramStopProvenance,
+        stop_state: _DatagramStopExecutionState,
+        stop_waiter: asyncio.Future[None] | None,
+        socket_cleanup: SocketCleanup | None,
+    ) -> None:
         """Tear down resources and schedule terminal publication after handlers unwind."""
         first_error: BaseException | None = None
-        try:
-            if provenance.active_inline_handler:
-                snapshot.cancel_task = False
-            await self._teardown_stop_resources(snapshot=snapshot, socket_cleanup=socket_cleanup)
-        except (Exception, asyncio.CancelledError) as error:
-            first_error = error
+        if provenance.active_inline_handler:
+            snapshot.cancel_task = False
+        first_error = await self._teardown_datagram_stop_resources(
+            snapshot=snapshot,
+            socket_cleanup=socket_cleanup,
+            first_error=first_error,
+        )
         if first_error is None:
-            try:
-                await self._event_dispatcher.stop_from_handler_origin()
-            except (Exception, asyncio.CancelledError) as error:
-                first_error = error
+            first_error = await self._stop_dispatcher_from_handler_origin(first_error=first_error)
         if first_error is None:
-            self._complete_stop_waiter_after_deferred_stop_events(stop_waiter, snapshot)
-            return True
+            self._schedule_deferred_stop_events(
+                stop_waiter=stop_waiter,
+                snapshot=snapshot,
+                stop_state=stop_state,
+            )
+            return
         raise first_error
 
     async def _run_ordinary_stop_path(
@@ -422,45 +429,160 @@ class _AsyncioDatagramReceiverBase:
     ) -> None:
         """Run the ordinary stop path that publishes terminal events inline."""
         first_error: BaseException | None = None
+        first_error = await self._emit_stop_started_event(
+            snapshot=snapshot, first_error=first_error
+        )
+        first_error = await self._teardown_datagram_stop_resources(
+            snapshot=snapshot,
+            socket_cleanup=socket_cleanup,
+            first_error=first_error,
+        )
+        if first_error is None:
+            first_error = await self._publish_stop_closed_event(
+                snapshot=snapshot,
+                stop_state=stop_state,
+                stop_waiter=stop_waiter,
+            )
+        first_error = await self._finish_stop_with_dispatcher(
+            snapshot=snapshot,
+            first_error=first_error,
+        )
+        if first_error is not None:
+            raise first_error
+
+    async def _emit_stop_started_event(
+        self,
+        *,
+        snapshot: _DatagramStopSnapshot,
+        first_error: BaseException | None,
+    ) -> BaseException | None:
+        """Publish the STOPPING lifecycle event when immediate publication is allowed."""
         try:
             await self._publish_stopping_transition(snapshot)
         except (Exception, asyncio.CancelledError) as error:
-            first_error = error
+            if first_error is None:
+                return error
+        return first_error
+
+    async def _teardown_datagram_stop_resources(
+        self,
+        *,
+        snapshot: _DatagramStopSnapshot,
+        socket_cleanup: SocketCleanup | None,
+        first_error: BaseException | None,
+    ) -> BaseException | None:
+        """Cancel the receive task and close the socket while preserving first error."""
         try:
             await self._teardown_stop_resources(snapshot=snapshot, socket_cleanup=socket_cleanup)
         except (Exception, asyncio.CancelledError) as error:
             if first_error is None:
-                first_error = error
-        if first_error is None:
-            try:
-                _, stop_state.deferred_close_waiter = await self._publish_closed_event_if_needed(
-                    snapshot
-                )
-            except (Exception, asyncio.CancelledError) as error:
-                first_error = error
-            else:
-                if stop_state.deferred_close_waiter is not None:
-                    try:
-                        await asyncio.shield(stop_state.deferred_close_waiter)
-                    except asyncio.CancelledError:
-                        self._complete_stop_waiter_after_deferred_close_and_stop(
-                            stop_waiter=stop_waiter,
-                            snapshot=snapshot,
-                            deferred_close_waiter=stop_state.deferred_close_waiter,
-                        )
-                        stop_state.stop_waiter_completion_deferred = True
-                        raise
-                    except Exception as error:
-                        first_error = error
+                return error
+        return first_error
+
+    async def _stop_dispatcher_from_handler_origin(
+        self,
+        *,
+        first_error: BaseException | None,
+    ) -> BaseException | None:
+        """Stop the dispatcher through its handler-origin path for deferred stops."""
+        try:
+            await self._event_dispatcher.stop_from_handler_origin()
+        except (Exception, asyncio.CancelledError) as error:
+            if first_error is None:
+                return error
+        return first_error
+
+    async def _publish_stop_closed_event(
+        self,
+        *,
+        snapshot: _DatagramStopSnapshot,
+        stop_state: _DatagramStopExecutionState,
+        stop_waiter: asyncio.Future[None] | None,
+    ) -> BaseException | None:
+        """Publish or await stop-time close publication when needed."""
+        try:
+            _, stop_state.deferred_close_waiter = await self._publish_closed_event_if_needed(
+                snapshot
+            )
+        except (Exception, asyncio.CancelledError) as error:
+            return error
+        if stop_state.deferred_close_waiter is None:
+            return None
+        try:
+            await asyncio.shield(stop_state.deferred_close_waiter)
+        except asyncio.CancelledError:
+            self._complete_stop_waiter_after_deferred_close_and_stop(
+                stop_waiter=stop_waiter,
+                snapshot=snapshot,
+                deferred_close_waiter=stop_state.deferred_close_waiter,
+            )
+            stop_state.stop_waiter_completion_deferred = True
+            raise
+        except Exception as error:
+            return error
+        return None
+
+    async def _finish_stop_with_dispatcher(
+        self,
+        *,
+        snapshot: _DatagramStopSnapshot,
+        first_error: BaseException | None,
+    ) -> BaseException | None:
+        """Publish final STOPPED and stop the dispatcher, preserving first error."""
         await self._publish_stopped_transition_if_needed(snapshot, emit_event=first_error is None)
         if snapshot.stop_dispatcher:
             try:
                 await self._event_dispatcher.stop()
             except (Exception, asyncio.CancelledError) as error:
                 if first_error is None:
-                    first_error = error
-        if first_error is not None:
-            raise first_error
+                    return error
+        return first_error
+
+    def _schedule_deferred_stop_events(
+        self,
+        *,
+        stop_waiter: asyncio.Future[None] | None,
+        snapshot: _DatagramStopSnapshot,
+        stop_state: _DatagramStopExecutionState,
+    ) -> None:
+        """Schedule terminal stop publication once active handlers unwind."""
+        self._complete_stop_waiter_after_deferred_stop_events(stop_waiter, snapshot)
+        stop_state.stop_waiter_completion_deferred = True
+
+    def _fail_stop_waiter_if_needed(
+        self,
+        stop_waiter: asyncio.Future[None] | None,
+        stop_state: _DatagramStopExecutionState,
+        error: BaseException,
+    ) -> None:
+        """Fail the shared stop waiter unless its completion was delegated."""
+        if stop_waiter is None or stop_waiter.done() or stop_state.stop_waiter_completion_deferred:
+            return
+        stop_waiter.set_exception(error)
+        # Mark the exception as retrieved so failed owner stops do not leave an
+        # unhandled-Future warning behind.
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            stop_waiter.exception()
+
+    def _complete_stop_waiter_after_owned_stop(
+        self,
+        *,
+        stop_waiter: asyncio.Future[None] | None,
+        provenance: _DatagramStopProvenance,
+        stop_state: _DatagramStopExecutionState,
+    ) -> None:
+        """Complete or delegate the owner stop waiter after successful execution."""
+        if stop_waiter is None or stop_waiter.done():
+            return
+        if stop_state.stop_waiter_completion_deferred:
+            return
+        if provenance.handler_originated and stop_state.deferred_close_waiter is not None:
+            self._complete_stop_waiter_after_deferred_close(
+                stop_waiter, stop_state.deferred_close_waiter
+            )
+            stop_state.stop_waiter_completion_deferred = True
+            return
+        stop_waiter.set_result(None)
 
     async def _clear_stop_waiter_if_current(self, stop_waiter: asyncio.Future[None] | None) -> None:
         """Clear the shared stop waiter when the caller still owns it."""
