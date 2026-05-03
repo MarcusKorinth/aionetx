@@ -165,6 +165,7 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
         self._logger.debug("Starting TCP client.")
         starting_event: ComponentLifecycleChangedEvent | None = None
         running_event: ComponentLifecycleChangedEvent | None = None
+        stop_waiter: asyncio.Future[None] | None = None
         async with self._state_lock:
             if self._lifecycle_state in (
                 ComponentLifecycleState.STARTING,
@@ -174,16 +175,31 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                 return
             self._last_connect_error = None
             self._has_started = True
-            # Keep dispatcher startup and the initial lifecycle transitions in one
-            # locked section so stop() cannot observe a half-started client.
+            # Keep dispatcher startup and STARTING in one locked section so
+            # stop() cannot observe a half-started client.
             await self._event_dispatcher.start()
             starting_event = self._apply_lifecycle_state(ComponentLifecycleState.STARTING)
-            self._supervisor_task = asyncio.create_task(
-                self._supervise(), name="tcp-client-supervisor"
-            )
-            running_event = self._apply_lifecycle_state(ComponentLifecycleState.RUNNING)
         try:
-            await self._emit_lifecycle_event(starting_event)
+            if starting_event is not None:
+                await self._event_dispatcher.emit_and_wait(
+                    starting_event, drop_on_backpressure=False
+                )
+        except (Exception, asyncio.CancelledError):
+            await self._rollback_failed_startup()
+            raise
+        async with self._state_lock:
+            if self._lifecycle_state != ComponentLifecycleState.STARTING:
+                stop_waiter = self._stop_waiter
+            else:
+                self._supervisor_task = asyncio.create_task(
+                    self._supervise(), name="tcp-client-supervisor"
+                )
+                running_event = self._apply_lifecycle_state(ComponentLifecycleState.RUNNING)
+        if stop_waiter is not None:
+            await asyncio.shield(stop_waiter)
+        if running_event is None:
+            return
+        try:
             await self._emit_lifecycle_event(running_event)
         except (Exception, asyncio.CancelledError):
             await self._rollback_failed_startup()
