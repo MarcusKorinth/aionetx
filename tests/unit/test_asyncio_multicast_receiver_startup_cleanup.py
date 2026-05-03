@@ -23,6 +23,7 @@ from aionetx.api.event_delivery_settings import (
     EventDispatchMode,
     EventHandlerFailurePolicy,
 )
+from aionetx.api.handler_failure_policy_stop_event import HandlerFailurePolicyStopEvent
 from aionetx.api.multicast_receiver_settings import MulticastReceiverSettings
 from aionetx.implementations.asyncio_impl import (
     _asyncio_datagram_receiver_base as datagram_base_module,
@@ -74,6 +75,19 @@ class BlockingStoppingHandler:
         ):
             self.stopping_seen.set()
             await self.release_stopping.wait()
+
+
+class RecordAndFailOnStoppingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STOPPING
+        ):
+            raise RuntimeError("multicast-stopping-publication-failed")
 
 
 @pytest.mark.asyncio
@@ -382,6 +396,58 @@ async def test_multicast_receiver_stop_from_starting_state_does_not_emit_closed_
     await receiver.stop()
 
     assert awaitable_recording_event_handler.closed_events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.multicast
+async def test_multicast_receiver_stop_component_failure_during_stopping_publishes_single_terminal_sequence() -> (
+    None
+):
+    handler = RecordAndFailOnStoppingHandler()
+    receiver = AsyncioMulticastReceiver(
+        settings=MulticastReceiverSettings(
+            group_ip="239.255.0.5",
+            port=20007,
+            bind_ip="0.0.0.0",
+            interface_ip="127.0.0.1",
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.BACKGROUND,
+                handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+            ),
+        ),
+        event_handler=handler,
+    )
+
+    await receiver.start()
+    await asyncio.wait_for(receiver.stop(), timeout=1.0)
+
+    stop_relevant_events = [
+        event
+        for event in handler.events
+        if isinstance(event, (ConnectionClosedEvent, HandlerFailurePolicyStopEvent))
+        or (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+        )
+    ]
+
+    assert [
+        (
+            event.current
+            if isinstance(event, ComponentLifecycleChangedEvent)
+            else type(event).__name__
+        )
+        for event in stop_relevant_events
+    ] == [
+        ComponentLifecycleState.STOPPING,
+        "HandlerFailurePolicyStopEvent",
+        "ConnectionClosedEvent",
+        ComponentLifecycleState.STOPPED,
+    ]
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
