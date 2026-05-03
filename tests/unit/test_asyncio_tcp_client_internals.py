@@ -23,6 +23,7 @@ from aionetx.api.event_delivery_settings import (
     EventHandlerFailurePolicy,
 )
 from aionetx.api.error_policy import ErrorPolicy
+from aionetx.api.handler_failure_policy_stop_event import HandlerFailurePolicyStopEvent
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
 from aionetx.api.connection_events import ConnectionClosedEvent, ConnectionOpenedEvent
@@ -1060,6 +1061,19 @@ async def test_client_reconnect_wait_returns_early_when_stop_changes_status(
 
 
 # STOP_COMPONENT ordering when handler failures trigger client shutdown.
+class _RecordAndFailOnClientStopping:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STOPPING
+        ):
+            raise RuntimeError("client-stopping-publication-failed")
+
+
 @pytest.mark.asyncio
 async def test_stop_component_policy_stops_heartbeat_before_connection_close() -> None:
     call_order: list[str] = []
@@ -1195,6 +1209,72 @@ async def test_stop_component_policy_from_worker_with_full_queue_stops_client() 
     assert tcp_client_module.ComponentLifecycleState.STOPPED in lifecycle_states
     assert any(type(event).__name__ == "HandlerFailurePolicyStopEvent" for event in observed_events)
     assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_tcp_client_stop_component_failure_during_stopping_publishes_single_terminal_sequence() -> (
+    None
+):
+    release_server_connection = asyncio.Event()
+
+    async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await release_server_connection.wait()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(_handle_client, "127.0.0.1", 0)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        handler = _RecordAndFailOnClientStopping()
+        client = AsyncioTcpClient(
+            settings=TcpClientSettings(
+                host="127.0.0.1",
+                port=port,
+                reconnect=TcpReconnectSettings(enabled=False),
+                event_delivery=EventDeliverySettings(
+                    dispatch_mode=EventDispatchMode.BACKGROUND,
+                    handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+                ),
+            ),
+            event_handler=handler,
+        )
+
+        try:
+            await client.start()
+            await client.wait_until_connected(timeout_seconds=1.0)
+            await asyncio.wait_for(client.stop(), timeout=1.0)
+        finally:
+            release_server_connection.set()
+            await client.stop()
+
+    stop_relevant_events = [
+        event
+        for event in handler.events
+        if isinstance(event, (ConnectionClosedEvent, HandlerFailurePolicyStopEvent))
+        or (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+        )
+    ]
+
+    assert [
+        (
+            event.current
+            if isinstance(event, ComponentLifecycleChangedEvent)
+            else type(event).__name__
+        )
+        for event in stop_relevant_events
+    ] == [
+        ComponentLifecycleState.STOPPING,
+        "HandlerFailurePolicyStopEvent",
+        "ConnectionClosedEvent",
+        ComponentLifecycleState.STOPPED,
+    ]
+    assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert client._event_dispatcher.is_running is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

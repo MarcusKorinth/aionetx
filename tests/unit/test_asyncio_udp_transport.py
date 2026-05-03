@@ -28,6 +28,7 @@ from aionetx.api.event_delivery_settings import (
     EventDispatchMode,
     EventHandlerFailurePolicy,
 )
+from aionetx.api.handler_failure_policy_stop_event import HandlerFailurePolicyStopEvent
 from aionetx.api.udp import UdpInvalidTargetError
 from aionetx.api.udp import UdpReceiverSettings
 from aionetx.api.udp import UdpSenderStoppedError
@@ -62,6 +63,19 @@ class FailOnLifecycleStateHandler:
     async def on_event(self, event) -> None:
         if isinstance(event, ComponentLifecycleChangedEvent) and event.current == self._state:
             raise RuntimeError(f"udp-{self._state.value}-publication-failed")
+
+
+class RecordAndFailOnStoppingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STOPPING
+        ):
+            raise RuntimeError("udp-stopping-publication-failed")
 
 
 class StopOnStartingHandler:
@@ -517,6 +531,55 @@ async def test_udp_receiver_stop_lifecycle_failure_still_closes_socket_and_stops
     with pytest.raises(RuntimeError, match="udp-stopping-publication-failed"):
         await receiver.stop()
 
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_stop_component_failure_during_stopping_publishes_single_terminal_sequence() -> (
+    None
+):
+    handler = RecordAndFailOnStoppingHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=_get_unused_udp_port(),
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.BACKGROUND,
+                handler_failure_policy=EventHandlerFailurePolicy.STOP_COMPONENT,
+            ),
+        ),
+        event_handler=handler,
+    )
+
+    await receiver.start()
+    await asyncio.wait_for(receiver.stop(), timeout=1.0)
+
+    stop_relevant_events = [
+        event
+        for event in handler.events
+        if isinstance(event, (ConnectionClosedEvent, HandlerFailurePolicyStopEvent))
+        or (
+            isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current in (ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED)
+        )
+    ]
+
+    assert [
+        (
+            event.current
+            if isinstance(event, ComponentLifecycleChangedEvent)
+            else type(event).__name__
+        )
+        for event in stop_relevant_events
+    ] == [
+        ComponentLifecycleState.STOPPING,
+        "HandlerFailurePolicyStopEvent",
+        "ConnectionClosedEvent",
+        ComponentLifecycleState.STOPPED,
+    ]
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._socket is None  # type: ignore[attr-defined]
     assert receiver._task is None  # type: ignore[attr-defined]
