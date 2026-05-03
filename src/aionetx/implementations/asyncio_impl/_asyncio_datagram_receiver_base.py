@@ -888,11 +888,20 @@ class _AsyncioDatagramReceiverBase:
             await self._event_dispatcher.start()
             starting_event = self._apply_lifecycle_state(ComponentLifecycleState.STARTING)
         try:
-            await self._emit_lifecycle_event(starting_event)
+            if starting_event is not None:
+                await self._event_dispatcher.emit_and_wait(
+                    starting_event, drop_on_backpressure=False
+                )
         except (Exception, asyncio.CancelledError):
             await self._rollback_failed_starting_publication()
             raise
-        return True
+        async with self._state_lock:
+            if self._lifecycle_state == ComponentLifecycleState.STARTING:
+                return True
+            stop_waiter = self._runtime.stop_waiter
+        if stop_waiter is not None:
+            await asyncio.shield(stop_waiter)
+        return False
 
     async def _complete_startup(
         self,

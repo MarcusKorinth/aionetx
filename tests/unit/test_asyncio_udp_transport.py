@@ -35,6 +35,7 @@ from aionetx.api.udp import UdpSenderSettings
 from aionetx.implementations.asyncio_impl import (
     _asyncio_datagram_receiver_base as datagram_base_module,
 )
+from aionetx.implementations.asyncio_impl import asyncio_udp_receiver as udp_receiver_module
 from aionetx.implementations.asyncio_impl import asyncio_udp_sender as udp_sender_module
 from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import AsyncioUdpReceiver
 from aionetx.implementations.asyncio_impl.asyncio_udp_sender import AsyncioUdpSender
@@ -61,6 +62,21 @@ class FailOnLifecycleStateHandler:
     async def on_event(self, event) -> None:
         if isinstance(event, ComponentLifecycleChangedEvent) and event.current == self._state:
             raise RuntimeError(f"udp-{self._state.value}-publication-failed")
+
+
+class StopOnStartingHandler:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.receiver: AsyncioUdpReceiver | None = None
+
+    async def on_event(self, event) -> None:
+        self.events.append(event)
+        if (
+            self.receiver is not None
+            and isinstance(event, ComponentLifecycleChangedEvent)
+            and event.current == ComponentLifecycleState.STARTING
+        ):
+            await self.receiver.stop()
 
 
 class BlockingStoppingHandler:
@@ -392,6 +408,61 @@ async def test_udp_receiver_starting_lifecycle_failure_rolls_back_dispatcher() -
         await receiver.start()
 
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert receiver._socket is None  # type: ignore[attr-defined]
+    assert receiver._task is None  # type: ignore[attr-defined]
+    assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch_mode",
+    [EventDispatchMode.INLINE, EventDispatchMode.BACKGROUND],
+)
+async def test_udp_receiver_starting_handler_stop_aborts_startup_without_resources(
+    dispatch_mode: EventDispatchMode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _get_unused_udp_port()
+
+    class SocketSetupShouldNotRun:
+        AF_INET = socket.AF_INET
+        SOCK_DGRAM = socket.SOCK_DGRAM
+        IPPROTO_UDP = socket.IPPROTO_UDP
+
+        @staticmethod
+        def socket(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("socket setup should not continue after STARTING stop")
+
+    monkeypatch.setattr(udp_receiver_module, "socket", SocketSetupShouldNotRun)
+
+    handler = StopOnStartingHandler()
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(
+            host="127.0.0.1",
+            port=port,
+            event_delivery=EventDeliverySettings(dispatch_mode=dispatch_mode),
+        ),
+        event_handler=handler,
+    )
+    handler.receiver = receiver
+
+    await receiver.start()
+    assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
+
+    lifecycle_states = [
+        event.current
+        for event in handler.events
+        if isinstance(event, ComponentLifecycleChangedEvent)
+    ]
+    assert lifecycle_states == [
+        ComponentLifecycleState.STARTING,
+        ComponentLifecycleState.STOPPING,
+        ComponentLifecycleState.STOPPED,
+    ]
+    assert not any(isinstance(event, ConnectionOpenedEvent) for event in handler.events)
+    assert not any(isinstance(event, ConnectionClosedEvent) for event in handler.events)
+    assert not receiver._running  # type: ignore[attr-defined]
     assert receiver._socket is None  # type: ignore[attr-defined]
     assert receiver._task is None  # type: ignore[attr-defined]
     assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
