@@ -21,6 +21,7 @@ from aionetx.api.bytes_received_event import BytesReceivedEvent
 from aionetx.api.connection_events import ConnectionClosedEvent
 from aionetx.api.connection_events import ConnectionOpenedEvent
 from aionetx.api.event_delivery_settings import (
+    EventBackpressurePolicy,
     EventDeliverySettings,
     EventDispatchMode,
     EventHandlerFailurePolicy,
@@ -47,6 +48,120 @@ def _unused_port(kind: socket.SocketKind = socket.SOCK_STREAM) -> int:
 class _NoopHandler:
     async def on_event(self, event: NetworkEvent) -> None:
         return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.behavior_critical
+async def test_tcp_server_background_backpressure_stays_bounded_across_live_connections() -> None:
+    port = _unused_port()
+
+    class BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.opened_ids: list[str] = []
+            self.bytes_events: list[BytesReceivedEvent] = []
+            self.first_bytes_started = asyncio.Event()
+            self.release_first_bytes = asyncio.Event()
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, ConnectionOpenedEvent):
+                self.opened_ids.append(event.resource_id)
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+
+            self.bytes_events.append(event)
+            if len(self.bytes_events) == 1:
+                self.first_bytes_started.set()
+                await self.release_first_bytes.wait()
+
+    handler = BlockingBytesHandler()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=port,
+            max_connections=64,
+            receive_buffer_size=2,
+            event_delivery=EventDeliverySettings(
+                dispatch_mode=EventDispatchMode.BACKGROUND,
+                max_pending_events=2,
+                backpressure_policy=EventBackpressurePolicy.DROP_NEWEST,
+            ),
+        ),
+        event_handler=handler,
+    )
+    client_streams: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+
+    await server.start()
+    try:
+        client_streams.append(await asyncio.open_connection("127.0.0.1", port))
+        client_streams.append(await asyncio.open_connection("127.0.0.1", port))
+        await wait_for_condition(lambda: len(handler.opened_ids) == 2, timeout_seconds=3.0)
+
+        _, first_writer = client_streams[0]
+        _, second_writer = client_streams[1]
+
+        first_writer.write(b"a1")
+        await first_writer.drain()
+        await asyncio.wait_for(handler.first_bytes_started.wait(), timeout=3.0)
+
+        first_writer.write(b"a2")
+        await first_writer.drain()
+        await wait_for_condition(
+            lambda: server.dispatcher_runtime_stats.queue_depth == 1,
+            timeout_seconds=3.0,
+        )
+
+        second_writer.write(b"b1")
+        await second_writer.drain()
+        await wait_for_condition(
+            lambda: server.dispatcher_runtime_stats.queue_depth == 2,
+            timeout_seconds=3.0,
+        )
+
+        second_writer.write(b"b2")
+        await second_writer.drain()
+        await wait_for_condition(
+            lambda: server.dispatcher_runtime_stats.dropped_backpressure_newest_total == 1,
+            timeout_seconds=3.0,
+        )
+        saturated_stats = server.dispatcher_runtime_stats
+
+        handler.release_first_bytes.set()
+        await wait_for_condition(
+            lambda: (
+                len(handler.bytes_events) == 3 and server.dispatcher_runtime_stats.queue_depth == 0
+            ),
+            timeout_seconds=3.0,
+        )
+        drained_stats = server.dispatcher_runtime_stats
+    finally:
+        handler.release_first_bytes.set()
+        for _, writer in client_streams:
+            writer.close()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await writer.wait_closed()
+        await server.stop()
+
+    assert saturated_stats.queue_depth == 2
+    assert saturated_stats.queue_peak == 2
+    assert saturated_stats.dropped_backpressure_newest_total == 1
+    assert saturated_stats.dropped_backpressure_oldest_total == 0
+    assert drained_stats.queue_depth == 0
+
+    delivered = [(event.resource_id, event.data) for event in handler.bytes_events]
+    assert [data for _, data in delivered] == [b"a1", b"a2", b"b1"]
+    first_connection_id = delivered[0][0]
+    second_connection_id = delivered[2][0]
+    assert first_connection_id != second_connection_id
+    assert delivered[1][0] == first_connection_id
+    assert [data for resource_id, data in delivered if resource_id == first_connection_id] == [
+        b"a1",
+        b"a2",
+    ]
+    assert [data for resource_id, data in delivered if resource_id == second_connection_id] == [
+        b"b1"
+    ]
 
 
 # ---------------------------------------------------------------------------
