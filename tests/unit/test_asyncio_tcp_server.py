@@ -218,6 +218,25 @@ class _TeardownSender:
             raise RuntimeError(f"stop-failed:{self.connection_id}")
 
 
+class _CancellingTeardownSender:
+    """Heartbeat-sender double that surfaces caller cancellation during stop."""
+
+    def __init__(self, connection_id: str) -> None:
+        self.connection_id = connection_id
+        self.stop_started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.stop_attempts = 0
+
+    async def stop(self) -> None:
+        self.stop_attempts += 1
+        self.stop_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 # Broadcast semantics and heartbeat preconditions.
 @pytest.mark.asyncio
 async def test_server_broadcast_continues_when_one_connection_send_fails(
@@ -711,6 +730,109 @@ async def test_server_cancelled_overlapping_stop_does_not_cancel_owner_waiter(
             await drain_awaitable_ignoring_cancelled(first_stop)
 
     assert blocking.close_attempts == 1
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_server_cancelled_active_inline_stop_still_closes_connections_after_heartbeat() -> (
+    None
+):
+    class BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.stopped_seen = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current == ComponentLifecycleState.STOPPED
+            ):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("STOPPED event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.stopped_seen.set()
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_started.set()
+            await self.release_bytes.wait()
+            self.bytes_finished.set()
+
+    handler = BlockingBytesHandler()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12349,
+            max_connections=64,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    origin_connection = _BlockingCloseConnection("server:cancelled-stop:origin")
+    sibling_connection = _BlockingCloseConnection("server:cancelled-stop:sibling")
+    sender = _CancellingTeardownSender(origin_connection.connection_id)
+    server._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    server._connections = {  # type: ignore[attr-defined]
+        origin_connection.connection_id: origin_connection,  # type: ignore[dict-item]
+        sibling_connection.connection_id: sibling_connection,  # type: ignore[dict-item]
+    }
+    server._heartbeat_senders = {  # type: ignore[attr-defined]
+        sender.connection_id: sender  # type: ignore[dict-item]
+    }
+
+    await server._event_dispatcher.start()  # type: ignore[attr-defined]
+    emit_task: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    try:
+        emit_task = asyncio.create_task(
+            server._event_dispatcher.emit(  # type: ignore[attr-defined]
+                BytesReceivedEvent(resource_id=origin_connection.connection_id, data=b"hold")
+            )
+        )
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+
+        stop_task = asyncio.create_task(server.stop())
+        await asyncio.wait_for(sender.stop_started.wait(), timeout=1.0)
+        stop_task.cancel()
+        await asyncio.wait_for(sender.cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(origin_connection.close_started.wait(), timeout=1.0)
+        await asyncio.wait_for(sibling_connection.close_started.wait(), timeout=1.0)
+
+        assert stop_task.done() is False
+        assert handler.stopped_seen.is_set() is False
+
+        origin_connection.release_close.set()
+        sibling_connection.release_close.set()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert handler.stopped_seen.is_set() is False
+
+        handler.release_bytes.set()
+        await assert_awaitable_cancelled(stop_task)
+        await asyncio.wait_for(handler.stopped_seen.wait(), timeout=1.0)
+        if emit_task is not None:
+            await asyncio.wait_for(emit_task, timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        origin_connection.release_close.set()
+        sibling_connection.release_close.set()
+        for task in (emit_task, stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await drain_awaitable_ignoring_cancelled(task)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(server.stop(), timeout=1.0)
+
+    assert handler.error is None
+    assert sender.stop_attempts == 1
+    assert origin_connection.close_attempts == 1
+    assert sibling_connection.close_attempts == 1
+    assert origin_connection.state == ConnectionState.CLOSED
+    assert sibling_connection.state == ConnectionState.CLOSED
     assert server.lifecycle_state == ComponentLifecycleState.STOPPED
 
 

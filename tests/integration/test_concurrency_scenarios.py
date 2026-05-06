@@ -36,7 +36,7 @@ from aionetx.implementations.asyncio_impl.asyncio_tcp_client import AsyncioTcpCl
 from aionetx.implementations.asyncio_impl.asyncio_tcp_server import AsyncioTcpServer
 from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import AsyncioUdpReceiver
 from aionetx.implementations.asyncio_impl.asyncio_udp_sender import AsyncioUdpSender
-from tests.helpers import wait_for_condition
+from tests.helpers import assert_awaitable_cancelled, wait_for_condition
 
 
 def _unused_port(kind: socket.SocketKind = socket.SOCK_STREAM) -> int:
@@ -1480,6 +1480,141 @@ async def test_external_inline_client_stop_waits_for_active_bytes_handler() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_cancelled_external_inline_client_stop_finishes_after_active_bytes_handler() -> None:
+    port = _unused_port()
+
+    class _BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.terminal_lifecycle_started = asyncio.Event()
+            self.release_terminal_lifecycle = asyncio.Event()
+            self.terminal_lifecycle_states: list[ComponentLifecycleState] = []
+            self.closed_events: list[ConnectionClosedEvent] = []
+            self.error: BaseException | None = None
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, BytesReceivedEvent):
+                self.bytes_started.set()
+                await self.release_bytes.wait()
+                self.bytes_finished.set()
+                return
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("close event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_events.append(event)
+                return
+            if isinstance(event, ComponentLifecycleChangedEvent) and event.current in (
+                ComponentLifecycleState.STOPPING,
+                ComponentLifecycleState.STOPPED,
+            ):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("terminal lifecycle re-entered bytes handler")
+                    self.release_bytes.set()
+                self.terminal_lifecycle_states.append(event.current)
+                if event.current == ComponentLifecycleState.STOPPING:
+                    self.terminal_lifecycle_started.set()
+                    await self.release_terminal_lifecycle.wait()
+
+    handler = _BlockingBytesHandler()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
+        event_handler=_NoopHandler(),
+    )
+    client = AsyncioTcpClient(
+        settings=TcpClientSettings(
+            host="127.0.0.1",
+            port=port,
+            reconnect=TcpReconnectSettings(enabled=False),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    stop_task: asyncio.Task[None] | None = None
+    joining_stop_task: asyncio.Task[None] | None = None
+    await server.start()
+    try:
+        await client.start()
+        await client.wait_until_connected(timeout_seconds=3.0)
+        await server.broadcast(b"cancelled-external-client-stop")
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=3.0)
+
+        stop_task = asyncio.create_task(client.stop())
+        await wait_for_condition(
+            lambda: client.lifecycle_state == ComponentLifecycleState.STOPPING,
+            timeout_seconds=3.0,
+        )
+
+        joining_stop_task = asyncio.create_task(client.stop())
+        await asyncio.sleep(0)
+        assert joining_stop_task.done() is False
+
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert joining_stop_task.done() is False
+        assert not handler.bytes_finished.is_set()
+        assert handler.terminal_lifecycle_states == []
+        assert handler.closed_events == []
+
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert joining_stop_task.done() is False
+        assert not handler.bytes_finished.is_set()
+        assert handler.terminal_lifecycle_states == []
+        assert handler.closed_events == []
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.terminal_lifecycle_started.wait(), timeout=3.0)
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert joining_stop_task.done() is False
+
+        handler.release_terminal_lifecycle.set()
+        await assert_awaitable_cancelled(stop_task)
+        await asyncio.wait_for(joining_stop_task, timeout=3.0)
+        await wait_for_condition(
+            lambda: client.lifecycle_state == ComponentLifecycleState.STOPPED,
+            timeout_seconds=3.0,
+        )
+        await wait_for_condition(
+            lambda: (
+                handler.terminal_lifecycle_states
+                == [ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED]
+                and len(handler.closed_events) == 1
+            ),
+            timeout_seconds=3.0,
+        )
+    finally:
+        handler.release_bytes.set()
+        handler.release_terminal_lifecycle.set()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stop_task, timeout=1.0)
+        if joining_stop_task is not None and not joining_stop_task.done():
+            joining_stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(joining_stop_task, timeout=1.0)
+        await client.stop()
+        await server.stop()
+
+    assert handler.error is None
+    assert handler.bytes_finished.is_set()
+    assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert client.connection is None
+    assert client._stop_waiter is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_external_inline_server_stop_waits_for_active_bytes_handler() -> None:
     port = _unused_port()
 
@@ -1556,3 +1691,142 @@ async def test_external_inline_server_stop_waits_for_active_bytes_handler() -> N
         await server.stop()
 
     assert handler.error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_cancelled_external_inline_server_stop_finishes_after_active_bytes_handler() -> None:
+    port = _unused_port()
+
+    class _BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.terminal_lifecycle_started = asyncio.Event()
+            self.release_terminal_lifecycle = asyncio.Event()
+            self.terminal_lifecycle_states: list[ComponentLifecycleState] = []
+            self.closed_events: list[ConnectionClosedEvent] = []
+            self.error: BaseException | None = None
+
+        async def on_event(self, event: NetworkEvent) -> None:
+            if isinstance(event, BytesReceivedEvent):
+                self.bytes_started.set()
+                await self.release_bytes.wait()
+                self.bytes_finished.set()
+                return
+            if isinstance(event, ConnectionClosedEvent):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("close event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.closed_events.append(event)
+                return
+            if isinstance(event, ComponentLifecycleChangedEvent) and event.current in (
+                ComponentLifecycleState.STOPPING,
+                ComponentLifecycleState.STOPPED,
+            ):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("terminal lifecycle re-entered bytes handler")
+                    self.release_bytes.set()
+                self.terminal_lifecycle_states.append(event.current)
+                if event.current == ComponentLifecycleState.STOPPING:
+                    self.terminal_lifecycle_started.set()
+                    await self.release_terminal_lifecycle.wait()
+
+    handler = _BlockingBytesHandler()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=port,
+            max_connections=64,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    client = AsyncioTcpClient(
+        settings=TcpClientSettings(
+            host="127.0.0.1",
+            port=port,
+            reconnect=TcpReconnectSettings(enabled=False),
+        ),
+        event_handler=_NoopHandler(),
+    )
+    stop_task: asyncio.Task[None] | None = None
+    joining_stop_task: asyncio.Task[None] | None = None
+    await server.start()
+    try:
+        await client.start()
+        connection = await client.wait_until_connected(timeout_seconds=3.0)
+        await connection.send(b"cancelled-external-server-stop")
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=3.0)
+
+        stop_task = asyncio.create_task(server.stop())
+        await wait_for_condition(
+            lambda: server.lifecycle_state == ComponentLifecycleState.STOPPING,
+            timeout_seconds=3.0,
+        )
+
+        joining_stop_task = asyncio.create_task(server.stop())
+        await asyncio.sleep(0)
+        assert joining_stop_task.done() is False
+
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert joining_stop_task.done() is False
+        assert not handler.bytes_finished.is_set()
+        assert handler.terminal_lifecycle_states == []
+        assert handler.closed_events == []
+
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert joining_stop_task.done() is False
+        assert not handler.bytes_finished.is_set()
+        assert handler.terminal_lifecycle_states == []
+        assert handler.closed_events == []
+
+        handler.release_bytes.set()
+        await asyncio.wait_for(handler.terminal_lifecycle_started.wait(), timeout=3.0)
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+        assert stop_task.done() is False
+        assert joining_stop_task.done() is False
+
+        handler.release_terminal_lifecycle.set()
+        await assert_awaitable_cancelled(stop_task)
+        await asyncio.wait_for(joining_stop_task, timeout=3.0)
+        await wait_for_condition(
+            lambda: server.lifecycle_state == ComponentLifecycleState.STOPPED,
+            timeout_seconds=3.0,
+        )
+        await wait_for_condition(
+            lambda: (
+                handler.terminal_lifecycle_states
+                == [ComponentLifecycleState.STOPPING, ComponentLifecycleState.STOPPED]
+                and len(handler.closed_events) == 1
+            ),
+            timeout_seconds=3.0,
+        )
+    finally:
+        handler.release_bytes.set()
+        handler.release_terminal_lifecycle.set()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stop_task, timeout=1.0)
+        if joining_stop_task is not None and not joining_stop_task.done():
+            joining_stop_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(joining_stop_task, timeout=1.0)
+        await client.stop()
+        await server.stop()
+
+    assert handler.error is None
+    assert handler.bytes_finished.is_set()
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert server.connections == ()
+    assert server._stop_waiter is None

@@ -25,6 +25,9 @@ Planned contents for the initial public alpha release (`0.1.0`).
   preserving per-connection event ordering across dispatch modes.
 - TCP close and stop paths now defer handler-origin terminal events until the
   active same-connection handler has returned.
+- TCP client/server stop paths and connection close paths now preserve deferred
+  terminal publication when an external caller is cancelled while an inline
+  bytes handler is still active.
 - UDP receivers now preserve deferred stop publication when stop originates
   from a handler or when an external stop caller is cancelled.
 - UDP and multicast receivers now abort startup when a STARTING lifecycle

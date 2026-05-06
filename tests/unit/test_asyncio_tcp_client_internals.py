@@ -477,6 +477,114 @@ async def test_client_stop_preserves_caller_cancellation_after_supervisor_cleanu
 
 
 @pytest.mark.asyncio
+async def test_client_cancelled_active_inline_stop_still_closes_connection_after_heartbeat() -> (
+    None
+):
+    class BlockingBytesHandler:
+        def __init__(self) -> None:
+            self.bytes_started = asyncio.Event()
+            self.release_bytes = asyncio.Event()
+            self.bytes_finished = asyncio.Event()
+            self.stopped_seen = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if (
+                isinstance(event, ComponentLifecycleChangedEvent)
+                and event.current == ComponentLifecycleState.STOPPED
+            ):
+                if not self.bytes_finished.is_set():
+                    self.error = AssertionError("STOPPED event re-entered bytes handler")
+                    self.release_bytes.set()
+                self.stopped_seen.set()
+                return
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_started.set()
+            await self.release_bytes.wait()
+            self.bytes_finished.set()
+
+    handler = BlockingBytesHandler()
+    client = AsyncioTcpClient(
+        settings=TcpClientSettings(
+            host="127.0.0.1",
+            port=45681,
+            reconnect=TcpReconnectSettings(enabled=False),
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.INLINE),
+        ),
+        event_handler=handler,
+    )
+    writer = _BlockingDrainWriter()
+    connection = AsyncioTcpConnection(
+        "tcp/client/127.0.0.1/45681/connection",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        client._event_dispatcher,  # type: ignore[attr-defined]
+        receive_buffer_size=4096,
+    )
+    connection._state = ConnectionState.CONNECTED  # type: ignore[attr-defined]
+    heartbeat_stop_started = asyncio.Event()
+    heartbeat_stop_cancelled = asyncio.Event()
+
+    async def fake_stop_heartbeat() -> None:
+        heartbeat_stop_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            heartbeat_stop_cancelled.set()
+            raise
+
+    client._running = True  # type: ignore[attr-defined]
+    client._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    client._connection = connection  # type: ignore[attr-defined]
+    client._connection_closed_event.clear()  # type: ignore[attr-defined]
+    client._stop_heartbeat_sender = fake_stop_heartbeat  # type: ignore[attr-defined,method-assign]
+    await client._event_dispatcher.start()  # type: ignore[attr-defined]
+
+    emit_task: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    try:
+        emit_task = asyncio.create_task(
+            client._event_dispatcher.emit(  # type: ignore[attr-defined]
+                BytesReceivedEvent(resource_id=connection.connection_id, data=b"hold")
+            )
+        )
+        await asyncio.wait_for(handler.bytes_started.wait(), timeout=1.0)
+
+        stop_task = asyncio.create_task(client.stop())
+        await asyncio.wait_for(heartbeat_stop_started.wait(), timeout=1.0)
+        stop_task.cancel()
+        await asyncio.wait_for(heartbeat_stop_cancelled.wait(), timeout=1.0)
+        await wait_for_condition(lambda: writer.closed, timeout_seconds=1.0)
+
+        assert stop_task.done() is False
+        assert handler.stopped_seen.is_set() is False
+
+        handler.release_bytes.set()
+        await assert_awaitable_cancelled(stop_task)
+        await asyncio.wait_for(handler.stopped_seen.wait(), timeout=1.0)
+        if emit_task is not None:
+            await asyncio.wait_for(emit_task, timeout=1.0)
+    finally:
+        handler.release_bytes.set()
+        for task in (emit_task, stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await drain_awaitable_ignoring_cancelled(task)
+        if connection.state != ConnectionState.CLOSED:
+            await connection.close()
+        if client._event_dispatcher.is_running:  # type: ignore[attr-defined]
+            await client._event_dispatcher.stop()  # type: ignore[attr-defined]
+
+    assert handler.error is None
+    assert connection.state == ConnectionState.CLOSED
+    assert writer.closed
+    assert client._connection is None  # type: ignore[attr-defined]
+    assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+
+
+@pytest.mark.asyncio
 async def test_client_concurrent_stop_waits_for_owner_without_duplicate_cleanup(
     recording_event_handler,
 ) -> None:

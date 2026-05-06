@@ -49,6 +49,7 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     ReconnectBackoff,
     assert_running_on_owner_loop,
+    await_future_completion_preserving_cancellation,
     await_task_completion_preserving_cancellation,
     validate_heartbeat_provider,
 )
@@ -98,6 +99,7 @@ class _TcpClientStopExecutionState:
 
     deferred_close_waiters: tuple[asyncio.Future[None], ...] = ()
     stop_waiter_completion_deferred: bool = False
+    raise_cancel_after_stop_waiter: bool = False
 
 
 class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
@@ -269,7 +271,9 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                 and plan.stop_waiter is not None
                 and not plan.stop_waiter.done()
             ):
-                await asyncio.shield(plan.stop_waiter)
+                await await_future_completion_preserving_cancellation(plan.stop_waiter)
+            if stop_state.raise_cancel_after_stop_waiter:
+                raise asyncio.CancelledError
         except (Exception, asyncio.CancelledError) as error:
             if plan.stop_waiter is not None and not plan.stop_waiter.done():
                 plan.stop_waiter.set_exception(error)
@@ -473,12 +477,20 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
             # A cancelled supervisor wait must not skip local resource cleanup.
             # Preserve the first error, finish teardown, then re-raise below.
             await self._stop_heartbeat_sender()
+        except (Exception, asyncio.CancelledError) as error:
+            if first_error is None:
+                first_error = error
+        try:
             state.deferred_close_waiters = await self._close_current_connection()
+        except (Exception, asyncio.CancelledError) as error:
+            if first_error is None:
+                first_error = error
+        try:
             if plan.cancel_supervisor_after_local_cleanup and plan.supervisor_task is not None:
                 plan.supervisor_task.cancel()
         except (Exception, asyncio.CancelledError) as error:
             if first_error is None:
-                return error
+                first_error = error
         return first_error
 
     async def _finish_stop_with_dispatcher(
@@ -497,6 +509,9 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     await self._event_dispatcher.stop_from_handler_origin()
                 except (Exception, asyncio.CancelledError) as error:
                     first_error = error
+            if provenance.active_inline_handler and isinstance(first_error, asyncio.CancelledError):
+                state.raise_cancel_after_stop_waiter = True
+                first_error = None
             if first_error is None:
                 self._schedule_deferred_stop_events(
                     plan=plan,
@@ -504,6 +519,7 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
                     stopped_event=stopped_event,
                     stop_dispatcher=True,
                 )
+                return None
             return first_error
 
         if first_error is None:

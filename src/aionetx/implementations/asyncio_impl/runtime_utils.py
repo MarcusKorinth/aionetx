@@ -14,6 +14,7 @@ import random
 import socket
 import sys
 import time
+from typing import Any
 
 from aionetx.api.heartbeat import TcpHeartbeatSettings
 from aionetx.api.errors import HeartbeatConfigurationError
@@ -173,6 +174,36 @@ async def await_task_completion_preserving_cancellation(task: asyncio.Task[objec
             break
     if caller_cancelled:
         raise asyncio.CancelledError
+
+
+async def await_future_completion_preserving_cancellation(
+    future: asyncio.Future[Any],
+) -> None:
+    """
+    Await a shared future without letting caller cancellation cancel or poison it.
+
+    This mirrors ``await_task_completion_preserving_cancellation`` for shared
+    coordination futures. The caller observes cancellation only after the
+    shielded future settles, while other waiters continue to observe the
+    future's own result or exception.
+    """
+    caller_cancelled = False
+    while True:
+        try:
+            await asyncio.shield(future)
+            break
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                caller_cancelled = True
+                if future.done():
+                    break
+                continue
+            raise
+    result = future.result()
+    if caller_cancelled:
+        raise asyncio.CancelledError
+    del result
 
 
 def is_task_being_cancelled(task: asyncio.Task[object] | None = None) -> bool:
