@@ -200,10 +200,9 @@ async def await_future_completion_preserving_cancellation(
                     break
                 continue
             raise
-    result = future.result()
+    future.result()
     if caller_cancelled:
         raise asyncio.CancelledError
-    del result
 
 
 def is_task_being_cancelled(task: asyncio.Task[object] | None = None) -> bool:
