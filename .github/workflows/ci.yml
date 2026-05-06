@@ -483,7 +483,7 @@ jobs:
   # Permanent readability lane: consolidates outcomes from secondary
   # non-blocking checks without affecting required trust semantics.
   property_tests_non_blocking:
-    name: Non-blocking - property-based settings tests
+    name: Non-blocking - property-based tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [required_behavior_tests]
@@ -497,12 +497,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .[dev-hypothesis]
-      - name: Run property-based settings tests
-        run: pytest -q tests/unit/test_settings_property_based.py --timeout=60
+      - name: Run property-based tests
+        run: |
+          pytest -q \
+            tests/unit/test_settings_property_based.py \
+            tests/integration/test_runtime_property_based.py \
+            --timeout=60
       - name: Warn if property tests failed
         if: failure()
         run: |
-          echo "WARNING: Property-based settings tests failed. This lane is non blocking but should be reviewed."
+          echo "WARNING: Property-based tests failed. This lane is non blocking but should be reviewed."
 
   ci_non_blocking_summary:
     name: Non-blocking - CI secondary signal summary
@@ -523,6 +527,6 @@ jobs:
           echo "- multicast checks: ${{ needs.multicast_tests_non_blocking.result }}"
           echo "- slow checks: ${{ needs.slow_tests_non_blocking.result }}"
           echo "- examples smoke: ${{ needs.examples_smoke_non_blocking.result }}"
-          echo "- property-based settings tests: ${{ needs.property_tests_non_blocking.result }}"
+          echo "- property-based tests: ${{ needs.property_tests_non_blocking.result }}"
           echo "These lanes are visible but not part of the required CI trust envelope."
 
