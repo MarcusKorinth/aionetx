@@ -1780,6 +1780,88 @@ async def test_tcp_connection_send_times_out_when_writer_drain_stalls(
 
 
 @pytest.mark.asyncio
+async def test_tcp_connection_cancelled_send_while_drain_blocked_stays_closeable(
+    recording_event_handler,
+) -> None:
+    class BlockingDrainWriter:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.drain_started = asyncio.Event()
+            self.drain_cancelled = asyncio.Event()
+            self.release_drain = asyncio.Event()
+            self.closed = False
+
+        def get_extra_info(self, key: str):
+            if key == "sockname":
+                return ("127.0.0.1", 10001)
+            if key == "peername":
+                return ("127.0.0.1", 10002)
+            return None
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+        async def drain(self) -> None:
+            self.drain_started.set()
+            try:
+                await self.release_drain.wait()
+            except asyncio.CancelledError:
+                self.drain_cancelled.set()
+                raise
+
+        def close(self) -> None:
+            self.closed = True
+            self.release_drain.set()
+
+        async def wait_closed(self) -> None:
+            return None
+
+    dispatcher = make_dispatcher(recording_event_handler)
+    await dispatcher.start()
+    writer = BlockingDrainWriter()
+    connection = AsyncioTcpConnection(
+        "client:send-cancelled",
+        ConnectionRole.CLIENT,
+        asyncio.StreamReader(),
+        writer,  # type: ignore[arg-type]
+        dispatcher,
+        1024,
+        send_timeout_seconds=30.0,
+    )
+    await connection.start()
+    send_task = asyncio.create_task(connection.send(b"payload"))
+
+    try:
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=1.0)
+        assert send_task.done() is False
+
+        send_task.cancel()
+        await asyncio.wait_for(assert_awaitable_cancelled(send_task), timeout=1.0)
+        await asyncio.wait_for(writer.drain_cancelled.wait(), timeout=1.0)
+
+        assert writer.writes == [b"payload"]
+        assert connection.state == ConnectionState.CONNECTED
+        assert writer.closed is False
+
+        await asyncio.wait_for(connection.close(), timeout=1.0)
+        await dispatcher.stop()
+
+        assert connection.state == ConnectionState.CLOSED
+        assert writer.closed is True
+        assert recording_event_handler.error_events == []
+    finally:
+        writer.release_drain.set()
+        if not send_task.done():
+            send_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(send_task, timeout=1.0)
+        if connection.state != ConnectionState.CLOSED:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await connection.close()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
 async def test_tcp_connection_send_timeout_none_waits_for_drain_completion(
     recording_event_handler,
 ) -> None:
