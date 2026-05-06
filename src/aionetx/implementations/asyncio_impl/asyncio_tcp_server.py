@@ -50,6 +50,7 @@ from aionetx.implementations.asyncio_impl.lifecycle_internal import (
 )
 from aionetx.implementations.asyncio_impl.runtime_utils import (
     assert_running_on_owner_loop,
+    await_future_completion_preserving_cancellation,
     configure_listener_bind_socket,
     validate_heartbeat_provider,
 )
@@ -95,6 +96,7 @@ class _TcpServerStopExecutionState:
     deferred_close_waiters: tuple[asyncio.Future[None], ...] = ()
     stop_waiter_completion_deferred: bool = False
     dispatcher_stopped_from_handler_origin: bool = False
+    raise_cancel_after_stop_waiter: bool = False
 
 
 class AsyncioTcpServer(TcpServerProtocol):
@@ -260,7 +262,9 @@ class AsyncioTcpServer(TcpServerProtocol):
                 and plan.stop_waiter is not None
                 and not plan.stop_waiter.done()
             ):
-                await asyncio.shield(plan.stop_waiter)
+                await await_future_completion_preserving_cancellation(plan.stop_waiter)
+            if stop_state.raise_cancel_after_stop_waiter:
+                raise asyncio.CancelledError
             self._notify_status_changed()
             self._logger.debug("TCP server stopped.")
         except (Exception, asyncio.CancelledError) as error:
@@ -420,23 +424,35 @@ class AsyncioTcpServer(TcpServerProtocol):
         try:
             if plan.server is not None:
                 plan.server.close()
+        except (Exception, asyncio.CancelledError) as error:
+            if first_error is None:
+                first_error = error
+        try:
             await stop_server_heartbeat_senders(
                 senders=plan.heartbeat_senders,
                 event_dispatcher=self._event_dispatcher,
                 logger=self._logger,
                 component_id=self._component_id,
             )
+        except (Exception, asyncio.CancelledError) as error:
+            if first_error is None:
+                first_error = error
+        try:
             if plan.connections:
                 await self._close_stop_plan_connections(
                     plan=plan,
                     provenance=provenance,
                     state=state,
                 )
+        except (Exception, asyncio.CancelledError) as error:
+            if first_error is None:
+                first_error = error
+        try:
             if plan.server is not None:
                 await plan.server.wait_closed()
         except (Exception, asyncio.CancelledError) as error:
             if first_error is None:
-                return error
+                first_error = error
         return first_error
 
     async def _close_stop_plan_connections(
@@ -488,12 +504,16 @@ class AsyncioTcpServer(TcpServerProtocol):
     ) -> BaseException | None:
         """Publish terminal stop events and stop the dispatcher when required."""
         if provenance.defers_terminal_events:
+            if provenance.active_inline_handler and isinstance(first_error, asyncio.CancelledError):
+                state.raise_cancel_after_stop_waiter = True
+                first_error = None
             if first_error is None:
                 self._schedule_deferred_stop_events(
                     plan=plan,
                     state=state,
                     stopped_event=stopped_event,
                 )
+                return None
             return first_error
 
         if first_error is None:

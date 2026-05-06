@@ -24,6 +24,10 @@ from aionetx.implementations.asyncio_impl._tcp_connection_helpers import (
 )
 from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from aionetx.implementations.asyncio_impl.runtime_utils import WarningRateLimiter
+from aionetx.implementations.asyncio_impl.runtime_utils import (
+    await_future_completion_preserving_cancellation,
+    await_task_completion_preserving_cancellation,
+)
 
 ConnectionClosedCallback = Callable[["AsyncioTcpConnection"], Awaitable[None] | None]
 ConnectionReadyCallback = Callable[["AsyncioTcpConnection"], Awaitable[None] | None]
@@ -290,6 +294,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
             self._connection_id
         )
         cancellation_requested = False
+        deferred_waiter: asyncio.Future[None] | None = None
         try:
             await asyncio.shield(close_task)
             deferred_waiter = self._pending_deferred_close_waiter()
@@ -303,7 +308,21 @@ class AsyncioTcpConnection(ConnectionProtocol):
             if close_task.done() and close_task.cancelled():
                 raise
             cancellation_requested = True
-            _ = await cast(Awaitable[object], close_task)
+            try:
+                await await_task_completion_preserving_cancellation(
+                    cast(asyncio.Task[object], close_task)
+                )
+            except asyncio.CancelledError:
+                if close_task.done() and close_task.cancelled():
+                    raise
+            if deferred_waiter is None and not handler_origin_caller:
+                deferred_waiter = self._pending_deferred_close_waiter()
+            if deferred_waiter is not None and not handler_origin_caller:
+                try:
+                    await await_future_completion_preserving_cancellation(deferred_waiter)
+                except asyncio.CancelledError:
+                    if deferred_waiter.done() and deferred_waiter.cancelled():
+                        raise
         if cancellation_requested:
             raise asyncio.CancelledError
 
