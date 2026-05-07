@@ -193,6 +193,60 @@ async def test_client_stop_during_reconnect_sleep_is_prompt(recording_event_hand
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+@pytest.mark.integration_semantic
+async def test_client_reconnect_failure_delays_reach_and_remain_at_cap(
+    recording_event_handler,
+    unused_tcp_port: int,
+) -> None:
+    async def always_failing_opener(
+        *, host: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        assert host == "127.0.0.1"
+        assert port == unused_tcp_port
+        raise OSError("connect-failed-for-delay-cap-test")
+
+    client = AsyncioTcpClient(
+        settings=TcpClientSettings(
+            host="127.0.0.1",
+            port=unused_tcp_port,
+            reconnect=TcpReconnectSettings(
+                enabled=True,
+                initial_delay_seconds=0.01,
+                max_delay_seconds=0.04,
+                backoff_factor=2.0,
+            ),
+            connect_timeout_seconds=0.5,
+        ),
+        event_handler=recording_event_handler,
+        connection_opener=always_failing_opener,
+    )
+    await client.start()
+
+    await wait_for_condition(
+        lambda: len(recording_event_handler.reconnect_scheduled_events) >= 4,
+        timeout_seconds=1.0,
+    )
+    await asyncio.wait_for(client.stop(), timeout=1.0)
+
+    scheduled_events = recording_event_handler.reconnect_scheduled_events[:4]
+    failed_events = recording_event_handler.reconnect_attempt_failed_events[:4]
+    started_events = recording_event_handler.reconnect_attempt_started_events[:4]
+
+    assert [event.attempt for event in started_events] == [1, 2, 3, 4]
+    assert [event.attempt for event in failed_events] == [1, 2, 3, 4]
+    assert [event.attempt for event in scheduled_events] == [2, 3, 4, 5]
+    assert [event.delay_seconds for event in scheduled_events] == pytest.approx(
+        [0.01, 0.02, 0.04, 0.04]
+    )
+    assert [event.next_delay_seconds for event in failed_events] == pytest.approx(
+        [0.01, 0.02, 0.04, 0.04]
+    )
+    assert client.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert client.connection is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 @pytest.mark.behavior_critical
 async def test_client_stop_during_inflight_heartbeat_send_is_prompt(
     recording_event_handler,
