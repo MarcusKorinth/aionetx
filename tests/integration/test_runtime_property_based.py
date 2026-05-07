@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+pytestmark = [pytest.mark.hypothesis, pytest.mark.integration]
+
 hypothesis = pytest.importorskip(
     "hypothesis", reason="hypothesis not installed; skipping runtime property tests"
 )
@@ -33,8 +35,6 @@ from aionetx.implementations.asyncio_impl.asyncio_udp_receiver import (  # noqa:
     AsyncioUdpReceiver,
 )
 from aionetx.testing import RecordingEventHandler, wait_for_condition  # noqa: E402
-
-pytestmark = [pytest.mark.hypothesis, pytest.mark.integration]
 
 TCP_MAX_EXAMPLES = 12
 UDP_MAX_EXAMPLES = 12

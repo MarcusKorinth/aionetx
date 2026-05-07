@@ -20,6 +20,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.hypothesis
+
 hypothesis = pytest.importorskip(
     "hypothesis", reason="hypothesis not installed; skipping property-based tests"
 )
@@ -30,8 +32,6 @@ from hypothesis import strategies as st  # noqa: E402
 from aionetx.api.errors import InvalidNetworkConfigurationError  # noqa: E402
 from aionetx.api.tcp_client import TcpClientSettings  # noqa: E402
 from aionetx.api.tcp_reconnect_settings import TcpReconnectSettings  # noqa: E402
-
-pytestmark = pytest.mark.hypothesis
 
 
 # ---------------------------------------------------------------------------
