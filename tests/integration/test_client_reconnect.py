@@ -193,7 +193,6 @@ async def test_client_stop_during_reconnect_sleep_is_prompt(recording_event_hand
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-@pytest.mark.integration_semantic
 async def test_client_reconnect_failure_delays_reach_and_remain_at_cap(
     recording_event_handler,
     unused_tcp_port: int,
