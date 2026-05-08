@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import sys
 import tarfile
 import tomllib
 import zipfile
@@ -150,4 +149,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

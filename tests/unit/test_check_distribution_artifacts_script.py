@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tarfile
 import zipfile
 from io import BytesIO
@@ -9,11 +10,11 @@ from types import ModuleType
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "ci" / "check_distribution_artifacts.py"
 
 
 def _load_script() -> ModuleType:
-    script_path = REPO_ROOT / "scripts" / "ci" / "check_distribution_artifacts.py"
-    spec = importlib.util.spec_from_file_location(script_path.stem, script_path)
+    spec = importlib.util.spec_from_file_location(SCRIPT_PATH.stem, SCRIPT_PATH)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -53,7 +54,7 @@ def test_distribution_artifact_checker_accepts_matching_wheel_and_sdist(
     _write_sdist(tmp_path / "aionetx-0.1.0.tar.gz", metadata)
 
     monkeypatch.setattr(
-        script.sys,
+        sys,
         "argv",
         [
             "check_distribution_artifacts.py",
@@ -83,7 +84,7 @@ def test_distribution_artifact_checker_rejects_version_mismatch(
     _write_sdist(tmp_path / "aionetx-0.2.0.tar.gz", metadata)
 
     monkeypatch.setattr(
-        script.sys,
+        sys,
         "argv",
         [
             "check_distribution_artifacts.py",
@@ -101,3 +102,9 @@ def test_distribution_artifact_checker_rejects_version_mismatch(
         assert str(exc) == "aionetx-0.2.0-py3-none-any.whl: expected Version 0.1.0, got 0.2.0"
     else:  # pragma: no cover - clarity for assertion failure
         raise AssertionError("metadata mismatch was accepted")
+
+
+def test_distribution_artifact_checker_entrypoint_does_not_wrap_main_return() -> None:
+    script_text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert "sys.exit(main())" not in script_text
