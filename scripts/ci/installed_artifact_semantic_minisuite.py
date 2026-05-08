@@ -167,6 +167,7 @@ async def _assert_reconnect_failure_and_recovery(factory: AsyncioNetworkFactory)
             settings=TcpClientSettings(
                 host="127.0.0.1",
                 port=port,
+                connect_timeout_seconds=0.2,
                 reconnect=TcpReconnectSettings(
                     enabled=True,
                     initial_delay_seconds=0.05,

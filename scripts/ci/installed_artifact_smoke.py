@@ -172,6 +172,7 @@ async def _run_reconnect_smoke(factory: AsyncioNetworkFactory, handler: SmokeEve
             settings=TcpClientSettings(
                 host="127.0.0.1",
                 port=port,
+                connect_timeout_seconds=0.2,
                 reconnect=TcpReconnectSettings(
                     enabled=True,
                     initial_delay_seconds=0.05,

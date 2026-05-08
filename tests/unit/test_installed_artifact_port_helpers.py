@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import ast
 import inspect
 import socket
 from pathlib import Path
@@ -21,6 +22,27 @@ def _load_script(script_name: str) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _script_ast(script_name: str) -> ast.Module:
+    script_path = _repo_root() / "scripts" / "ci" / script_name
+    return ast.parse(script_path.read_text(encoding="utf-8"))
+
+
+def _tcp_client_settings_keywords(script_name: str, function_name: str) -> set[str]:
+    module = _script_ast(script_name)
+    for node in module.body:
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name:
+            return {
+                keyword.arg
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "TcpClientSettings"
+                for keyword in child.keywords
+                if keyword.arg is not None
+            }
+    raise AssertionError(f"{function_name} not found in {script_name}")
 
 
 def _assert_tcp_port_is_held(port: int) -> None:
@@ -79,3 +101,14 @@ def test_installed_artifact_scripts_do_not_keep_generic_unused_port_helpers() ->
             if name.startswith("_get_unused_tcp_port") or name.startswith("_get_unused_udp_port")
         }
         assert helper_names == set()
+
+
+def test_reconnect_smokes_bound_connect_attempt_duration() -> None:
+    reconnect_checks = {
+        "installed_artifact_smoke.py": "_run_reconnect_smoke",
+        "installed_artifact_semantic_minisuite.py": "_assert_reconnect_failure_and_recovery",
+    }
+
+    for script_name, function_name in reconnect_checks.items():
+        keywords = _tcp_client_settings_keywords(script_name, function_name)
+        assert "connect_timeout_seconds" in keywords
