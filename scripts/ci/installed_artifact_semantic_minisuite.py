@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import socket
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 from aionetx import (
     AsyncioNetworkFactory,
@@ -63,7 +64,22 @@ async def _wait_for_condition(
         ) from error
 
 
-def _get_unused_tcp_port() -> int:
+@contextmanager
+def _reserved_tcp_failure_port() -> Iterator[int]:
+    """Hold a bound non-listening TCP port for predictable connection failures."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        yield int(sock.getsockname()[1])
+
+
+def _released_tcp_listener_port() -> int:
+    """Return an intentionally released TCP port for managed server checks.
+
+    This released-port helper is intentional: TcpServerSettings requires a
+    concrete nonzero port and does not accept a pre-bound socket. Keep this
+    helper scoped to installed-artifact checks that must exercise the managed
+    TCP server itself.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -91,7 +107,7 @@ def _has_ordered_subsequence(
 
 async def _assert_lifecycle_and_order_semantics(factory: AsyncioNetworkFactory) -> None:
     handler = SemanticEventHandler()
-    port = _get_unused_tcp_port()
+    port = _released_tcp_listener_port()
 
     server = factory.create_tcp_server(
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
@@ -146,35 +162,40 @@ async def _assert_lifecycle_and_order_semantics(factory: AsyncioNetworkFactory) 
 
 async def _assert_reconnect_failure_and_recovery(factory: AsyncioNetworkFactory) -> None:
     handler = SemanticEventHandler()
-    port = _get_unused_tcp_port()
-
-    client = factory.create_tcp_client(
-        settings=TcpClientSettings(
-            host="127.0.0.1",
-            port=port,
-            reconnect=TcpReconnectSettings(
-                enabled=True,
-                initial_delay_seconds=0.05,
-                max_delay_seconds=0.1,
-                backoff_factor=1.0,
+    with _reserved_tcp_failure_port() as port:
+        client = factory.create_tcp_client(
+            settings=TcpClientSettings(
+                host="127.0.0.1",
+                port=port,
+                reconnect=TcpReconnectSettings(
+                    enabled=True,
+                    initial_delay_seconds=0.05,
+                    max_delay_seconds=0.1,
+                    backoff_factor=1.0,
+                ),
             ),
-        ),
-        event_handler=handler,
-    )
+            event_handler=handler,
+        )
 
-    await client.start()
+        await client.start()
+        try:
+            await _wait_for_condition(
+                handler,
+                lambda: any(
+                    isinstance(event, ReconnectAttemptFailedEvent) for event in handler.events
+                ),
+                timeout=3.0,
+                description="reconnect failure before server starts",
+            )
+        except Exception:
+            await client.stop()
+            raise
+
     server = factory.create_tcp_server(
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
         event_handler=handler,
     )
     try:
-        await _wait_for_condition(
-            handler,
-            lambda: any(isinstance(event, ReconnectAttemptFailedEvent) for event in handler.events),
-            timeout=3.0,
-            description="reconnect failure before server starts",
-        )
-
         await server.start()
         connection = await client.wait_until_connected(timeout_seconds=3.0)
         payload = b"mini-suite-reconnect-recovered"
@@ -197,7 +218,7 @@ async def _assert_reconnect_failure_and_recovery(factory: AsyncioNetworkFactory)
 
 async def _assert_heartbeat_semantics(factory: AsyncioNetworkFactory) -> None:
     handler = SemanticEventHandler()
-    port = _get_unused_tcp_port()
+    port = _released_tcp_listener_port()
     heartbeat_payload = b"mini-suite-heartbeat"
 
     server = factory.create_tcp_server(

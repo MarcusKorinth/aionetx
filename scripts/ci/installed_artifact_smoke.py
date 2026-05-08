@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from importlib.metadata import version as package_version
 
 import aionetx
@@ -70,13 +71,35 @@ async def _wait_for_event(
         ) from error
 
 
-def _get_unused_tcp_port() -> int:
+@contextmanager
+def _reserved_tcp_failure_port() -> Iterator[int]:
+    """Hold a bound non-listening TCP port for predictable connection failures."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        yield int(sock.getsockname()[1])
+
+
+def _released_tcp_listener_port() -> int:
+    """Return an intentionally released TCP port for managed server checks.
+
+    This released-port helper is intentional: TcpServerSettings requires a
+    concrete nonzero port and does not accept a pre-bound socket. Keep this
+    helper scoped to installed-artifact checks that must exercise the managed
+    TCP server itself.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
 
-def _get_unused_udp_port() -> int:
+def _released_udp_receiver_port() -> int:
+    """Return an intentionally released UDP port for managed receiver checks.
+
+    This released-port helper is intentional: UdpReceiverSettings requires a
+    concrete nonzero port and does not accept a pre-bound socket. Keep this
+    helper scoped to installed-artifact checks that must exercise the managed
+    UDP receiver itself.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -85,7 +108,7 @@ def _get_unused_udp_port() -> int:
 async def _run_tcp_roundtrip_smoke(
     factory: AsyncioNetworkFactory, handler: SmokeEventHandler
 ) -> None:
-    port = _get_unused_tcp_port()
+    port = _released_tcp_listener_port()
     server = factory.create_tcp_server(
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
         event_handler=handler,
@@ -119,7 +142,7 @@ async def _run_tcp_roundtrip_smoke(
 async def _run_udp_roundtrip_smoke(
     factory: AsyncioNetworkFactory, handler: SmokeEventHandler
 ) -> None:
-    port = _get_unused_udp_port()
+    port = _released_udp_receiver_port()
     receiver = factory.create_udp_receiver(
         settings=UdpReceiverSettings(host="127.0.0.1", port=port),
         event_handler=handler,
@@ -144,31 +167,33 @@ async def _run_udp_roundtrip_smoke(
 
 
 async def _run_reconnect_smoke(factory: AsyncioNetworkFactory, handler: SmokeEventHandler) -> None:
-    port = _get_unused_tcp_port()
-    reconnecting_client = factory.create_tcp_client(
-        settings=TcpClientSettings(
-            host="127.0.0.1",
-            port=port,
-            reconnect=TcpReconnectSettings(
-                enabled=True,
-                initial_delay_seconds=0.05,
-                max_delay_seconds=0.1,
-                backoff_factor=1.0,
+    with _reserved_tcp_failure_port() as port:
+        reconnecting_client = factory.create_tcp_client(
+            settings=TcpClientSettings(
+                host="127.0.0.1",
+                port=port,
+                reconnect=TcpReconnectSettings(
+                    enabled=True,
+                    initial_delay_seconds=0.05,
+                    max_delay_seconds=0.1,
+                    backoff_factor=1.0,
+                ),
             ),
-        ),
-        event_handler=handler,
-    )
-
-    await reconnecting_client.start()
-    try:
-        await _wait_for_event(
-            handler,
-            lambda: any(isinstance(event, ReconnectAttemptFailedEvent) for event in handler.events),
-            timeout=3.0,
-            description="reconnect failure event",
+            event_handler=handler,
         )
-    finally:
-        await reconnecting_client.stop()
+
+        await reconnecting_client.start()
+        try:
+            await _wait_for_event(
+                handler,
+                lambda: any(
+                    isinstance(event, ReconnectAttemptFailedEvent) for event in handler.events
+                ),
+                timeout=3.0,
+                description="reconnect failure event",
+            )
+        finally:
+            await reconnecting_client.stop()
 
 
 async def main() -> None:
