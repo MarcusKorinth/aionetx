@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import socket
 from collections.abc import Callable
 from importlib.metadata import version as package_version
+
+from _port_helpers import (
+    released_tcp_listener_port,
+    released_udp_receiver_port,
+    reserved_tcp_failure_port,
+)
 
 import aionetx
 from aionetx.api import (
@@ -70,22 +75,10 @@ async def _wait_for_event(
         ) from error
 
 
-def _get_unused_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _get_unused_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 async def _run_tcp_roundtrip_smoke(
     factory: AsyncioNetworkFactory, handler: SmokeEventHandler
 ) -> None:
-    port = _get_unused_tcp_port()
+    port = released_tcp_listener_port()
     server = factory.create_tcp_server(
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
         event_handler=handler,
@@ -119,7 +112,7 @@ async def _run_tcp_roundtrip_smoke(
 async def _run_udp_roundtrip_smoke(
     factory: AsyncioNetworkFactory, handler: SmokeEventHandler
 ) -> None:
-    port = _get_unused_udp_port()
+    port = released_udp_receiver_port()
     receiver = factory.create_udp_receiver(
         settings=UdpReceiverSettings(host="127.0.0.1", port=port),
         event_handler=handler,
@@ -144,31 +137,34 @@ async def _run_udp_roundtrip_smoke(
 
 
 async def _run_reconnect_smoke(factory: AsyncioNetworkFactory, handler: SmokeEventHandler) -> None:
-    port = _get_unused_tcp_port()
-    reconnecting_client = factory.create_tcp_client(
-        settings=TcpClientSettings(
-            host="127.0.0.1",
-            port=port,
-            reconnect=TcpReconnectSettings(
-                enabled=True,
-                initial_delay_seconds=0.05,
-                max_delay_seconds=0.1,
-                backoff_factor=1.0,
+    with reserved_tcp_failure_port() as port:
+        reconnecting_client = factory.create_tcp_client(
+            settings=TcpClientSettings(
+                host="127.0.0.1",
+                port=port,
+                connect_timeout_seconds=0.2,
+                reconnect=TcpReconnectSettings(
+                    enabled=True,
+                    initial_delay_seconds=0.05,
+                    max_delay_seconds=0.1,
+                    backoff_factor=1.0,
+                ),
             ),
-        ),
-        event_handler=handler,
-    )
-
-    await reconnecting_client.start()
-    try:
-        await _wait_for_event(
-            handler,
-            lambda: any(isinstance(event, ReconnectAttemptFailedEvent) for event in handler.events),
-            timeout=3.0,
-            description="reconnect failure event",
+            event_handler=handler,
         )
-    finally:
-        await reconnecting_client.stop()
+
+        await reconnecting_client.start()
+        try:
+            await _wait_for_event(
+                handler,
+                lambda: any(
+                    isinstance(event, ReconnectAttemptFailedEvent) for event in handler.events
+                ),
+                timeout=3.0,
+                description="reconnect failure event",
+            )
+        finally:
+            await reconnecting_client.stop()
 
 
 async def main() -> None:
