@@ -28,13 +28,13 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install build tool
+      - name: Install pinned build tools
         run: |
-          python -m pip install --upgrade pip build twine
+          python -m pip install --require-hashes -r requirements/ci-build-tools.txt
       - name: Build artifacts
-        run: python -m build
+        run: python -m build --no-isolation
       - name: Validate artifact metadata
-        run: python -m twine check dist/*
+        run: python scripts/ci/check_distribution_artifacts.py dist/*
       - name: Install wheel and run portability smoke + semantic mini-suite
         run: |
           python scripts/ci/install_single_artifact.py "dist/*.whl" --force-reinstall --no-deps
@@ -46,7 +46,7 @@ jobs:
       - name: Install sdist and run portability smoke + semantic mini-suite
         run: |
           python -m pip uninstall -y aionetx
-          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps
+          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps --no-build-isolation
           python -c "import aionetx; print(aionetx.__name__)"
           python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
           python scripts/ci/installed_artifact_smoke.py
@@ -65,13 +65,13 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install build tool
+      - name: Install pinned build tools
         run: |
-          python -m pip install --upgrade pip build twine
+          python -m pip install --require-hashes -r requirements/ci-build-tools.txt
       - name: Build artifacts
-        run: python -m build
+        run: python -m build --no-isolation
       - name: Validate artifact metadata
-        run: python -m twine check dist/*
+        run: python scripts/ci/check_distribution_artifacts.py dist/*
       - name: Install wheel and verify import
         run: |
           python scripts/ci/install_single_artifact.py "dist/*.whl" --force-reinstall --no-deps
@@ -83,7 +83,7 @@ jobs:
       - name: Install sdist and verify import
         run: |
           python -m pip uninstall -y aionetx
-          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps
+          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps --no-build-isolation
           python -c "import aionetx; print(aionetx.__name__)"
           python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
           python scripts/ci/installed_artifact_smoke.py
@@ -370,8 +370,8 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.11"
-      - name: Install build tool
-        run: python -m pip install --upgrade pip build
+      - name: Install pinned build tools
+        run: python -m pip install --require-hashes -r requirements/ci-build-tools.txt
       - name: Capture deterministic build timestamp
         id: build_epoch
         shell: bash
@@ -380,12 +380,12 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
         run: |
-          python -m build --wheel --outdir dist1/
+          python -m build --no-isolation --wheel --outdir dist1/
       - name: Second wheel build (independent repeat)
         env:
           SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
         run: |
-          python -m build --wheel --outdir dist2/
+          python -m build --no-isolation --wheel --outdir dist2/
       - name: Compare wheel SHA-256 hashes (byte-identical check)
         run: |
           python - <<'EOF'

@@ -23,6 +23,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pass --no-deps to pip install.",
     )
+    parser.add_argument(
+        "--no-build-isolation",
+        action="store_true",
+        help="Pass --no-build-isolation to pip install.",
+    )
     return parser
 
 
@@ -41,6 +46,8 @@ def main() -> None:
         pip_command.append("--force-reinstall")
     if args.no_deps:
         pip_command.append("--no-deps")
+    if args.no_build_isolation:
+        pip_command.append("--no-build-isolation")
     pip_command.append(matches[0])
 
     subprocess.check_call(pip_command)
