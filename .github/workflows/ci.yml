@@ -332,7 +332,7 @@ jobs:
 
   # Tier: supply-chain integrity - SHA pin validation (non-blocking, scheduled + workflow changes)
   validate_sha_pins:
-    name: Non-blocking - validate workflow SHA pins match tag comments
+    name: Non-blocking - validate workflow SHA pins match ref comments
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -355,8 +355,8 @@ jobs:
       - name: Warn if SHA pin validation failed
         if: failure()
         run: |
-          echo "WARNING: One or more workflow SHA pins do not match their tag comments."
-          echo "Update the SHA in the uses: line to match the tag's current commit SHA."
+          echo "WARNING: One or more workflow SHA pins do not match their ref comments."
+          echo "Update the SHA in the uses: line to match the ref's current commit SHA."
 
   # Tier: reproducible build verification (weekly schedule only - not required on every PR)
   verify_reproducible_build:
