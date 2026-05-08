@@ -73,17 +73,17 @@ jobs:
         shell: bash
         run: echo "epoch=$(git log -1 --format=%ct "${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
 
-      - name: Install build tool
+      - name: Install pinned build tools
         run: |
-          python -m pip install --upgrade pip build twine
+          python -m pip install --require-hashes -r requirements/ci-build-tools.txt
 
       - name: Build artifacts
         env:
           SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
-        run: python -m build
+        run: python -m build --no-isolation
 
       - name: Validate artifact metadata
-        run: python -m twine check dist/*
+        run: python scripts/ci/check_distribution_artifacts.py dist/*
 
       - name: Install wheel and run portability smoke + semantic mini-suite
         run: |
@@ -97,7 +97,7 @@ jobs:
       - name: Install sdist and run portability smoke + semantic mini-suite
         run: |
           python -m pip uninstall -y aionetx
-          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps
+          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps --no-build-isolation
           python -c "import aionetx; print(aionetx.__name__)"
           python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
           python scripts/ci/installed_artifact_smoke.py
@@ -329,8 +329,8 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.11"
-      - name: Install build tool
-        run: python -m pip install --upgrade pip build
+      - name: Install pinned build tools
+        run: python -m pip install --require-hashes -r requirements/ci-build-tools.txt
       - name: Capture deterministic build timestamp
         id: build_epoch
         shell: bash
@@ -338,11 +338,11 @@ jobs:
       - name: First wheel build
         env:
           SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
-        run: python -m build --wheel --outdir dist1/
+        run: python -m build --no-isolation --wheel --outdir dist1/
       - name: Second wheel build (independent repeat)
         env:
           SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
-        run: python -m build --wheel --outdir dist2/
+        run: python -m build --no-isolation --wheel --outdir dist2/
       - name: Compare wheel SHA-256 hashes (byte-identical check)
         run: |
           python - <<'EOF'
@@ -429,17 +429,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements/ci-build-tools.txt
           python -m pip install -e .[dev]
-          python -m pip install build twine
 
       - name: Build artifacts from source
         env:
           SOURCE_DATE_EPOCH: ${{ steps.build_epoch.outputs.epoch }}
-        run: python -m build
+        run: python -m build --no-isolation
 
       - name: Validate artifact metadata
-        run: python -m twine check dist/*
+        run: python scripts/ci/check_distribution_artifacts.py dist/*
 
       - name: Install wheel and run installed-artifact smoke + semantic mini-suite
         run: |
@@ -453,7 +452,7 @@ jobs:
       - name: Install sdist and run installed-artifact smoke + semantic mini-suite
         run: |
           python -m pip uninstall -y aionetx
-          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps
+          python scripts/ci/install_single_artifact.py "dist/*.tar.gz" --no-deps --no-build-isolation
           python -c "from importlib import resources; typed_marker = resources.files('aionetx').joinpath('py.typed'); assert typed_marker.is_file(), 'py.typed not found in installed aionetx package'"
           python scripts/ci/installed_artifact_smoke.py
           python scripts/ci/installed_artifact_semantic_minisuite.py

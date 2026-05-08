@@ -49,12 +49,12 @@ cd aionetx
 git checkout vX.Y.Z
 ```
 
-2. Create a clean environment and install the build frontend.
+2. Create a clean environment and install the pinned build frontend and backend tooling.
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip build
+python -m pip install --require-hashes -r requirements/ci-build-tools.txt
 ```
 
 3. Export the deterministic timestamp used by the release workflow.
@@ -67,11 +67,11 @@ export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
 
 ```bash
 rm -rf build dist
-python -m build
+python -m build --no-isolation
 mv dist dist-first
 
 rm -rf build dist
-python -m build
+python -m build --no-isolation
 mv dist dist-second
 ```
 
@@ -86,5 +86,27 @@ Matching hashes for the wheel and sdist indicate a reproducible rebuild for that
 ## Notes
 
 - Rebuild the exact tagged commit, not a moving branch tip.
-- Keep tool versions stable while comparing outputs.
+- Use the checked-in `requirements/ci-build-tools.txt` lockfile while comparing outputs.
 - If a deeper diff is needed, compare wheel contents directly or use `diffoscope`.
+
+## Updating pinned CI build tools
+
+The CI and release workflows install build tooling from
+`requirements/ci-build-tools.txt` with `--require-hashes`. The input file is
+`requirements/ci-build-tools.in`.
+
+To update the pinned tool bundle, use a temporary environment and regenerate
+the lockfile:
+
+```bash
+python -m venv .venv-tools
+. .venv-tools/bin/activate
+python -m pip install "pip==25.3" "pip-tools==7.5.2"
+python -m piptools compile --allow-unsafe --generate-hashes \
+  --output-file requirements/ci-build-tools.txt \
+  requirements/ci-build-tools.in
+```
+
+Review the resulting diff before opening a PR. The workflow build commands use
+`python -m build --no-isolation` so the checked-in `setuptools` and `wheel`
+pins are the build backend versions used by CI.
