@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import socket
 from collections import defaultdict
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
+
+from _port_helpers import released_tcp_listener_port, reserved_tcp_failure_port
 
 from aionetx import (
     AsyncioNetworkFactory,
@@ -64,27 +64,6 @@ async def _wait_for_condition(
         ) from error
 
 
-@contextmanager
-def _reserved_tcp_failure_port() -> Iterator[int]:
-    """Hold a bound non-listening TCP port for predictable connection failures."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        yield int(sock.getsockname()[1])
-
-
-def _released_tcp_listener_port() -> int:
-    """Return an intentionally released TCP port for managed server checks.
-
-    This released-port helper is intentional: TcpServerSettings requires a
-    concrete nonzero port and does not accept a pre-bound socket. Keep this
-    helper scoped to installed-artifact checks that must exercise the managed
-    TCP server itself.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _lifecycle_sequences(handler: SemanticEventHandler) -> dict[str, list[ComponentLifecycleState]]:
     by_resource: dict[str, list[ComponentLifecycleState]] = defaultdict(list)
     for event in handler.events:
@@ -107,7 +86,7 @@ def _has_ordered_subsequence(
 
 async def _assert_lifecycle_and_order_semantics(factory: AsyncioNetworkFactory) -> None:
     handler = SemanticEventHandler()
-    port = _released_tcp_listener_port()
+    port = released_tcp_listener_port()
 
     server = factory.create_tcp_server(
         settings=TcpServerSettings(host="127.0.0.1", port=port, max_connections=64),
@@ -162,7 +141,7 @@ async def _assert_lifecycle_and_order_semantics(factory: AsyncioNetworkFactory) 
 
 async def _assert_reconnect_failure_and_recovery(factory: AsyncioNetworkFactory) -> None:
     handler = SemanticEventHandler()
-    with _reserved_tcp_failure_port() as port:
+    with reserved_tcp_failure_port() as port:
         client = factory.create_tcp_client(
             settings=TcpClientSettings(
                 host="127.0.0.1",
@@ -219,7 +198,7 @@ async def _assert_reconnect_failure_and_recovery(factory: AsyncioNetworkFactory)
 
 async def _assert_heartbeat_semantics(factory: AsyncioNetworkFactory) -> None:
     handler = SemanticEventHandler()
-    port = _released_tcp_listener_port()
+    port = released_tcp_listener_port()
     heartbeat_payload = b"mini-suite-heartbeat"
 
     server = factory.create_tcp_server(
