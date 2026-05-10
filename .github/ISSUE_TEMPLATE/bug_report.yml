@@ -10,7 +10,7 @@ body:
 
         Before filing, please check:
         - **Questions or usage help** belong in [Discussions -> Q&A](https://github.com/MarcusKorinth/aionetx/discussions/categories/q-a), not here.
-        - **Security vulnerabilities** must be reported privately via [GitHub Private Vulnerability Reporting](https://github.com/MarcusKorinth/aionetx/security/advisories/new) or the email fallback in `SECURITY.md`. Do not file them as public issues.
+        - **Security vulnerabilities** must be reported privately via [GitHub Private Vulnerability Reporting](https://github.com/MarcusKorinth/aionetx/security/advisories/new). Do not file them as public issues.
         - Search [existing issues](https://github.com/MarcusKorinth/aionetx/issues?q=is%3Aissue) to see if the bug is already tracked.
 
   - type: textarea
