@@ -23,6 +23,8 @@ Planned contents for the initial public alpha release (`0.1.0`).
 
 ### Fixed
 
+- README and reconnect heartbeat example wording now describe heartbeat bytes
+  as advisory application-level probes, not built-in peer-health detection.
 - TCP connections now wait for opened-event handlers before starting reads,
   preserving per-connection event ordering across dispatch modes.
 - TCP close and stop paths now defer handler-origin terminal events until the

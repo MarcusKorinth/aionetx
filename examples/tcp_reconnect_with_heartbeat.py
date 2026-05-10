@@ -19,8 +19,10 @@ Heartbeats
 ----------
 The client is configured with `TcpHeartbeatSettings(enabled=True, ...)` plus a
 minimal heartbeat provider. Once the connection is up, the client asks the
-provider every interval whether to send a keep-alive byte. This is how you
-would keep idle TCP connections alive or detect zombie peers.
+provider every interval whether to send a keep-alive byte. This can support
+application-level idle-connection keep-alives or advisory probes, but response
+handling, timeout policy, and peer-health decisions belong in your protocol
+code.
 """
 
 from __future__ import annotations
@@ -100,7 +102,8 @@ class ServerHandler(BaseNetworkEventHandler):
 class ConstantHeartbeatProvider(HeartbeatProviderProtocol):
     """
     Sends a 2-byte keep-alive on every tick. Production providers typically
-    gate `should_send` on traffic-idle conditions or wall-clock deadlines.
+    gate `should_send` on traffic-idle conditions or application-owned
+    deadlines.
     """
 
     async def create_heartbeat(self, request: HeartbeatRequest) -> HeartbeatResult:
