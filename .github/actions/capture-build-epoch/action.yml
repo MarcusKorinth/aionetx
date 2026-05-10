@@ -1,0 +1,17 @@
+name: Capture deterministic build timestamp
+description: Capture the current commit timestamp for reproducible release builds.
+
+outputs:
+  epoch:
+    description: Unix timestamp for the current release commit.
+    value: ${{ steps.capture.outputs.epoch }}
+
+runs:
+  using: composite
+  steps:
+    - name: Capture commit timestamp
+      id: capture
+      shell: bash
+      run: |
+        epoch="$(git log -1 --format=%ct "$GITHUB_SHA")"
+        echo "epoch=${epoch}" >> "$GITHUB_OUTPUT"
