@@ -12,7 +12,8 @@ permissions:
 
 jobs:
   # Calibration note:
-  # - Required lanes are runtime trust, integration confidence, packaging/release, and static analysis.
+  # - Required lanes are runtime trust, integration confidence, packaging/release,
+  #   static analysis, and pull-request dependency policy.
   # - Non-blocking lanes are docs/process hygiene, optional environment-sensitive checks, and observability-only reports.
   # Tier: packaging/release verification (installed-artifact portability and metadata)
   cross_platform_portability_smoke:
@@ -322,13 +323,56 @@ jobs:
     name: Required - CI trust gate profile passed
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [required_suite_with_coverage, build_install_verify]
+    if: ${{ always() }}
+    needs:
+      - required_suite_with_coverage
+      - build_install_verify
+      - dependency_review
     steps:
       - name: Summarize required CI trust envelope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUIRED_SUITE_RESULT: ${{ needs.required_suite_with_coverage.result }}
+          BUILD_INSTALL_RESULT: ${{ needs.build_install_verify.result }}
+          DEPENDENCY_REVIEW_RESULT: ${{ needs.dependency_review.result }}
         run: |
-          echo "Required CI trust gate profile completed."
-          echo "- required runtime trust, integration confidence, packaging/release, and static checks passed"
+          failed=0
+
+          echo "Required CI trust gate profile evaluated."
+
+          if [ "$REQUIRED_SUITE_RESULT" = "success" ]; then
+            echo "- required suite with coverage result: success"
+          else
+            echo "::error::Required suite with coverage result: $REQUIRED_SUITE_RESULT"
+            failed=1
+          fi
+
+          if [ "$BUILD_INSTALL_RESULT" = "success" ]; then
+            echo "- build and install verification result: success"
+          else
+            echo "::error::Build and install verification result: $BUILD_INSTALL_RESULT"
+            failed=1
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ "$DEPENDENCY_REVIEW_RESULT" = "success" ]; then
+              echo "- dependency review result: success"
+            else
+              echo "::error::Dependency review result: $DEPENDENCY_REVIEW_RESULT"
+              failed=1
+            fi
+          else
+            echo "- dependency review is pull-request only"
+            echo "- dependency review was not part of this $EVENT_NAME run"
+          fi
+
           echo "- non-blocking secondary lanes are intentionally out-of-envelope"
+          if [ "$failed" = "0" ]; then
+            echo "- required CI trust gate profile passed"
+          fi
+
+          exit "$failed"
 
   # Tier: supply-chain integrity - SHA pin validation (non-blocking, scheduled + workflow changes)
   validate_sha_pins:
@@ -529,4 +573,3 @@ jobs:
           echo "- examples smoke: ${{ needs.examples_smoke_non_blocking.result }}"
           echo "- property-based tests: ${{ needs.property_tests_non_blocking.result }}"
           echo "These lanes are visible but not part of the required CI trust envelope."
-
