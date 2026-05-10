@@ -4,6 +4,9 @@ This document is the canonical architectural contract for `aionetx`.
 
 It replaces scattered ADR history with one current-state record of decisions, boundaries, and limitations.
 
+For the focused stop-during-state, caller-origin, dispatch-mode, waiter, and
+terminal-publication matrix, see [lifecycle reference](./lifecycle.md).
+
 ## 1) Purpose and boundary
 
 `aionetx` is an asyncio-first transport library for reusable TCP/UDP primitives with explicit lifecycle semantics and event-driven integration.
@@ -85,6 +88,9 @@ the semantic test suite:
 - Lifecycle publication remains monotonic: managed components do not publish
   illegal backward transitions.
 - Terminal lifecycle publication happens at most once per shutdown sequence.
+
+The detailed stop/close matrix for these invariants lives in
+[lifecycle reference](./lifecycle.md).
 
 ## 3) Event model contract
 

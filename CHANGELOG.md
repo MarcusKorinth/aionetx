@@ -15,6 +15,8 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - optional TCP client reconnect and heartbeat support
 - `DispatcherRuntimeStats` as the public diagnostics snapshot type for managed
   TCP, UDP, and multicast receiver dispatcher counters
+- `docs/lifecycle.md` as the public stop-during-state and caller-origin
+  lifecycle reference
 - tests, examples, typing metadata, and CI/release verification gates
 
 ### Changed
