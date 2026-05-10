@@ -1,0 +1,30 @@
+name: Install project development dependencies
+description: Install the editable development package for release trust gates.
+
+inputs:
+  upgrade-pip:
+    description: Upgrade pip before installing editable development dependencies.
+    required: false
+    default: "true"
+  use-python-module:
+    description: Install through python -m pip instead of the pip executable.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Upgrade pip
+      if: ${{ inputs.upgrade-pip == 'true' }}
+      shell: bash
+      run: python -m pip install --upgrade pip
+
+    - name: Install project development dependencies with pip
+      if: ${{ inputs.use-python-module != 'true' }}
+      shell: bash
+      run: pip install -e .[dev]
+
+    - name: Install project development dependencies with python -m pip
+      if: ${{ inputs.use-python-module == 'true' }}
+      shell: bash
+      run: python -m pip install -e .[dev]
