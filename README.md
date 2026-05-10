@@ -445,14 +445,17 @@ Dispatcher phase behavior in `BACKGROUND` mode is explicit:
 This shutdown-phase drop behavior is a documented exception to steady-state
 overload policy.
 
-Operational diagnostics for concrete asyncio implementations now make drop causes
-explicit at runtime:
+Managed TCP clients, TCP servers, UDP receivers, and multicast receivers expose
+dispatcher diagnostics through `dispatcher_runtime_stats`. The snapshot type is
+part of the advanced public API and can be imported as
+`from aionetx.api import DispatcherRuntimeStats`.
+
+The public counters make drop causes explicit at runtime:
 
 - backpressure drops are tracked separately for `DROP_OLDEST` and `DROP_NEWEST`
-- shutdown-phase drops are tracked separately from overload drops
-- dispatcher runtime stats include enqueue volume, handler dispatch attempts, and queue depth peak/current snapshots
-
-Concrete asyncio TCP components expose this as `dispatcher_runtime_stats`.
+- shutdown and terminal cleanup drops are tracked separately from overload drops
+- dispatcher runtime stats include enqueue volume, handler dispatch attempts,
+  handler failures, inline fallback count, and queue depth peak/current snapshots
 
 Use those diagnostics to distinguish overload tuning problems from intentional
 deterministic-shutdown cutoffs.

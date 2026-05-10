@@ -13,6 +13,8 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - explicit lifecycle events, event delivery settings, and backpressure policies
 - bounded TCP send flushes with configurable per-connection send timeouts
 - optional TCP client reconnect and heartbeat support
+- `DispatcherRuntimeStats` as the public diagnostics snapshot type for managed
+  TCP, UDP, and multicast receiver dispatcher counters
 - tests, examples, typing metadata, and CI/release verification gates
 
 ### Changed

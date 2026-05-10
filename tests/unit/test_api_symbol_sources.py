@@ -60,6 +60,7 @@ def test_api_symbol_api_curated_exports_come_from_grouping_modules() -> None:
         "ConnectionProtocol": "aionetx.api.protocols",
         "ConnectionRole": "aionetx.api.lifecycle",
         "ConnectionState": "aionetx.api.lifecycle",
+        "DispatcherRuntimeStats": "aionetx.api.diagnostics",
         "ErrorPolicy": "aionetx.api.policies",
         "EventDeliverySettings": "aionetx.api.policies",
         "HandlerFailurePolicyStopEvent": "aionetx.api.events",

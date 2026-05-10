@@ -26,6 +26,7 @@ from aionetx.api.lifecycle import (
     ConnectionRole,
     ConnectionState,
 )
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.errors import (
     ConnectionClosedError,
     HeartbeatConfigurationError,
@@ -92,6 +93,7 @@ __all__ = (
     "ConnectionProtocol",
     "ConnectionRole",
     "ConnectionState",
+    "DispatcherRuntimeStats",
     "ErrorPolicy",
     "EventBackpressurePolicy",
     "EventDeliverySettings",

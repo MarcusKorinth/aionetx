@@ -22,11 +22,9 @@ from aionetx.api.component_lifecycle_state import ComponentLifecycleState
 from aionetx.api.connection_metadata import ConnectionMetadata
 from aionetx.api.connection_lifecycle import ConnectionState
 from aionetx.api.connection_events import ConnectionClosedEvent, ConnectionOpenedEvent
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.network_error_event import NetworkErrorEvent
-from aionetx.implementations.asyncio_impl.event_dispatcher import (
-    AsyncioEventDispatcher,
-    DispatcherRuntimeStats,
-)
+from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from aionetx.implementations.asyncio_impl.lifecycle_internal import LifecycleRole
 from aionetx.implementations.asyncio_impl.lifecycle_internal import (
     LifecycleTransitionPublisher,

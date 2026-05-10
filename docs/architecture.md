@@ -292,19 +292,22 @@ For `BACKGROUND` dispatch mode, runtime behavior is intentionally phase-aware:
 - during dispatcher shutdown: newly emitted events may be dropped to guarantee deterministic stop completion
 
 This shutdown-phase drop behavior is a deliberate deterministic-shutdown tradeoff and not a hidden overload policy.
-Runtime diagnostics should make this distinction explicit by separating:
+Runtime diagnostics make this distinction explicit by separating:
 
 - overload drops (`DROP_OLDEST`/`DROP_NEWEST`)
-- shutdown-phase drops after stop begins
+- shutdown and terminal cleanup drops after stop begins or resource close
 - queue occupancy snapshots (current + peak)
+- enqueue volume, handler dispatch attempts/failures, and inline fallback count
 
 For handler-failure-driven shutdown, the dispatcher uses an explicit
 `DispatcherStopPolicy` contract. Under
 `handler_failure_policy=STOP_COMPONENT`, it emits
 `HandlerFailurePolicyStopEvent` before invoking the configured stop callback.
 
-In concrete asyncio TCP transports, this diagnostic snapshot is exposed via
-`dispatcher_runtime_stats` on the client/server objects.
+Managed TCP client, TCP server, UDP receiver, and multicast receiver protocols
+expose this diagnostic snapshot via `dispatcher_runtime_stats`. The public
+snapshot type is `DispatcherRuntimeStats`, importable from `aionetx.api`.
+The dispatcher implementation remains internal.
 
 ## 16) Verification posture interpretation
 

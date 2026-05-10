@@ -20,6 +20,7 @@ from aionetx.api.bytes_like import BytesLike
 from aionetx.api.component_lifecycle_changed_event import ComponentLifecycleChangedEvent
 from aionetx.api.component_lifecycle_state import ComponentLifecycleState
 from aionetx.api.connection_protocol import ConnectionProtocol
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.heartbeat_provider_protocol import HeartbeatProviderProtocol
 from aionetx.api.network_event_handler_protocol import NetworkEventHandlerProtocol
 from aionetx.api.tcp_server import TcpServerProtocol, TcpServerSettings
@@ -37,10 +38,7 @@ from aionetx.implementations.asyncio_impl.identifier_utils import (
     tcp_server_component_id,
     tcp_server_connection_id,
 )
-from aionetx.implementations.asyncio_impl.event_dispatcher import (
-    AsyncioEventDispatcher,
-    DispatcherRuntimeStats,
-)
+from aionetx.implementations.asyncio_impl.event_dispatcher import AsyncioEventDispatcher
 from aionetx.implementations.asyncio_impl.lifecycle_internal import LifecycleRole
 from aionetx.implementations.asyncio_impl.lifecycle_internal import (
     LifecycleTransitionPublisher,
