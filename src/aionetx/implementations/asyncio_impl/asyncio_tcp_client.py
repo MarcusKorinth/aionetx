@@ -711,8 +711,7 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
 
         async def _complete() -> None:
             try:
-                while self._event_dispatcher.has_active_handler_context():
-                    await asyncio.sleep(0)
+                await self._event_dispatcher.wait_for_handler_context()
                 with self._event_dispatcher.inline_delivery_context():
                     await self._emit_lifecycle_event(stopping_event)
                     if deferred_close_waiters:

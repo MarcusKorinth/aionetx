@@ -272,6 +272,46 @@ async def test_handler_origin_context_expires_when_handler_returns() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_handler_context_blocks_until_matching_handler_returns() -> None:
+    handler_started = asyncio.Event()
+    allow_handler_to_finish = asyncio.Event()
+
+    class BlockingHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            del event
+            handler_started.set()
+            await allow_handler_to_finish.wait()
+
+    dispatcher = AsyncioEventDispatcher(
+        BlockingHandler(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+    emit_task: asyncio.Task[None] | None = None
+    wait_task: asyncio.Task[None] | None = None
+    try:
+        emit_task = asyncio.create_task(dispatcher.emit_and_wait(_opened("blocked")))
+        await asyncio.wait_for(handler_started.wait(), timeout=1.0)
+
+        wait_task = asyncio.create_task(dispatcher.wait_for_handler_context("blocked"))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        allow_handler_to_finish.set()
+        await asyncio.wait_for(emit_task, timeout=1.0)
+        await asyncio.wait_for(wait_task, timeout=1.0)
+    finally:
+        allow_handler_to_finish.set()
+        for task in (wait_task, emit_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1.0)
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
 async def test_handler_origin_context_is_not_inherited_by_child_tasks() -> None:
     child_ready = asyncio.Event()
     allow_child_to_check = asyncio.Event()

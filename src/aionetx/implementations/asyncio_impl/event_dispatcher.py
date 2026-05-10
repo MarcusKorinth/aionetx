@@ -129,6 +129,7 @@ class AsyncioEventDispatcher:
         self._active_handler_origin_owner_tasks: dict[int, int | None] = {}
         self._active_handler_origin_child_provenance_tokens: set[int] = set()
         self._next_handler_origin_token = 0
+        self._handler_context_changed_waiter: asyncio.Future[None] | None = None
         self._active_stop_await_bypass_tokens: set[int] = set()
         self._active_stop_await_bypass_owner_tasks: dict[int, int] = {}
         self._next_stop_await_bypass_token = 0
@@ -519,6 +520,25 @@ class AsyncioEventDispatcher:
             for active_resource_id in self._active_handler_origin_resources.values()
         )
 
+    async def wait_for_handler_context(self, resource_id: str | None = None) -> None:
+        """Wait until no active handler-origin barrier remains."""
+        while self.has_active_handler_context(resource_id):
+            waiter = self._handler_context_changed_waiter
+            if waiter is None or waiter.done():
+                waiter = asyncio.get_running_loop().create_future()
+                self._handler_context_changed_waiter = waiter
+            await asyncio.shield(waiter)
+
+    def _notify_handler_context_changed(self) -> None:
+        """Wake tasks waiting for active handler-origin barriers to clear."""
+        waiter = self._handler_context_changed_waiter
+        if waiter is None:
+            return
+        if not waiter.done():
+            waiter.set_result(None)
+        if self._handler_context_changed_waiter is waiter:
+            self._handler_context_changed_waiter = None
+
     def has_active_handler_origin(self) -> bool:
         """Return whether this dispatcher currently has an active handler-origin barrier."""
         return self.has_active_handler_context()
@@ -560,6 +580,7 @@ class AsyncioEventDispatcher:
             self._active_handler_origin_resources.pop(origin_token, None)
             self._active_handler_origin_owner_tasks.pop(origin_token, None)
             self._active_handler_origin_child_provenance_tokens.discard(origin_token)
+            self._notify_handler_context_changed()
             _handler_dispatch_context.reset(reset_token)
             _handler_origin_context.reset(origin_reset_token)
 
@@ -585,6 +606,7 @@ class AsyncioEventDispatcher:
             self._active_handler_origin_resources.pop(origin_token, None)
             self._active_handler_origin_owner_tasks.pop(origin_token, None)
             self._active_handler_origin_child_provenance_tokens.discard(origin_token)
+            self._notify_handler_context_changed()
             _handler_origin_context.reset(origin_reset_token)
 
     def _is_in_stop_await_bypass_context(self) -> bool:

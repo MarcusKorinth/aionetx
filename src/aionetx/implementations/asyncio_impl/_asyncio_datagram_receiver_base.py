@@ -579,8 +579,7 @@ class _AsyncioDatagramReceiverBase:
         async def _complete() -> None:
             first_error: BaseException | None = None
             try:
-                while self._event_dispatcher.has_active_handler_context():
-                    await asyncio.sleep(0)
+                await self._event_dispatcher.wait_for_handler_context()
                 with self._event_dispatcher.inline_delivery_context():
                     try:
                         await self._publish_stopping_transition(snapshot)
@@ -745,8 +744,7 @@ class _AsyncioDatagramReceiverBase:
         """Publish a deferred close once the handler-origin context has unwound."""
         current_task = asyncio.current_task()
         try:
-            while self._event_dispatcher.has_active_handler_context():
-                await asyncio.sleep(0)
+            await self._event_dispatcher.wait_for_handler_context()
             await self._publish_deferred_close_after_opened_event()
         except (Exception, asyncio.CancelledError) as error:
             async with self._state_lock:

@@ -590,8 +590,7 @@ class AsyncioTcpConnection(ConnectionProtocol):
         """Publish a deferred close once active connection handlers have unwound."""
         current_task = asyncio.current_task()
         try:
-            while self._event_dispatcher.has_active_handler_context(self._connection_id):
-                await asyncio.sleep(0)
+            await self._event_dispatcher.wait_for_handler_context(self._connection_id)
             await self._publish_deferred_close_after_opened_event()
         except (Exception, asyncio.CancelledError) as error:
             async with self._close_lock:
