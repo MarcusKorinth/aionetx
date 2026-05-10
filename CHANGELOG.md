@@ -20,6 +20,9 @@ Planned contents for the initial public alpha release (`0.1.0`).
 ### Changed
 
 - require Python 3.11 or newer for the initial public alpha release
+- Documentation now distinguishes possible future narrow TCP `ssl=` /
+  `ssl.SSLContext` transport wiring from higher-layer authentication,
+  certificate-management, DTLS, service-mesh, and application-security scope.
 
 ### Fixed
 

@@ -87,6 +87,11 @@ Use `aionetx` when you want:
 - configurable dispatch mode and backpressure policy
 - optional reconnect for TCP clients and optional heartbeat for managed TCP roles
 
+Planned TCP TLS work, if added, is limited to narrow transport-level
+`ssl=` / `ssl.SSLContext` wiring. Authentication policy, certificate lifecycle
+management, DTLS, service-mesh integration, protocol security, and application
+semantics stay above this library.
+
 Canonical scope reference: `docs/architecture.md` (**Purpose and boundary**).
 
 ---
@@ -98,6 +103,8 @@ Canonical scope reference: `docs/architecture.md` (**Purpose and boundary**).
 - message framing or protocol boundaries for TCP
 - protocol parsers/state machines (MQTT/Modbus/HTTP/etc.)
 - serialization/deserialization
+- authentication policy, certificate lifecycle management, DTLS, or
+  service-mesh integration
 - business logic and domain workflows
 
 Those belong in higher layers. For detailed in-scope/out-of-scope and deferred-area criteria, see `docs/architecture.md` (**Purpose and boundary** + **Current limitations and explicit non-goals**).
