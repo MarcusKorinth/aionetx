@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from aionetx.api.connection_protocol import ConnectionProtocol
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.error_policy import ErrorPolicy
 from aionetx.api.event_delivery_settings import EventDeliverySettings
 from aionetx.api.heartbeat import TcpHeartbeatSettings
@@ -124,6 +125,11 @@ class TcpClientProtocol(ManagedTransportProtocol, Protocol):
     @property
     def connection(self) -> ConnectionProtocol | None:
         """Return active connection if connected, otherwise ``None``."""
+        raise NotImplementedError
+
+    @property
+    def dispatcher_runtime_stats(self) -> DispatcherRuntimeStats:
+        """Return a point-in-time dispatcher diagnostics snapshot."""
         raise NotImplementedError
 
     async def wait_until_connected(

@@ -12,6 +12,7 @@ from typing import Protocol
 
 from aionetx.api.bytes_like import BytesLike
 from aionetx.api.connection_protocol import ConnectionProtocol
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.event_delivery_settings import EventDeliverySettings
 from aionetx.api.heartbeat import TcpHeartbeatSettings
 from aionetx.api.managed_transport_protocol import ManagedTransportProtocol
@@ -133,6 +134,11 @@ class TcpServerProtocol(ManagedTransportProtocol, Protocol):
 
         Rejected or already-closed connections are never part of this tuple.
         """
+        raise NotImplementedError
+
+    @property
+    def dispatcher_runtime_stats(self) -> DispatcherRuntimeStats:
+        """Return a point-in-time dispatcher diagnostics snapshot."""
         raise NotImplementedError
 
     async def wait_until_running(

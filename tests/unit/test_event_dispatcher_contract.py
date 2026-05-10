@@ -16,6 +16,7 @@ import logging
 
 import pytest
 
+from aionetx.api.bytes_received_event import BytesReceivedEvent
 from aionetx.api.connection_events import ConnectionClosedEvent
 from aionetx.api.connection_events import ConnectionOpenedEvent
 from aionetx.api.connection_metadata import ConnectionMetadata
@@ -1899,6 +1900,42 @@ async def test_runtime_stats_characterize_stop_with_pending_queue_work() -> None
     assert stats.dropped_stop_phase_total == 1
     assert stats.queue_depth == 0
     assert stats.queue_peak == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_stats_capture_resource_close_queue_cleanup_drop_counts() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class BlockingHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if (
+                isinstance(event, ConnectionOpenedEvent)
+                and event.metadata.connection_id == "blocker"
+            ):
+                first_started.set()
+                await release_first.wait()
+
+    dispatcher = AsyncioEventDispatcher(
+        BlockingHandler(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+    await dispatcher.emit(_opened("blocker"))
+    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+    await dispatcher.emit(BytesReceivedEvent(resource_id="closing", data=b"drop"))
+    await dispatcher.emit(BytesReceivedEvent(resource_id="staying", data=b"keep"))
+    dropped = await dispatcher.drop_queued_events_for_resource("closing")
+
+    stats = dispatcher.runtime_stats
+    assert dropped == 1
+    assert stats.dropped_stop_phase_total == 1
+    assert stats.queue_depth == 1
+
+    release_first.set()
+    await dispatcher.stop()
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from aionetx.api.bytes_received_event import BytesReceivedEvent
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.event_delivery_settings import (
     EventBackpressurePolicy,
     EventDeliverySettings,
@@ -51,36 +52,6 @@ _handler_origin_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = (
 
 class _HandlerCancelledError(RuntimeError):
     """Exception wrapper used when a handler raises CancelledError itself."""
-
-
-@dataclass(frozen=True, slots=True)
-class DispatcherRuntimeStats:
-    """
-    Point-in-time operational counters for one dispatcher instance.
-
-    Attributes:
-        emit_calls_total: Total number of ``emit()`` calls observed.
-        enqueued_total: Events accepted into the background queue.
-        handler_dispatch_attempts_total: Attempts to invoke the event handler.
-        handler_failures_total: Handler invocations that raised.
-        inline_fallback_total: Background-mode emits delivered inline because no worker existed yet.
-        dropped_backpressure_oldest_total: Events evicted by ``DROP_OLDEST`` backpressure.
-        dropped_backpressure_newest_total: Events rejected by ``DROP_NEWEST`` backpressure.
-        dropped_stop_phase_total: Background-mode emits ignored after shutdown started.
-        queue_depth: Current queued event count.
-        queue_peak: Highest queue depth observed so far.
-    """
-
-    emit_calls_total: int
-    enqueued_total: int
-    handler_dispatch_attempts_total: int
-    handler_failures_total: int
-    inline_fallback_total: int
-    dropped_backpressure_oldest_total: int
-    dropped_backpressure_newest_total: int
-    dropped_stop_phase_total: int
-    queue_depth: int
-    queue_peak: int
 
 
 @dataclass(slots=True)

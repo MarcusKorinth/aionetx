@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 from types import ModuleType
+from typing import get_type_hints
 
 import pytest
 
@@ -84,6 +85,29 @@ def test_aionetx_api_exports_exception_bases_and_typed_router() -> None:
     assert api.TypedEventRouter is TypedEventRouter
 
 
+def test_aionetx_api_exports_dispatcher_runtime_stats_for_advanced_usage() -> None:
+    api = _api_module()
+
+    assert hasattr(api, "DispatcherRuntimeStats")
+    assert "DispatcherRuntimeStats" in api.PUBLIC_API
+
+
+def test_managed_receiver_protocols_expose_dispatcher_runtime_stats() -> None:
+    api = _api_module()
+    expected_stats_type = api.DispatcherRuntimeStats
+
+    for protocol in (
+        api.TcpClientProtocol,
+        api.TcpServerProtocol,
+        api.UdpReceiverProtocol,
+        api.MulticastReceiverProtocol,
+    ):
+        stats_property = getattr(protocol, "dispatcher_runtime_stats", None)
+
+        assert isinstance(stats_property, property), protocol.__name__
+        assert get_type_hints(stats_property.fget)["return"] is expected_stats_type
+
+
 def test_recording_event_handler_is_available_only_from_testing_namespace() -> None:
     aionetx = _root_module()
 
@@ -105,6 +129,7 @@ def test_recording_event_handler_is_available_only_from_testing_namespace() -> N
         "UdpSenderProtocol",
         "MulticastReceiverProtocol",
         "ConnectionClosedEvent",
+        "DispatcherRuntimeStats",
     ],
 )
 def test_root_import_does_not_expose_advanced_or_internal_symbols(

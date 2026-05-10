@@ -13,6 +13,7 @@ from typing import Protocol
 
 from aionetx.api.byte_sender_protocol import ByteSenderProtocol
 from aionetx.api.bytes_like import BytesLike
+from aionetx.api.diagnostics import DispatcherRuntimeStats
 from aionetx.api.event_delivery_settings import EventDeliverySettings
 from aionetx.api.managed_transport_protocol import ManagedTransportProtocol
 from aionetx.api.errors import NetworkConfigurationError, NetworkRuntimeError
@@ -146,6 +147,11 @@ class UdpInvalidTargetError(NetworkConfigurationError):
 
 class UdpReceiverProtocol(ManagedTransportProtocol, Protocol):
     """UDP datagram receiver contract built on managed lifecycle capability."""
+
+    @property
+    def dispatcher_runtime_stats(self) -> DispatcherRuntimeStats:
+        """Return a point-in-time dispatcher diagnostics snapshot."""
+        raise NotImplementedError
 
 
 @dataclass(frozen=True, slots=True)
