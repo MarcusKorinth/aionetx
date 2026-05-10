@@ -315,6 +315,14 @@ class AsyncioEventDispatcher:
         This preserves normal ``emit()`` behavior for callers that only need
         queue acceptance, while giving lifecycle-sensitive transports a narrow
         internal hook for event-completion barriers.
+
+        In BACKGROUND mode, shutdown drop semantics intentionally differ from
+        ``emit()``. If dispatcher stop has already started, this records a
+        stop-phase drop and raises ``RuntimeError`` instead of returning. If a
+        queued barrier event is later dropped by stop before handler execution,
+        its waiter is completed with ``RuntimeError``. This prevents
+        completion-sensitive lifecycle publication from silently treating a
+        discarded event as handled.
         """
         self._emit_calls_total += 1
         if self._delivery.dispatch_mode == EventDispatchMode.INLINE:
