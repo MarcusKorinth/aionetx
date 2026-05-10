@@ -291,7 +291,15 @@ For `BACKGROUND` dispatch mode, runtime behavior is intentionally phase-aware:
 - steady-state: dispatcher worker delivers queued events
 - during dispatcher shutdown: newly emitted events may be dropped to guarantee deterministic stop completion
 
-This shutdown-phase drop behavior is a deliberate deterministic-shutdown tradeoff and not a hidden overload policy.
+This shutdown-phase drop behavior is a deliberate deterministic-shutdown
+tradeoff and not a hidden overload policy. The normal `emit()` path is
+best-effort at this boundary: once stop begins, a new BACKGROUND-mode event
+records a stop-phase drop and returns without handler execution. The
+completion-barrier path, `emit_and_wait()`, is stricter: if stop has already
+begun, or if stop drops a queued barrier event before handler execution, the
+waiter receives `RuntimeError` after the drop is recorded. This keeps
+completion-sensitive lifecycle publication from silently treating a discarded
+event as handled.
 Runtime diagnostics make this distinction explicit by separating:
 
 - overload drops (`DROP_OLDEST`/`DROP_NEWEST`)
@@ -318,4 +326,3 @@ Verification signals are interpreted in tiers:
 - semantic behavioral confidence (lifecycle/ordering/cancellation/reconnect) is prioritized over raw coverage alone
 
 The architecture goal is trustworthy runtime semantics, not process-heavy governance signaling.
-
