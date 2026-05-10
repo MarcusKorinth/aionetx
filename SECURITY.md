@@ -134,9 +134,12 @@ publishing, artifact attestations, and branch protection rules.
 
 The project's security assurance case is based on a deliberately narrow
 scope: `aionetx` provides transport primitives and lifecycle/event
-semantics, but does not provide authentication, authorization,
-encryption, message framing, payload validation, or application
-protocol security.
+semantics. The current release line does not provide built-in
+transport-layer encryption. A future TCP `ssl=` / `ssl.SSLContext`
+integration may expose asyncio's TLS transport wiring, but that would
+not make `aionetx` responsible for authentication policy, certificate
+lifecycle management, message framing, payload validation, or
+application protocol security.
 
 Security requirements:
 
@@ -163,7 +166,8 @@ Trust boundaries:
 Secure design arguments:
 
 - the transport-only boundary avoids mixing network I/O with application
-  protocol, authentication, authorization, or business logic
+  protocol, authentication policy, authorization, certificate lifecycle
+  management, or business logic
 - lifecycle state transitions are explicit and covered by automated
   tests, reducing ambiguity around startup, shutdown, and cleanup
 - event backpressure is configurable and bounded by default settings
@@ -194,13 +198,16 @@ The following are **not** treated as security vulnerabilities because
 they reflect deliberate architectural choices of a raw-byte transport
 library, not defects:
 
-- **No authentication, authorization, or transport-layer encryption.**
-  `aionetx` exposes raw TCP/UDP/multicast byte streams. Peer identity,
-  integrity, and confidentiality are the responsibility of the
-  application layer built on top (for example, TLS via
-  `asyncio.start_tls`, DTLS, or application-level signing). Reports of
-  the form "an attacker can send bytes to an open port" will be
-  closed as out of scope.
+- **No current built-in authentication, authorization, or
+  transport-layer encryption.** `aionetx` currently exposes raw
+  TCP/UDP/multicast byte streams. Missing TLS support in the current
+  raw-byte transports is not treated as a vulnerability by itself. A
+  narrowly scoped future TCP `ssl=` / `ssl.SSLContext` integration may
+  be considered as transport wiring, but peer identity policy,
+  certificate issuance, certificate rotation, trust-store management,
+  DTLS, service-mesh integration, and application-level signing remain
+  higher-layer responsibilities. Reports of the form "an attacker can
+  send bytes to an open port" will be closed as out of scope.
 - **Denial of service from malformed or flooding peer traffic on
   untrusted transports.** Backpressure, rate limiting, and peer-trust
   decisions are delegated to the user's event handler and higher-layer

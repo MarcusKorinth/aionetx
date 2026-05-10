@@ -10,7 +10,8 @@ body:
 
         Before filing, please check:
         - **Early-stage ideas and "wouldn't it be cool if..."** belong in [Discussions → Ideas](https://github.com/MarcusKorinth/aionetx/discussions). Open a feature request issue only when you have a concrete behavior change in mind (you can describe inputs, outputs, and user-visible API).
-        - aionetx is a deliberately narrow **raw-byte asyncio transport library**. Features that belong in higher-layer frameworks (HTTP, messaging, TLS, service-mesh concerns) are generally out of scope — see the "What this library is not for" section in README.
+        - aionetx is a deliberately narrow **raw-byte asyncio transport library**. Features that belong in higher-layer frameworks (HTTP, messaging, authentication policy, certificate lifecycle management, DTLS, service-mesh concerns) are generally out of scope - see the "What this library is not for" section in README.
+        - Narrow TCP TLS transport wiring proposals can be in scope when they are limited to exposing `ssl.SSLContext` / `ssl=` support on TCP transports. Requests for authentication, authorization, certificate rotation, trust-store management, DTLS, service-mesh integration, or application security semantics belong above this library.
         - Search [existing issues](https://github.com/MarcusKorinth/aionetx/issues?q=is%3Aissue) to avoid duplicates.
 
   - type: textarea
@@ -62,5 +63,5 @@ body:
       options:
         - label: I have searched existing issues and discussions and confirmed this is not already proposed.
           required: true
-        - label: This proposal is about raw-byte transport behavior (lifecycle, events, backpressure, reconnect, multicast, typing) — not a higher-layer protocol concern.
+        - label: This proposal is about raw-byte transport behavior (lifecycle, events, backpressure, reconnect, multicast, typing, or narrow TCP `ssl=` wiring) - not a higher-layer protocol or security-policy concern.
           required: true

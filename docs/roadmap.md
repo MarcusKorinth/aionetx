@@ -10,14 +10,18 @@ items may be reprioritized, postponed, or removed.
 ### TLS support for TCP (`ssl=` parameter)
 
 `asyncio.open_connection()` and `asyncio.start_server()` already support
-transport-level TLS. The main open work is exposing that cleanly through
-`TcpClientSettings` / `TcpServerSettings` without compromising lifecycle,
-reconnect, or transport-boundary clarity.
+transport-level TLS. A possible future `aionetx` change is limited to exposing
+that capability cleanly through `TcpClientSettings` / `TcpServerSettings`, most
+likely by accepting an `ssl.SSLContext`-compatible `ssl=` setting without
+compromising lifecycle, reconnect, or transport-boundary clarity.
+
+This would be transport wiring only. It would not make `aionetx` responsible
+for authentication policy, certificate issuance or rotation, trust-store
+management, DTLS, service-mesh integration, or application security semantics.
 
 Open questions:
 
 - expose `ssl.SSLContext` directly or wrap it in a dedicated settings object
-- certificate reload strategy for long-lived servers
 - typing shape for optional TLS settings
 
 ### UDP sender auto-rebind evaluation

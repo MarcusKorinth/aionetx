@@ -26,9 +26,20 @@ Core principle: **hide plumbing, not semantics**.
 - protocol framing/parsing
 - serialization/deserialization
 - message schemas
+- authentication policy
+- certificate issuance, rotation, and trust-store management
+- DTLS and service-mesh integration
+- application security semantics
 - business/domain logic
 - application-level retry orchestration
 - hidden recovery/implicit lifecycle transitions
+
+### Possible future transport capability
+
+Narrow TCP TLS wiring can fit this boundary when it is limited to exposing
+asyncio-compatible `ssl=` / `ssl.SSLContext` transport settings. That possible
+future scope does not include authentication policy, certificate lifecycle
+management, DTLS, service-mesh integration, or application security semantics.
 
 ## 2) Lifecycle contract (authoritative)
 
@@ -233,6 +244,8 @@ Required discipline:
 
 - No built-in framing/parsing helpers in transport core
 - No protocol adapters/codecs in this repository
+- No authentication policy, certificate lifecycle management, DTLS, or
+  service-mesh integration
 - No hidden recovery automation beyond explicit settings
 - No application-level policy engine (retry/routing/business orchestration)
 
