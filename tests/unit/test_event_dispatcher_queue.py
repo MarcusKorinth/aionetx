@@ -36,7 +36,7 @@ async def test_drop_queued_event_releases_waiter_with_reason() -> None:
     drop_queued_event(queued_event, reason="dropped by backpressure")
 
     with pytest.raises(RuntimeError, match="Queued event was dropped by backpressure\\."):
-        await handled
+        handled.result()
 
 
 @pytest.mark.asyncio
