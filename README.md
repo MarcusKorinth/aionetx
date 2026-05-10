@@ -283,7 +283,7 @@ Managed components use four explicit states to make startup, shutdown, and trans
 
 Lifecycle state is observable via `component.lifecycle_state` and `ComponentLifecycleChangedEvent`.
 
-Transition semantics include guarded startup rollback and stop-during-startup behavior. Lifecycle authority is consolidated in `docs/architecture.md`.
+Transition semantics include guarded startup rollback and stop-during-startup behavior. Lifecycle authority is consolidated in `docs/architecture.md`, with the stop/caller-origin matrix in [`docs/lifecycle.md`](docs/lifecycle.md).
 
 ```mermaid
 stateDiagram-v2
@@ -467,7 +467,7 @@ The public counters make drop causes explicit at runtime:
 Use those diagnostics to distinguish overload tuning problems from intentional
 deterministic-shutdown cutoffs.
 
-For lifecycle/cancellation/shutdown contract details, see `docs/architecture.md` and the runtime/integration tests in `tests/`.
+For lifecycle/cancellation/shutdown contract details, see `docs/architecture.md`, [`docs/lifecycle.md`](docs/lifecycle.md), and the runtime/integration tests in `tests/`.
 
 ### TCP send timeout behavior
 
@@ -838,6 +838,7 @@ Choose direct `asyncio` if you need very custom low-level control and are comfor
 
 - `README.md`: public overview, core semantics, event flow, and practical usage examples
 - `docs/architecture.md`: canonical architecture, constraints, consolidated decisions (formerly ADR knowledge), and current limitations
+- `docs/lifecycle.md`: stop-during-state, caller-origin, dispatch-mode, waiter, cancellation, and terminal-event matrix
 - `docs/platform_notes.md`: platform-specific runtime behavior (socket bind reuse/exclusivity, UDP fallback polling on Windows)
 - `docs/timing_and_latency.md`: timing envelope, what aionetx guarantees and does not, suitability statement
 - `docs/logging.md`: logger hierarchy, structured context, recommended levels, and a minimal `dictConfig`
