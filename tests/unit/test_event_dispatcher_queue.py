@@ -48,5 +48,5 @@ async def test_fail_queued_event_releases_waiter_with_original_error() -> None:
     fail_queued_event(queued_event, error)
 
     with pytest.raises(RuntimeError, match="worker stopped") as exc_info:
-        await handled
+        handled.result()
     assert exc_info.value is error
