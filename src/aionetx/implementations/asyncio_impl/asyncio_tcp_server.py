@@ -12,7 +12,6 @@ import contextlib
 import logging
 import socket
 from collections.abc import Awaitable
-from dataclasses import dataclass
 from types import TracebackType
 from typing import cast
 
@@ -31,6 +30,11 @@ from aionetx.implementations.asyncio_impl._tcp_server_helpers import (
     start_server_heartbeat_if_needed,
     stop_server_heartbeat_senders,
     wait_until_server_running,
+)
+from aionetx.implementations.asyncio_impl._tcp_server_stop_state import (
+    TcpServerStopExecutionState as _TcpServerStopExecutionState,
+    TcpServerStopPlan as _TcpServerStopPlan,
+    TcpServerStopProvenance as _TcpServerStopProvenance,
 )
 from aionetx.implementations.asyncio_impl.asyncio_heartbeat_sender import AsyncioHeartbeatSender
 from aionetx.implementations.asyncio_impl.asyncio_tcp_connection import AsyncioTcpConnection
@@ -54,47 +58,6 @@ from aionetx.implementations.asyncio_impl.runtime_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(slots=True)
-class _TcpServerStopPlan:
-    """Detached stop-time decisions made while holding the server state lock."""
-
-    stop_waiter: asyncio.Future[None] | None = None
-    owns_stop: bool = False
-    server: asyncio.AbstractServer | None = None
-    stopping_event: ComponentLifecycleChangedEvent | None = None
-    should_transition_to_stopped: bool = False
-    heartbeat_senders: tuple[AsyncioHeartbeatSender, ...] = ()
-    connections: tuple[AsyncioTcpConnection, ...] = ()
-
-    @property
-    def waits_for_owner(self) -> bool:
-        """Whether this stop call should wait for an already-running stop path."""
-        return self.stop_waiter is not None and not self.owns_stop
-
-
-@dataclass(frozen=True, slots=True)
-class _TcpServerStopProvenance:
-    """Where the current stop request originated relative to active handlers."""
-
-    handler_originated: bool = False
-    active_inline_handler: bool = False
-
-    @property
-    def defers_terminal_events(self) -> bool:
-        """Whether terminal publication must wait for active handler work to unwind."""
-        return self.handler_originated or self.active_inline_handler
-
-
-@dataclass(slots=True)
-class _TcpServerStopExecutionState:
-    """Mutable cross-step state for a single TCP server stop execution."""
-
-    deferred_close_waiters: tuple[asyncio.Future[None], ...] = ()
-    stop_waiter_completion_deferred: bool = False
-    dispatcher_stopped_from_handler_origin: bool = False
-    raise_cancel_after_stop_waiter: bool = False
 
 
 class AsyncioTcpServer(TcpServerProtocol):
