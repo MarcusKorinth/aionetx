@@ -930,6 +930,59 @@ async def test_server_lifecycle_events_preserve_start_stop_order(recording_event
 
 
 @pytest.mark.asyncio
+async def test_server_starting_handler_stop_aborts_startup_before_running() -> None:
+    class StopOnStartingHandler:
+        def __init__(self) -> None:
+            self.server: AsyncioTcpServer | None = None
+            self.events: list[ComponentLifecycleChangedEvent] = []
+            self.stopped_seen = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if not isinstance(event, ComponentLifecycleChangedEvent):
+                return
+            self.events.append(event)
+            if event.current == ComponentLifecycleState.STOPPED:
+                self.stopped_seen.set()
+            if event.current != ComponentLifecycleState.STARTING:
+                return
+            try:
+                if self.server is None:
+                    raise AssertionError("server reference was not attached")
+                await self.server.stop()
+            except (Exception, asyncio.CancelledError) as error:
+                self.error = error
+
+    handler = StopOnStartingHandler()
+    port = _unused_tcp_port()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=port,
+            max_connections=64,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.server = server
+
+    await server.start()
+    await asyncio.wait_for(handler.stopped_seen.wait(), timeout=1.0)
+
+    assert handler.error is None
+    assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+    assert server._server is None  # type: ignore[attr-defined]
+    assert server._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    assert [event.current for event in handler.events] == [
+        ComponentLifecycleState.STARTING,
+        ComponentLifecycleState.STOPPING,
+        ComponentLifecycleState.STOPPED,
+    ]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", port))
+
+
+@pytest.mark.asyncio
 async def test_server_start_rolls_back_state_and_allows_retry(
     recording_event_handler, monkeypatch: pytest.MonkeyPatch
 ) -> None:

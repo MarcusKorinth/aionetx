@@ -155,10 +155,23 @@ class AsyncioTcpServer(TcpServerProtocol):
             lifecycle_event = self._apply_lifecycle_state(ComponentLifecycleState.STARTING)
             self._notify_status_changed()
         try:
-            await self._emit_lifecycle_event(lifecycle_event)
+            if lifecycle_event is not None:
+                await self._event_dispatcher.emit_and_wait(
+                    lifecycle_event, drop_on_backpressure=False
+                )
         except (Exception, asyncio.CancelledError):
             await self._rollback_failed_startup()
             raise
+        startup_was_stopped = False
+        stop_waiter: asyncio.Future[None] | None = None
+        async with self._state_lock:
+            if self._lifecycle_state != ComponentLifecycleState.STARTING:
+                startup_was_stopped = True
+                stop_waiter = self._stop_waiter
+        if startup_was_stopped:
+            if stop_waiter is not None:
+                await asyncio.shield(stop_waiter)
+            return
         server: asyncio.AbstractServer | None = None
         listening_socket: socket.socket | None = None
         try:
