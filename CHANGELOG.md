@@ -42,6 +42,8 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - TCP server `stop()` now joins an active handler-origin deferred stop waiter
   even after lifecycle state has reached `STOPPED`, so overlapping callers do
   not return before terminal publication and dispatcher shutdown finish.
+- TCP servers now suppress stale `RUNNING` lifecycle publication when a
+  `STARTING` lifecycle handler stops startup.
 - UDP receivers now preserve deferred stop publication when stop originates
   from a handler or when an external stop caller is cancelled.
 - UDP and multicast receivers now abort startup when a STARTING lifecycle
