@@ -577,6 +577,75 @@ async def test_server_handler_origin_stop_drops_queued_background_bytes() -> Non
 
 
 @pytest.mark.asyncio
+async def test_server_late_external_stop_joins_deferred_handler_stop_waiter() -> None:
+    class StopServerAndHoldHandler:
+        def __init__(self) -> None:
+            self.server: AsyncioTcpServer | None = None
+            self.bytes_seen = asyncio.Event()
+            self.stop_returned = asyncio.Event()
+            self.release_handler = asyncio.Event()
+            self.error: BaseException | None = None
+
+        async def on_event(self, event) -> None:
+            if not isinstance(event, BytesReceivedEvent):
+                return
+            self.bytes_seen.set()
+            try:
+                if self.server is None:
+                    raise AssertionError("server reference was not attached")
+                await self.server.stop()
+                self.stop_returned.set()
+                await self.release_handler.wait()
+            except (Exception, asyncio.CancelledError) as error:
+                self.error = error
+                self.release_handler.set()
+
+    handler = StopServerAndHoldHandler()
+    server = AsyncioTcpServer(
+        settings=TcpServerSettings(
+            host="127.0.0.1",
+            port=12348,
+            max_connections=64,
+            event_delivery=EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        ),
+        event_handler=handler,
+    )
+    handler.server = server
+    server._lifecycle_state = ComponentLifecycleState.RUNNING  # type: ignore[attr-defined]
+    await server._event_dispatcher.start()  # type: ignore[attr-defined]
+    external_stop: asyncio.Task[None] | None = None
+    try:
+        await server._event_dispatcher.emit(  # type: ignore[attr-defined]
+            BytesReceivedEvent(resource_id="server:late-overlap-stop:1", data=b"stop")
+        )
+        await asyncio.wait_for(handler.bytes_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(handler.stop_returned.wait(), timeout=1.0)
+        assert server.lifecycle_state == ComponentLifecycleState.STOPPED
+
+        stop_waiter = server._stop_waiter  # type: ignore[attr-defined]
+        assert stop_waiter is not None
+        assert stop_waiter.done() is False
+
+        external_stop = asyncio.create_task(server.stop())
+        await asyncio.sleep(0)
+
+        assert external_stop.done() is False
+
+        handler.release_handler.set()
+        await asyncio.wait_for(external_stop, timeout=1.0)
+        assert server._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+    finally:
+        handler.release_handler.set()
+        if external_stop is not None and not external_stop.done():
+            external_stop.cancel()
+            await drain_awaitable_ignoring_cancelled(external_stop)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(server.stop(), timeout=1.0)
+
+    assert handler.error is None
+
+
+@pytest.mark.asyncio
 async def test_server_spawned_handler_stop_preserves_close_events_for_all_connections() -> None:
     class SpawnStopFromFirstBytes:
         def __init__(self) -> None:

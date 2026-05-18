@@ -39,6 +39,9 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - TCP client/server stop paths and connection close paths now preserve deferred
   terminal publication when an external caller is cancelled while an inline
   bytes handler is still active.
+- TCP server `stop()` now joins an active handler-origin deferred stop waiter
+  even after lifecycle state has reached `STOPPED`, so overlapping callers do
+  not return before terminal publication and dispatcher shutdown finish.
 - UDP receivers now preserve deferred stop publication when stop originates
   from a handler or when an external stop caller is cancelled.
 - UDP and multicast receivers now abort startup when a STARTING lifecycle

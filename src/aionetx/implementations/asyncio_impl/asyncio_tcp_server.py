@@ -256,10 +256,7 @@ class AsyncioTcpServer(TcpServerProtocol):
         plan = _TcpServerStopPlan()
         async with self._state_lock:
             self._logger.debug("Stopping TCP server.")
-            if (
-                self._lifecycle_state == ComponentLifecycleState.STOPPING
-                and self._stop_waiter is not None
-            ):
+            if self._stop_waiter is not None:
                 plan.stop_waiter = self._stop_waiter
                 return plan
 
