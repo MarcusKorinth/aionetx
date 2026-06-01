@@ -2,7 +2,7 @@
 #
 # Regenerate the hash-locked requirements file with:
 #   python -m piptools compile --allow-unsafe --generate-hashes --output-file requirements/ci-build-tools.txt requirements/ci-build-tools.in
-pip==26.1.1
+pip==26.1.2
 build==1.5.0
 setuptools==82.0.1
 wheel==0.47.0
