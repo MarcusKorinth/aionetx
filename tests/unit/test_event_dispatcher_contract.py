@@ -1979,6 +1979,43 @@ async def test_runtime_stats_capture_resource_close_queue_cleanup_drop_counts() 
 
 
 @pytest.mark.asyncio
+async def test_resource_close_queue_cleanup_preserves_queue_identity() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class BlockingHandler:
+        async def on_event(self, event: NetworkEvent) -> None:
+            if (
+                isinstance(event, ConnectionOpenedEvent)
+                and event.metadata.connection_id == "blocker"
+            ):
+                first_started.set()
+                await release_first.wait()
+
+    dispatcher = AsyncioEventDispatcher(
+        BlockingHandler(),
+        EventDeliverySettings(dispatch_mode=EventDispatchMode.BACKGROUND),
+        logging.getLogger("test"),
+    )
+    await dispatcher.start()
+    await dispatcher.emit(_opened("blocker"))
+    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+    await dispatcher.emit(BytesReceivedEvent(resource_id="closing", data=b"drop"))
+    await dispatcher.emit(BytesReceivedEvent(resource_id="staying", data=b"keep"))
+    original_queue = dispatcher._queue
+    try:
+        dropped = await dispatcher.drop_queued_events_for_resource("closing")
+
+        assert dropped == 1
+        assert dispatcher._queue is original_queue
+        assert [queued.event.resource_id for queued in dispatcher._queue] == ["staying"]
+    finally:
+        release_first.set()
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
 async def test_stop_phase_drops_emit_distinct_warning_signal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -342,7 +342,8 @@ class AsyncioEventDispatcher:
                 kept_events.append(queued_event)
         if not dropped_events:
             return 0
-        self._queue = kept_events
+        self._queue.clear()
+        self._queue.extend(kept_events)
         self._dropped_stop_phase_total += len(dropped_events)
         for queued_event in dropped_events:
             drop_queued_event(queued_event, reason=f"dropped because resource {resource_id} closed")
