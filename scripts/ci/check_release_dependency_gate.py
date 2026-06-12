@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from json import JSONDecodeError
 import os
 import sys
 import urllib.error
@@ -132,7 +131,12 @@ def main() -> int:
         release_ref = _require_env("GITHUB_REF")
         token = _require_env("GITHUB_TOKEN")
         inspected_alerts = _iter_open_blocking_alerts(repository=repository, token=token)
-    except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError, JSONDecodeError) as exc:
+    except (
+        RuntimeError,
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+    ) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

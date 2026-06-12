@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-from json import JSONDecodeError
 from email.message import Message
+import json
 import runpy
 import urllib.error
 import urllib.request
@@ -274,7 +273,7 @@ def test_release_dependency_gate_fails_closed_on_invalid_json(
     _set_release_env(monkeypatch)
 
     def fake_urlopen(request: urllib.request.Request) -> FakeResponse:
-        raise JSONDecodeError("invalid json", doc="", pos=0)
+        raise json.JSONDecodeError("invalid json", doc="", pos=0)
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
