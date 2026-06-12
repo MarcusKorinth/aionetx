@@ -385,9 +385,38 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: python scripts/ci/check_release_codeql_gate.py
 
+  # Tier: release dependency policy
+  # PRs use dependency-review to inspect changed dependencies. Releases do not
+  # have a PR diff, so this gate blocks artifact builds when GitHub Dependabot
+  # reports a high/critical alert without an accepted non-exploitability
+  # rationale.
+  release_dependency_audit:
+    name: Release trust gate - dependency vulnerability audit
+    needs: [verify_tag_version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      vulnerability-alerts: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Fail on high/critical dependency alerts without rationale
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          # High and critical dependency vulnerability findings block releases
+          # unless an explicit non-exploitability rationale exists.
+          python scripts/ci/check_release_dependency_gate.py
+
   verify_and_build:
     name: Verify and build release artifacts
-    needs: [release_profile_gate, release_codeql_gate]
+    needs: [release_profile_gate, release_codeql_gate, release_dependency_audit]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
