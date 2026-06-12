@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+import gc
 from inspect import iscoroutinefunction
 import socket
+from typing import Any
 
 import pytest
+import pytest_asyncio
 
 from aionetx.testing import AwaitableRecordingEventHandler, RecordingEventHandler
+
+pytest_plugins = ("pytester",)
+
+_UNRETRIEVED_FUTURE_EXCEPTION_MESSAGE = "Future exception was never retrieved"
 
 
 @pytest.fixture
@@ -30,6 +39,63 @@ def _is_async_test(item: pytest.Item) -> bool:
     return item.get_closest_marker("asyncio") is not None or (
         test_function is not None and iscoroutinefunction(test_function)
     )
+
+
+def _is_unretrieved_future_exception_context(context: dict[str, Any]) -> bool:
+    return context.get("message") == _UNRETRIEVED_FUTURE_EXCEPTION_MESSAGE and isinstance(
+        context.get("future"), asyncio.Future
+    )
+
+
+def _format_unretrieved_future_exception_context(context: dict[str, Any]) -> str:
+    future = context.get("future")
+    exception = context.get("exception")
+    return f"{_UNRETRIEVED_FUTURE_EXCEPTION_MESSAGE}: {exception!r} from {future!r}"
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _fail_on_unretrieved_asyncio_future_diagnostics(
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[None]:
+    if not _is_async_test(request.node):
+        yield
+        return
+
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    unretrieved_future_contexts: list[dict[str, Any]] = []
+
+    def record_unretrieved_future_diagnostics(
+        current_loop: asyncio.AbstractEventLoop,
+        context: dict[str, Any],
+    ) -> None:
+        if _is_unretrieved_future_exception_context(context):
+            unretrieved_future_contexts.append(dict(context))
+            return
+        if previous_exception_handler is not None:
+            previous_exception_handler(current_loop, context)
+            return
+        current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(record_unretrieved_future_diagnostics)
+    try:
+        yield
+        gc.collect()
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+
+    if unretrieved_future_contexts:
+        details = "\n".join(
+            f"- {_format_unretrieved_future_exception_context(context)}"
+            for context in unretrieved_future_contexts
+        )
+        pytest.fail(
+            f"asyncio reported unretrieved Future exception diagnostics:\n{details}",
+            pytrace=False,
+        )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
