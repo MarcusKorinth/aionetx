@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import logging
 import socket
 
@@ -402,6 +403,60 @@ async def test_udp_receiver_cancelled_external_stop_during_opened_barrier_publis
     assert any(isinstance(event, ConnectionClosedEvent) for event in handler.events)
     assert receiver.lifecycle_state == ComponentLifecycleState.STOPPED
     assert receiver._event_dispatcher.is_running is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_udp_receiver_deferred_close_failure_retrieves_waiter_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    exception_contexts: list[dict[str, object]] = []
+    previous_exception_handler = loop.get_exception_handler()
+
+    def record_exception_context(_loop, context: dict[str, object]) -> None:
+        exception_contexts.append(context)
+
+    receiver = AsyncioUdpReceiver(
+        settings=UdpReceiverSettings(host="127.0.0.1", port=_get_unused_udp_port()),
+        event_handler=NoopHandler(),
+    )
+    waiter = loop.create_future()
+    receiver._runtime.deferred_close_event = ConnectionClosedEvent(  # type: ignore[attr-defined]
+        resource_id="udp:deferred-close-failure",
+        previous_state=ConnectionState.CONNECTED,
+    )
+    receiver._runtime.deferred_close_event_waiter = waiter  # type: ignore[attr-defined]
+    close_publication_error = RuntimeError("udp-close-publication-failed")
+
+    async def fail_emit(event) -> None:
+        raise close_publication_error
+
+    monkeypatch.setattr(receiver._event_dispatcher, "emit", fail_emit)  # type: ignore[attr-defined]
+
+    loop.set_exception_handler(record_exception_context)
+    caught_error: RuntimeError | None = None
+    try:
+        try:
+            await receiver._publish_deferred_close_after_opened_event()  # type: ignore[attr-defined]
+        except RuntimeError as error:
+            caught_error = error
+
+        assert caught_error is close_publication_error
+        assert receiver._runtime.deferred_close_event_waiter is None  # type: ignore[attr-defined]
+
+        if caught_error is not None:
+            caught_error.__traceback__ = None
+        del caught_error
+        del waiter
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+
+    assert not any(
+        context.get("message") == "Future exception was never retrieved"
+        for context in exception_contexts
+    )
 
 
 @pytest.mark.asyncio
