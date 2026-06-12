@@ -81,8 +81,8 @@ def test_release_reuses_setup_phases_without_hiding_publish_steps() -> None:
         _assert_local_actions_run_after_checkout(job)
 
     verify_and_build = _job_block(workflow_text, "verify_and_build")
-    assert 'upgrade-pip: "false"' in verify_and_build
-    assert 'use-python-module: "true"' in verify_and_build
+    assert 'upgrade-pip: "false"' not in verify_and_build
+    assert 'use-python-module: "true"' not in verify_and_build
     assert "git log -1 --format=%ct" not in workflow_text
     assert "pip install -e .[dev]" not in workflow_text
 
@@ -114,21 +114,31 @@ def test_capture_build_epoch_action_has_narrow_release_contract() -> None:
 
 def test_install_dev_dependencies_action_has_narrow_release_contract() -> None:
     action_text = _read(DEV_INSTALL_ACTION_PATH)
-    default_install_step = _action_step_block(
+    build_tools_step = _action_step_block(
         action_text,
-        "Install project development dependencies with pip",
+        "Install pinned CI build tools",
     )
-    python_module_install_step = _action_step_block(
+    dev_tools_step = _action_step_block(
         action_text,
-        "Install project development dependencies with python -m pip",
+        "Install pinned CI development tools",
+    )
+    editable_install_step = _action_step_block(
+        action_text,
+        "Install project in editable mode without dependency resolution",
     )
 
     assert "name: Install project development dependencies" in action_text
-    assert "description: Install the editable development package for release trust gates." in (
+    assert "description: Install pinned CI build/dev tools and the editable package." in (
         action_text
     )
-    assert "python -m pip install --upgrade pip" in action_text
-    assert "run: pip install -e .[dev]" in default_install_step
-    assert "python -m pip install -e .[dev]" not in default_install_step
-    assert "run: python -m pip install -e .[dev]" in python_module_install_step
-    assert "requirements/ci-build-tools.txt" not in action_text
+    assert "python -m pip install --upgrade pip" not in action_text
+    assert "run: python -m pip install --require-hashes -r requirements/ci-build-tools.txt" in (
+        build_tools_step
+    )
+    assert "run: python -m pip install --require-hashes -r requirements/ci-dev-tools.txt" in (
+        dev_tools_step
+    )
+    assert "run: python -m pip install --no-build-isolation --no-deps -e ." in (
+        editable_install_step
+    )
+    assert "pip install -e .[dev]" not in action_text
