@@ -1,30 +1,17 @@
 name: Install project development dependencies
-description: Install the editable development package for release trust gates.
-
-inputs:
-  upgrade-pip:
-    description: Upgrade pip before installing editable development dependencies.
-    required: false
-    default: "true"
-  use-python-module:
-    description: Install through python -m pip instead of the pip executable.
-    required: false
-    default: "false"
+description: Install pinned CI build/dev tools and the editable package.
 
 runs:
   using: composite
   steps:
-    - name: Upgrade pip
-      if: ${{ inputs.upgrade-pip == 'true' }}
+    - name: Install pinned CI build tools
       shell: bash
-      run: python -m pip install --upgrade pip
+      run: python -m pip install --require-hashes -r requirements/ci-build-tools.txt
 
-    - name: Install project development dependencies with pip
-      if: ${{ inputs.use-python-module != 'true' }}
+    - name: Install pinned CI development tools
       shell: bash
-      run: pip install -e .[dev]
+      run: python -m pip install --require-hashes -r requirements/ci-dev-tools.txt
 
-    - name: Install project development dependencies with python -m pip
-      if: ${{ inputs.use-python-module == 'true' }}
+    - name: Install project in editable mode without dependency resolution
       shell: bash
-      run: python -m pip install -e .[dev]
+      run: python -m pip install --no-build-isolation --no-deps -e .
