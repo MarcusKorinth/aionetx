@@ -25,6 +25,21 @@ def _job_block(workflow_text: str, job_name: str) -> str:
     return workflow_text[start:end]
 
 
+def _direct_needs(job_block: str) -> set[str]:
+    inline_needs = re.search(r"^    needs: \[(?P<needs>[^\]]+)\]$", job_block, re.MULTILINE)
+    if inline_needs is not None:
+        return {need.strip() for need in inline_needs.group("needs").split(",")}
+
+    needs_start = job_block.index("    needs:\n") + len("    needs:\n")
+    steps_start = job_block.index("    steps:\n", needs_start)
+    needs_block = job_block[needs_start:steps_start]
+    return {
+        line.removeprefix("      - ").strip()
+        for line in needs_block.splitlines()
+        if line.startswith("      - ")
+    }
+
+
 def _action_step_block(action_text: str, step_name: str) -> str:
     header = f"    - name: {step_name}\n"
     start = action_text.index(header)
@@ -98,6 +113,31 @@ def test_release_reuses_setup_phases_without_hiding_publish_steps() -> None:
         workflow_text,
         "attest_provenance",
     )
+
+
+def test_release_dependency_audit_blocks_artifact_build() -> None:
+    workflow_text = _read(RELEASE_WORKFLOW_PATH)
+
+    codeql_gate = _job_block(workflow_text, "release_codeql_gate")
+    dependency_audit = _job_block(workflow_text, "release_dependency_audit")
+    verify_and_build = _job_block(workflow_text, "verify_and_build")
+
+    assert "permissions:\n      contents: read\n      security-events: read" in codeql_gate
+    assert "name: Release trust gate - dependency vulnerability audit" in dependency_audit
+    assert _direct_needs(dependency_audit) == {"verify_tag_version"}
+    assert "permissions:\n      contents: read" in dependency_audit
+    assert "vulnerability-alerts: read" in dependency_audit
+    assert "security-events: read" not in dependency_audit
+    assert "uses: actions/checkout@" in dependency_audit
+    assert "uses: actions/setup-python@" in dependency_audit
+    assert "GITHUB_TOKEN: ${{ github.token }}" in dependency_audit
+    assert "GITHUB_REPOSITORY: ${{ github.repository }}" in dependency_audit
+    assert "python scripts/ci/check_release_dependency_gate.py" in dependency_audit
+    assert "pip dependency alerts" not in dependency_audit
+    assert "High and critical dependency vulnerability findings block releases" in (
+        dependency_audit
+    )
+    assert "release_dependency_audit" in _direct_needs(verify_and_build)
 
 
 def test_capture_build_epoch_action_has_narrow_release_contract() -> None:
