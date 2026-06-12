@@ -641,6 +641,8 @@ class AsyncioTcpConnection(ConnectionProtocol):
         except (Exception, asyncio.CancelledError) as error:
             if deferred_waiter is not None and not deferred_waiter.done():
                 deferred_waiter.set_exception(error)
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    deferred_waiter.exception()
             raise
         else:
             if deferred_waiter is not None and not deferred_waiter.done():

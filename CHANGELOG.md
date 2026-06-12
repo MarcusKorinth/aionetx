@@ -50,3 +50,6 @@ Planned contents for the initial public alpha release (`0.1.0`).
   handler stops the receiver, preventing stale socket or running state.
 - TCP clients now suppress stale RUNNING lifecycle publication when a
   STARTING lifecycle handler stops the client.
+- TCP and datagram deferred-close failure paths now retrieve deferred waiter
+  exceptions before re-raising, avoiding asyncio unretrieved-future shutdown
+  warnings while preserving the original close-publication error.
