@@ -5,11 +5,11 @@
 #
 # Regenerate the hash-locked requirements file with:
 #   python -m piptools compile --allow-unsafe --generate-hashes --output-file requirements/ci-dev-tools.txt requirements/ci-dev-tools.in
-pytest==9.0.3
-pytest-asyncio==1.3.0
+pytest==9.1.0
+pytest-asyncio==1.4.0
 pytest-cov==7.1.0
 pytest-timeout==2.4.0
-coverage==7.13.5
-ruff==0.15.12
-mypy==2.0.0
+coverage==7.14.1
+ruff==0.15.17
+mypy==2.1.0
 hypothesis>=6.0
