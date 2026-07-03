@@ -33,6 +33,7 @@ def _github_api_headers(token: str) -> dict[str, str]:
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
+        # User-Agent is just an application identifier for GitHub API, not a secret
         "User-Agent": "aionetx-release-codeql-gate",
     }
 
