@@ -41,6 +41,13 @@ coordination without expanding the library beyond transport concerns.
 
 ## Performance and observability
 
+### Maintain lightweight local performance baselines
+
+The repository includes `bench/event_delivery_baseline.py` as a small local
+before/after harness for TCP event-delivery changes. Future performance work
+should keep this kind of measurement lightweight, dependency-free, and
+non-contractual unless a separate public guarantee is deliberately designed.
+
 ### Evaluate `asyncio.DatagramProtocol` for UDP receive throughput
 
 The current UDP receiver uses an explicit socket receive loop. It may be worth

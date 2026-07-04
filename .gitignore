@@ -21,6 +21,8 @@
 # Source, tests, examples, scripts, and docs
 !/docs/
 !/docs/**
+!/bench/
+!/bench/**
 !/examples/
 !/examples/**
 !/requirements/

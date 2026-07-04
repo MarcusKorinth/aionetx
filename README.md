@@ -844,6 +844,7 @@ Choose direct `asyncio` if you need very custom low-level control and are comfor
 - `docs/logging.md`: logger hierarchy, structured context, recommended levels, and a minimal `dictConfig`
 - `docs/reproducible_build.md`: release artifact verification, provenance/SBOM checks, and reproducible rebuild recipe
 - `docs/breaking_changes/README.md`: compatibility-note format and expectations for supported upgrade-path changes
+- `bench/README.md`: local, non-contractual benchmark harnesses for contributor before/after measurements
 - `CHANGELOG.md`: user-visible changes per release, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format
 - `SECURITY.md`: supported versions, private vulnerability reporting, security-scope boundaries, secrets policy, SCA/SAST thresholds, threat model, and security assurance case
 - `GOVERNANCE.md`: decision model, project roles, access review expectations, and current single-maintainer continuity limits

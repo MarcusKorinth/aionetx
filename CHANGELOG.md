@@ -15,6 +15,8 @@ Planned contents for the initial public alpha release (`0.1.0`).
 - optional TCP client reconnect and heartbeat support
 - `DispatcherRuntimeStats` as the public diagnostics snapshot type for managed
   TCP, UDP, and multicast receiver dispatcher counters
+- `bench/event_delivery_baseline.py` as a local, non-contractual TCP
+  event-delivery baseline harness for contributor before/after measurements
 - `docs/lifecycle.md` as the public stop-during-state and caller-origin
   lifecycle reference
 - tests, examples, typing metadata, and CI/release verification gates
