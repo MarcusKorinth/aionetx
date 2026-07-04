@@ -83,6 +83,23 @@ def _fake_ref_api(
     return fake_gh_api
 
 
+def _assert_pin_ref_was_requested(
+    requested_paths: list[str],
+    pins: dict[tuple[str, str, str], str],
+    owner: str,
+    repo: str,
+) -> None:
+    refs = {ref for pin_owner, pin_repo, ref in pins if (pin_owner, pin_repo) == (owner, repo)}
+    assert refs
+
+    for ref in refs:
+        ref_kind = "heads" if ref.startswith("release/") else "tags"
+        assert any(
+            path.endswith(f"/repos/{owner}/{repo}/git/refs/{ref_kind}/{ref}")
+            for path in requested_paths
+        )
+
+
 def test_current_release_publish_pins_are_validated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,16 +114,9 @@ def test_current_release_publish_pins_are_validated(
 
     assert main() == 0
 
-    assert any(
-        path.endswith("/repos/actions/checkout/git/refs/tags/v6") for path in requested_paths
-    )
-    assert any(
-        path.endswith("/repos/github/codeql-action/git/refs/tags/v4") for path in requested_paths
-    )
-    assert any(
-        path.endswith("/repos/pypa/gh-action-pypi-publish/git/refs/heads/release/v1")
-        for path in requested_paths
-    )
+    _assert_pin_ref_was_requested(requested_paths, pins, "actions", "checkout")
+    _assert_pin_ref_was_requested(requested_paths, pins, "github", "codeql-action")
+    _assert_pin_ref_was_requested(requested_paths, pins, "pypa", "gh-action-pypi-publish")
 
 
 def test_missing_ref_comment_fails_closed(
