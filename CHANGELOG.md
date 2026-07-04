@@ -4,7 +4,9 @@ All notable user-visible changes to `aionetx` are documented in this file.
 
 ## [Unreleased]
 
-Planned contents for the initial public alpha release (`0.1.0`).
+## [0.1.0] - 2026-07-05
+
+Initial public alpha release.
 
 ### Added
 
@@ -23,7 +25,7 @@ Planned contents for the initial public alpha release (`0.1.0`).
 
 ### Changed
 
-- require Python 3.11 or newer for the initial public alpha release
+- require Python 3.11 or newer
 - Documentation now distinguishes possible future narrow TCP `ssl=` /
   `ssl.SSLContext` transport wiring from higher-layer authentication,
   certificate-management, DTLS, service-mesh, and application-security scope.
