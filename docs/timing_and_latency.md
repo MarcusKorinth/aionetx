@@ -36,6 +36,21 @@ of the system under test.
 
 ## Observed envelopes
 
+### Local event-delivery baseline
+
+Contributors can run the local TCP event-delivery harness when comparing
+changes that affect dispatch, receive loops, queueing, or backpressure:
+
+```bash
+python bench/event_delivery_baseline.py --json
+```
+
+The harness prints Python/platform context, dispatch and backpressure settings,
+payload size/count, elapsed time, throughput, received bytes, queue peak, and
+dispatcher drop counters. These are local observations only. They are useful
+for same-machine before/after comparisons, not public API guarantees or
+cross-platform performance claims.
+
 ### TCP send flushes
 
 TCP `ConnectionProtocol.send()` completes after the underlying `asyncio.StreamWriter.drain()` completes. TCP client and server connections default to `connection_send_timeout_seconds=30.0`, so a slow or non-reading peer cannot stall a send forever unless that timeout is explicitly disabled.
