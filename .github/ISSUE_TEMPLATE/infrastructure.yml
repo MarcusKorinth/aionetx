@@ -1,0 +1,76 @@
+name: Infrastructure / maintenance
+description: Propose a change to CI, tooling, packaging, developer workflow, or repository housekeeping.
+title: "[infra] "
+labels: ["type:chore", "area:repo", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for project infrastructure and maintenance work: CI pipelines, linting, formatting, type checking, test configuration, packaging metadata, dependency management, developer setup, documentation builds, repository housekeeping, and similar concerns.
+
+        If your proposal changes transport runtime behavior (lifecycle, events, backpressure, reconnect, multicast, typing, or narrow TCP `ssl=` wiring), use the [Feature request](https://github.com/MarcusKorinth/aionetx/issues/new?template=feature_request.yml) template instead.
+
+        Please report suspected vulnerabilities privately through [GitHub Private Vulnerability Reporting](https://github.com/MarcusKorinth/aionetx/security/advisories/new), not as public issues.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What friction, gap, or risk does this address?
+      placeholder: e.g. "There is no optional pre-commit setup that mirrors the repository's existing lint and format checks."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What specifically should change? Include commands, configuration snippets, or tool names where helpful.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project does this touch?
+      multiple: true
+      options:
+        - CI / GitHub Actions
+        - Linting / formatting
+        - Type checking
+        - Test configuration / fixtures
+        - Packaging / pyproject.toml
+        - Dependency management
+        - Developer environment setup
+        - Documentation build
+        - Repository housekeeping
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Considered alternatives
+      description: Other approaches you considered, or why the current setup is not enough.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to relevant tool documentation, related issues, or examples from other projects.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: I have searched existing issues and confirmed this is not already proposed.
+          required: true
+        - label: This proposal concerns project infrastructure, tooling, or maintenance, not transport runtime behavior.
+          required: true
