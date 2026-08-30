@@ -929,7 +929,8 @@ class _AsyncioDatagramReceiverBase:
             await self._rollback_failed_starting_publication()
             raise
         async with self._state_lock:
-            if self._lifecycle_state == ComponentLifecycleState.STARTING:
+            state_after_starting: ComponentLifecycleState = self._lifecycle_state
+            if state_after_starting == ComponentLifecycleState.STARTING:
                 return True
             stop_waiter = self._runtime.stop_waiter
         if stop_waiter is not None:

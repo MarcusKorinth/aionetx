@@ -97,8 +97,7 @@ The detailed stop/close matrix for these invariants lives in
 Primary integration contract:
 
 ```python
-async def on_event(self, event: NetworkEvent) -> None:
-    ...
+async def on_event(self, event: NetworkEvent) -> None: ...
 ```
 
 `BaseNetworkEventHandler` is a convenience layer over this contract.

@@ -165,7 +165,8 @@ class AsyncioTcpServer(TcpServerProtocol):
         startup_was_stopped = False
         stop_waiter: asyncio.Future[None] | None = None
         async with self._state_lock:
-            if self._lifecycle_state != ComponentLifecycleState.STARTING:
+            state_after_starting: ComponentLifecycleState = self._lifecycle_state
+            if state_after_starting != ComponentLifecycleState.STARTING:
                 startup_was_stopped = True
                 stop_waiter = self._stop_waiter
         if startup_was_stopped:
@@ -199,7 +200,8 @@ class AsyncioTcpServer(TcpServerProtocol):
 
         lifecycle_event = None
         async with self._state_lock:
-            if self._lifecycle_state != ComponentLifecycleState.STARTING:
+            state_after_socket_bind: ComponentLifecycleState = self._lifecycle_state
+            if state_after_socket_bind != ComponentLifecycleState.STARTING:
                 # stop() may have completed while ``asyncio.start_server()``
                 # was still in flight. Close this just-created server locally
                 # because the stop path could not yet see it.
