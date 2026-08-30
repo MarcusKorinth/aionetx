@@ -102,30 +102,30 @@ default.
 ```python
 import logging.config
 
-logging.config.dictConfig({
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "aionetx": {
-            "format": (
-                "%(asctime)s %(levelname)s %(name)s %(message)s"
-            ),
+logging.config.dictConfig(
+    {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "aionetx": {
+                "format": ("%(asctime)s %(levelname)s %(name)s %(message)s"),
+            },
         },
-    },
-    "handlers": {
-        "stderr": {
-            "class": "logging.StreamHandler",
-            "formatter": "aionetx",
+        "handlers": {
+            "stderr": {
+                "class": "logging.StreamHandler",
+                "formatter": "aionetx",
+            },
         },
-    },
-    "loggers": {
-        "aionetx": {
-            "level": "WARNING",
-            "handlers": ["stderr"],
-            "propagate": False,
+        "loggers": {
+            "aionetx": {
+                "level": "WARNING",
+                "handlers": ["stderr"],
+                "propagate": False,
+            },
         },
-    },
-})
+    }
+)
 ```
 
 Use a standard formatter as the default copy-paste configuration.

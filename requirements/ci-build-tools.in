@@ -2,10 +2,10 @@
 #
 # Regenerate the hash-locked requirements file with:
 #   python -m piptools compile --allow-unsafe --generate-hashes --output-file requirements/ci-build-tools.txt requirements/ci-build-tools.in
-pip==26.1.2
+pip==26.2.1
 build==1.5.0
 # Required by build on Windows; keep explicit so the hash-locked CI tools
 # file stays portable when compiled on non-Windows platforms.
 colorama==0.4.6
-setuptools==83.0.0
-wheel==0.47.0
+setuptools==84.0.0
+wheel==0.48.0

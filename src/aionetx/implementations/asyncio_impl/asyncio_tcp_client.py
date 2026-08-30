@@ -192,7 +192,8 @@ class AsyncioTcpClient(_ClientRuntimeAccessors, TcpClientProtocol):
             await self._rollback_failed_startup()
             raise
         async with self._state_lock:
-            if self._lifecycle_state != ComponentLifecycleState.STARTING:
+            state_after_starting: ComponentLifecycleState = self._lifecycle_state
+            if state_after_starting != ComponentLifecycleState.STARTING:
                 stop_waiter = self._stop_waiter
             else:
                 self._supervisor_task = asyncio.create_task(
